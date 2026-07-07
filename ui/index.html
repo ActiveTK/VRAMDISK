@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VRAMDISK</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <!-- ============ Setup screen (shown when nothing is mounted) ============ -->
+      <section id="screen-setup" class="screen">
+        <h1 class="title">VRAMDISK</h1>
+        <form id="mount-form" autocomplete="off">
+          <div class="field">
+            <label for="device">GPU デバイス</label>
+            <select id="device" required></select>
+          </div>
+
+          <div class="field">
+            <label>マウント先</label>
+            <div class="tabs" role="tablist">
+              <button type="button" class="tab active" data-mount-mode="drive">ドライブレター</button>
+              <button type="button" class="tab" data-mount-mode="folder">フォルダ</button>
+            </div>
+          </div>
+
+          <div class="field" id="mount-drive-field">
+            <select id="drive" aria-label="ドライブレター" required></select>
+          </div>
+
+          <div class="field" id="mount-folder-field" hidden>
+            <div class="row">
+              <input id="mount-folder" type="text" aria-label="フォルダ" placeholder="C:\vramdisk" spellcheck="false" />
+              <button id="browse-folder-btn" type="button" class="btn">参照...</button>
+            </div>
+          </div>
+
+          <div class="field size-field">
+            <div class="row size-row">
+              <label for="size-value" id="size-label">容量：</label>
+              <input id="size-value" type="number" min="0" step="any" inputmode="decimal" placeholder="既定" />
+              <select id="size-unit">
+                <option value="MB">MB</option>
+                <option value="GB" selected>GB</option>
+              </select>
+            </div>
+            <div id="size-error" class="hint error" hidden></div>
+          </div>
+
+          <div class="check-row">
+            <label class="check"><input id="compress" type="checkbox" /> データを圧縮</label>
+            <label class="check"><input id="dedup" type="checkbox" /> 同一内容のチャンク共有</label>
+          </div>
+          <div id="compress-hint" class="hint" hidden>
+            nvCOMP が見つからないため、この GUI では圧縮を利用できません（CLI では CPU zstd にフォールバックします）
+          </div>
+
+          <button id="mount-btn" type="submit" class="btn btn-primary btn-block">マウント</button>
+        </form>
+      </section>
+
+      <!-- ============ Mounted screen (shown while a disk is mounted) ============ -->
+      <section id="screen-mounted" class="screen" hidden>
+        <div class="mounted-head">
+          <div class="drive-letter" id="mounted-drive">R:</div>
+          <div class="mounted-sub" id="mounted-sub">[GPU 0] · 2.00 GB</div>
+        </div>
+
+        <div class="bar"><i id="usage-bar"></i></div>
+        <div class="usage-text">
+          <span id="usage-text-left">物理使用 0 B / 0 B</span>
+          <span id="usage-text-pct">0%</span>
+        </div>
+
+        <div class="stat-grid">
+          <div class="stat"><span class="k">ファイル数</span><span class="v" id="stat-files">—</span></div>
+          <div class="stat"><span class="k">論理データ</span><span class="v" id="stat-logical">—</span></div>
+          <div class="stat"><span class="k">dedup 節約</span><span class="v" id="stat-dedup">—</span></div>
+          <div class="stat"><span class="k">圧縮 節約</span><span class="v" id="stat-compress">—</span></div>
+        </div>
+
+        <div class="tool-row">
+          <button id="open-hash" type="button" class="btn btn-ghost">ファイルのハッシュ計算</button>
+          <button id="open-archive" type="button" class="btn btn-ghost">ファイル圧縮（nvCOMP）</button>
+        </div>
+
+        <button id="unmount-btn" type="button" class="btn btn-danger btn-block">アンマウント</button>
+        <div id="mounted-status" class="status-text" role="status"></div>
+      </section>
+
+      <!-- ============ Hash panel ============ -->
+      <section id="screen-hash" class="screen" hidden>
+        <div class="panel-head">
+          <button type="button" class="btn-back" data-back>← 戻る</button>
+          <h2>ファイルのハッシュ計算</h2>
+        </div>
+        <form id="hash-form" autocomplete="off">
+          <div class="field">
+            <label for="hash-path">パス <span class="hint">(例: \data や R:\data)</span></label>
+            <input id="hash-path" type="text" value="\" spellcheck="false" />
+          </div>
+          <div class="row">
+            <div class="field grow">
+              <label for="hash-algo">アルゴリズム</label>
+              <select id="hash-algo">
+                <option value="sha256">SHA-256</option>
+                <option value="sha1">SHA-1</option>
+                <option value="md5">MD5</option>
+                <option value="fnv1a64">FNV-1a 64</option>
+              </select>
+            </div>
+            <label class="check check-inline"><input id="hash-recursive" type="checkbox" checked /> 再帰</label>
+          </div>
+          <button id="hash-btn" type="submit" class="btn btn-primary btn-block">計算</button>
+          <div id="hash-status" class="status-text" role="status"></div>
+        </form>
+        <div id="hash-result" class="kv-list"></div>
+      </section>
+
+      <!-- ============ File compression panel (nvCOMP) ============ -->
+      <section id="screen-archive" class="screen" hidden>
+        <div class="panel-head">
+          <button type="button" class="btn-back" data-back>← 戻る</button>
+          <h2>ファイル圧縮（nvCOMP）</h2>
+        </div>
+
+        <div class="tabs" role="tablist">
+          <button type="button" class="tab active" data-mode="compress">圧縮</button>
+          <button type="button" class="tab" data-mode="extract">展開</button>
+        </div>
+
+        <form id="archive-form" autocomplete="off">
+          <div id="archive-compress-fields">
+            <div class="field">
+              <label for="archive-paths">対象パス <span class="hint">(常に再帰)</span></label>
+              <div class="row with-browse">
+                <input id="archive-paths" type="text" spellcheck="false" />
+                <button id="archive-paths-browse" type="button" class="btn">参照...</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="archive-output">出力先</label>
+              <div class="row with-browse">
+                <input id="archive-output" type="text" spellcheck="false" />
+                <button id="archive-output-browse" type="button" class="btn">参照...</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="archive-format">形式</label>
+              <select id="archive-format">
+                <option value="tar.zst">tar.zst</option>
+                <option value="tar.lz4">tar.lz4</option>
+                <option value="tar.gz">tar.gz</option>
+                <option value="zip">zip</option>
+              </select>
+            </div>
+          </div>
+
+          <div id="archive-extract-fields" hidden>
+            <div class="field">
+              <label for="archive-input">アーカイブ</label>
+              <div class="row with-browse">
+                <input id="archive-input" type="text" spellcheck="false" />
+                <button id="archive-input-browse" type="button" class="btn">参照...</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="archive-outdir">展開先</label>
+              <div class="row with-browse">
+                <input id="archive-outdir" type="text" spellcheck="false" />
+                <button id="archive-outdir-browse" type="button" class="btn">参照...</button>
+              </div>
+            </div>
+          </div>
+
+          <button id="archive-btn" type="submit" class="btn btn-primary btn-block">実行</button>
+          <div id="archive-status" class="status-text" role="status"></div>
+        </form>
+        <div id="archive-result" class="kv-list"></div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,39 @@
+[package]
+name = "vramdisk-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop UI for VRAMDISK"
+license = "MIT"
+publish = false
+
+# This is the only binary VRAMDISK produces (package name stays vramdisk-gui
+# for cargo/npm purposes; the exe is named plainly since 99% of users only
+# need it). It's also the CLI: `vramdisk.exe cli ...` / `benchmark ...`
+# dispatches into vramdisk::cli_run instead of showing a window (see main.rs).
+[[bin]]
+name = "vramdisk"
+path = "src/main.rs"
+
+# Independent package: it path-depends on the root `vramdisk` crate but is not
+# a workspace member, so the existing `build.ps1` / `cargo test` at the root are
+# unaffected. Build this from the `src-tauri/` directory (see build-gui.ps1).
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# Emit the same /DELAYLOAD:winfsp-x64.dll linker directive as the CLI so this
+# binary loads without WinFsp's bin dir on PATH; the DLL is resolved at runtime
+# by preload_winfsp_dll() before the first mount.
+winfsp = { version = "0.13", features = ["delayload"] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+vramdisk = { path = ".." }
+
+[profile.release]
+opt-level = 3

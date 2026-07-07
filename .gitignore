@@ -1,0 +1,10 @@
+/target
+*.pdb
+
+# Working plan (not tracked)
+/PLAN.md
+
+# GUI (Tauri) build artifacts
+/src-tauri/target
+/src-tauri/gen
+/node_modules

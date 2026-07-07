@@ -1,0 +1,149 @@
+// Two-level parallel FNV-1a hash for 64 KiB VRAM chunks (batched).
+//
+// Launch config: gridDim=(num_chunks,1,1), blockDim=(256,1,1)
+//   blockIdx.x  selects which chunk this block hashes.
+//   threadIdx.x hashes 256 contiguous bytes (thread t -> [t*256, t*256+256)).
+// Thread 0 of each block then runs a second FNV-1a pass over the 256 per-thread
+// u64 hashes (each treated as 8 little-endian bytes) and writes the final u64
+// to out_ptr[blockIdx.x].
+//
+// One launch hashes the whole batch in parallel; with one block per chunk the
+// GPU saturates many SMs instead of the single block the old kernel used.
+//
+// The same two-level algorithm is implemented on the CPU side in engine.rs so
+// both paths produce identical hashes for identical data.
+//
+// .target is sm_50 (Maxwell): the kernel only uses scalar arithmetic, global/
+// shared loads/stores and a plain bar.sync, none of which need a newer
+// architecture, and the PTX JIT loader refuses to run a module on a GPU
+// older than its declared .target (JIT can only go forward, not backward).
+// Pinning this to the actual instructions used (rather than whatever the
+// generating toolchain defaulted to) keeps this working on pre-Turing GPUs.
+//
+// Signature:  fnv1a_hash(u64 base, u64 offs_ptr, u64 out_ptr)
+//   base     : device address of the VRAM buffer start
+//   offs_ptr : device array of u64 byte-offsets, indexed by blockIdx.x
+//              (each entry = chunk_id * 65536)
+//   out_ptr  : device array of u64 results, indexed by blockIdx.x
+
+.version 7.5
+.target sm_50
+.address_size 64
+
+.visible .entry fnv1a_hash(
+    .param .u64 p_base,
+    .param .u64 p_offs,
+    .param .u64 p_out
+)
+{
+    // ---- register declarations ----
+    // %ltid / %ltid64: local copies of threadIdx.x; %bid/%bid64: blockIdx.x.
+    // (avoid conflict with the predefined v4.u32 vectors %tid / %ctaid.)
+    // PTX has no .u8 register type; use .u32 for byte loads (zero-extends).
+    .reg .u64   %base, %offsp, %outp;
+    .reg .u64   %ltid64, %bid64, %src, %h, %prime;
+    .reg .u64   %smbase, %smaddr, %w, %tmp, %off, %oaddr;
+    .reg .u32   %ltid, %bid, %n, %byte32;
+    .reg .pred  %cond;
+
+    // 256 x 8 bytes of shared scratch for per-thread hashes.
+    .shared .align 8 .b8 smem[2048];
+
+    // ---- load kernel parameters ----
+    ld.param.u64   %base,  [p_base];
+    ld.param.u64   %offsp, [p_offs];
+    ld.param.u64   %outp,  [p_out];
+
+    // ---- thread / block index ----
+    mov.u32        %ltid, %tid.x;
+    cvt.u64.u32    %ltid64, %ltid;
+    mov.u32        %bid,  %ctaid.x;
+    cvt.u64.u32    %bid64, %bid;
+
+    // ---- this block's chunk offset: off = offs_ptr[blockIdx.x] ----
+    mul.lo.u64     %oaddr, %bid64, 8;
+    add.u64        %oaddr, %oaddr, %offsp;
+    ld.global.u64  %off,   [%oaddr];
+
+    // ---- source address for this thread ----
+    // src = base + off + threadIdx.x * 256
+    mul.lo.u64     %src, %ltid64, 256;
+    add.u64        %src, %src, %off;
+    add.u64        %src, %src, %base;
+
+    // ---- FNV-1a prime ----
+    mov.u64        %prime, 0x00000100000001b3;
+
+    // ========================================================
+    // Phase 1: each thread hashes its own 256-byte segment.
+    // ========================================================
+    mov.u64        %h, 0xcbf29ce484222325;
+    mov.u32        %n, 256;
+LOOP1:
+    setp.eq.u32    %cond, %n, 0;
+    @%cond bra     END1;
+    // ld.global.u8 loads 1 byte and zero-extends into the u32 register.
+    ld.global.u8   %byte32, [%src];
+    cvt.u64.u32    %tmp, %byte32;
+    xor.b64        %h, %h, %tmp;
+    mul.lo.u64     %h, %h, %prime;
+    add.u64        %src, %src, 1;
+    sub.u32        %n, %n, 1;
+    bra            LOOP1;
+END1:
+
+    // ---- write per-thread hash into shared memory ----
+    // mov.u64 on a .shared variable gives its shared-space address.
+    mov.u64        %smbase, smem;
+    mul.lo.u64     %smaddr, %ltid64, 8;
+    add.u64        %smaddr, %smaddr, %smbase;
+    st.shared.u64  [%smaddr], %h;
+
+    // Barrier: wait for all 256 threads in this block to finish phase 1.
+    bar.sync       0;
+
+    // ---- only thread 0 runs the reduction ----
+    setp.ne.u32    %cond, %ltid, 0;
+    @%cond ret;
+
+    // ========================================================
+    // Phase 2 (thread 0 only): FNV-1a over the 256 u64 values
+    // stored in shared memory, treating each as 8 LE bytes.
+    // ========================================================
+    mov.u64        %h,      0xcbf29ce484222325;
+    mov.u64        %smaddr, %smbase;
+    mov.u32        %n,      256;
+LOOP2:
+    setp.eq.u32    %cond, %n, 0;
+    @%cond bra     END2;
+
+    ld.shared.u64  %w, [%smaddr];
+    add.u64        %smaddr, %smaddr, 8;
+
+    // Unroll 8 bytes of the loaded u64 into the running FNV-1a hash.
+    and.b64        %tmp, %w, 0xff;  xor.b64 %h, %h, %tmp;  mul.lo.u64 %h, %h, %prime;
+    shr.u64        %w, %w, 8;
+    and.b64        %tmp, %w, 0xff;  xor.b64 %h, %h, %tmp;  mul.lo.u64 %h, %h, %prime;
+    shr.u64        %w, %w, 8;
+    and.b64        %tmp, %w, 0xff;  xor.b64 %h, %h, %tmp;  mul.lo.u64 %h, %h, %prime;
+    shr.u64        %w, %w, 8;
+    and.b64        %tmp, %w, 0xff;  xor.b64 %h, %h, %tmp;  mul.lo.u64 %h, %h, %prime;
+    shr.u64        %w, %w, 8;
+    and.b64        %tmp, %w, 0xff;  xor.b64 %h, %h, %tmp;  mul.lo.u64 %h, %h, %prime;
+    shr.u64        %w, %w, 8;
+    and.b64        %tmp, %w, 0xff;  xor.b64 %h, %h, %tmp;  mul.lo.u64 %h, %h, %prime;
+    shr.u64        %w, %w, 8;
+    and.b64        %tmp, %w, 0xff;  xor.b64 %h, %h, %tmp;  mul.lo.u64 %h, %h, %prime;
+    shr.u64        %w, %w, 8;
+    and.b64        %tmp, %w, 0xff;  xor.b64 %h, %h, %tmp;  mul.lo.u64 %h, %h, %prime;
+
+    sub.u32        %n, %n, 1;
+    bra            LOOP2;
+END2:
+
+    // out_ptr[blockIdx.x] = h
+    mul.lo.u64     %oaddr, %bid64, 8;
+    add.u64        %oaddr, %oaddr, %outp;
+    st.global.u64  [%oaddr], %h;
+    ret;
+}

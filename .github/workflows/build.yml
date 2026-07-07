@@ -1,0 +1,60 @@
+name: build
+
+# Build-only CI: GitHub-hosted runners have no NVIDIA GPU, so this verifies
+# that vramdisk.exe compiles on every push/PR. It intentionally does not run
+# `cargo test` — the unit tests allocate real GPU VRAM (`Vram::new`) and
+# require an actual CUDA device, which this workflow cannot provide.
+# GPU-dependent test/E2E verification stays a local/manual step (see
+# CURRENT.md). There is no installer to build (bundle.active=false in
+# tauri.conf.json) — vramdisk.exe is a standalone executable, so this is a
+# plain `cargo build`, no Node/npm/tauri-cli involved.
+#
+# There's only one binary: vramdisk.exe is both the GUI (default launch) and
+# the CLI (`vramdisk.exe cli ...` / `vramdisk.exe benchmark ...`), so building
+# it here covers both.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gui:
+    name: Build vramdisk.exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            src-tauri -> target
+
+      # winfsp-sys vendors its own headers/import libs, so no WinFsp install is
+      # needed here — but its bindgen step still needs MSVC's environment (for
+      # the CRT headers) and libclang.
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate libclang
+        shell: pwsh
+        run: |
+          $cand = "$env:ProgramFiles\LLVM\bin"
+          if (-not (Test-Path "$cand\libclang.dll")) {
+            throw "libclang.dll not found at $cand (expected preinstalled on windows-latest)"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$cand"
+
+      - name: cargo build
+        working-directory: src-tauri
+        run: cargo build --locked --release --verbose
+
+      - name: Upload standalone exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vramdisk
+          path: src-tauri/target/release/vramdisk.exe
+          if-no-files-found: error

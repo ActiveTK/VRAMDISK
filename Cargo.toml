@@ -1,0 +1,39 @@
+[package]
+name = "vramdisk"
+version = "0.1.0"
+edition = "2021"
+description = "VRAMDISK: GPU as a Storage - use GPU VRAM as a compressed, deduplicated RAM disk on Windows"
+license = "MIT"
+
+[lib]
+name = "vramdisk"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "cuda-12080", "dynamic-loading"] }
+libloading = "0.8"
+serde_json = "1"
+zstd = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[target.'cfg(windows)'.dependencies]
+winfsp = { version = "0.13", features = ["delayload"] }
+winfsp-sys = "0.12.1"
+widestring = "1"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+winfsp = { version = "0.13", features = ["delayload"] }

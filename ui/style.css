@@ -1,0 +1,476 @@
+:root {
+  --bg: #ffffff;
+  --field-bg: #f5f5f6;
+  --border: #dcdce0;
+  --text: #1a1a1e;
+  --muted: #75757e;
+  --accent: #3266d6;
+  --accent-text: #ffffff;
+  --accent-hover: #2a56ba;
+  --danger: #c23c34;
+  --danger-text: #ffffff;
+  --danger-hover: #a5322b;
+  --good: #1f8a5f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1d20;
+    --field-bg: #26272b;
+    --border: #38393e;
+    --text: #ececee;
+    --muted: #9a9aa2;
+    --accent: #4d7ef0;
+    --accent-text: #ffffff;
+    --accent-hover: #6491f2;
+    --danger: #e0554c;
+    --danger-text: #1c1d20;
+    --danger-hover: #e8756d;
+    --good: #3fbf87;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* The `hidden` attribute must always win over any element's own `display`
+   rule (e.g. `.field { display: flex }`) — author rules otherwise beat the
+   UA stylesheet's [hidden]{display:none} regardless of specificity. */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--text);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.app {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+}
+
+.screen {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.title {
+  margin: 0 0 2px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: var(--muted);
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field.grow {
+  flex: 1;
+}
+
+label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.hint {
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.hint.error {
+  color: var(--danger);
+}
+
+select,
+input[type="text"],
+input[type="number"] {
+  appearance: none;
+  background: var(--field-bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 7px 9px;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  width: 100%;
+}
+
+select:focus,
+input:focus {
+  border-color: var(--accent);
+}
+
+/* Native appearance is stripped above (appearance:none), which also removes
+   the dropdown arrow. Re-add a chevron so selects read as selectable. The
+   stroke colour is baked into the SVG (currentColor can't reach a
+   background-image), so light/dark get their own copy. */
+select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2375757e' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  padding-right: 28px;
+}
+
+@media (prefers-color-scheme: dark) {
+  select {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239a9aa2' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  }
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+/* A little extra breathing room between the mount-destination input, the
+   size row, the option checkboxes, and the mount button. */
+.size-field,
+.check-row,
+#mount-btn {
+  margin-top: 9px;
+}
+
+/* Size row: label + input + unit on one centered line. */
+.size-row {
+  justify-content: center;
+  align-items: center;
+}
+
+#size-label {
+  flex: none;
+}
+
+#size-error {
+  text-align: center;
+}
+
+#size-value {
+  width: 90px;
+  flex: none;
+}
+
+#size-unit {
+  width: auto;
+  flex: none;
+}
+
+#mount-folder-field .row {
+  align-items: center;
+}
+
+#mount-folder-field input {
+  flex: 1;
+  min-width: 0;
+}
+
+#mount-folder-field .btn {
+  flex: none;
+  padding: 7px 12px;
+  font-size: 12.5px;
+}
+
+/* input + "参照..." button rows (archive panel) */
+.row.with-browse {
+  align-items: center;
+}
+
+.row.with-browse > input[type="text"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.row.with-browse > .btn {
+  flex: none;
+  padding: 7px 12px;
+  font-size: 12.5px;
+}
+
+.check-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px 18px;
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: default;
+}
+
+.check-inline {
+  padding-bottom: 7px;
+}
+
+input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--field-bg);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn:hover {
+  border-color: var(--muted);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.btn-block {
+  width: 100%;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.btn-danger {
+  background: var(--bg);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.btn-danger:hover {
+  background: var(--danger);
+  color: var(--danger-text);
+}
+
+.btn-ghost {
+  background: transparent;
+}
+
+.status-text {
+  font-size: 12px;
+  color: var(--muted);
+  min-height: 14px;
+}
+
+.status-text.error {
+  color: var(--danger);
+}
+
+.status-text.ok {
+  color: var(--good);
+}
+
+/* Mounted screen */
+.mounted-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.drive-letter {
+  font-size: 26px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.drive-letter.long {
+  font-size: 14px;
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+
+.mounted-sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--field-bg);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.bar > i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+}
+
+.usage-text {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: -6px;
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--field-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 9px;
+}
+
+.stat .k {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.stat .v {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.tool-row {
+  display: flex;
+  gap: 8px;
+}
+
+.tool-row .btn {
+  flex: 1;
+  font-size: 12px;
+  padding: 8px 6px;
+  line-height: 1.3;
+}
+
+/* Panels (hash / archive) */
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.btn-back {
+  appearance: none;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+
+.btn-back:hover {
+  color: var(--text);
+}
+
+.tabs {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.tab {
+  flex: 1;
+  appearance: none;
+  border: none;
+  background: var(--bg);
+  color: var(--muted);
+  padding: 7px 0;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.tab + .tab {
+  border-left: 1px solid var(--border);
+}
+
+.tab.active {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.kv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.kv-row {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  background: var(--field-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 9px;
+  font-size: 12px;
+}
+
+.kv-row .kv-key {
+  color: var(--muted);
+  flex: none;
+}
+
+.kv-row .kv-val {
+  text-align: right;
+  overflow-wrap: anywhere;
+  font-family: "Cascadia Code", Consolas, monospace;
+}
