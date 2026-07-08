@@ -36,6 +36,20 @@ nvCOMPは以下から入手できます。
 
 https://developer.nvidia.com/nvcomp-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local
 
+## 導入時のエラーについて
+
+### 「VCRUNTIME140.dll が見つからないため、コードの実行を続行できません」と表示された場合
+
+以下から、Microsoft Visual C++ 再頒布可能パッケージ（VC++ ランタイム）を導入してください。
+
+https://aka.ms/vc14/vc_redist.x64.exe
+
+### 「Cloud not find the WebView2 Runtime」と表示された場合
+
+以下から、WebView2ランタイムを導入してください。Evergreen Standalone Installerで大丈夫です。
+
+https://developer.microsoft.com/en-us/microsoft-edge/webview2?form=MA13LH#download
+
 ## ビルド方法
 
 Visual Studio Dev Shell環境が必要です。以下のコマンドでビルドできます。
