@@ -20,6 +20,10 @@ use crate::gpu_hash::GpuHasher;
 use crate::lookup::{Codec, LookupError, LookupTable, Node, Placement};
 use crate::nvcomp::{Lz4Codec, NvcompBatchedCodec, NvcompFrameCodec};
 use crate::CHUNK_SIZE;
+use digest::Digest;
+use md5::Md5;
+use sha1::Sha1;
+use sha2::Sha256;
 
 const ZIP_DEFLATE_CHUNK: u64 = 1024 * 1024;
 
@@ -37,6 +41,65 @@ const ENTROPY_SKIP_THRESHOLD: f64 = 7.2;
 /// Number of 256-byte windows sampled evenly across the chunk for the entropy
 /// estimate. More windows → more accurate but slightly more CPU time.
 const ENTROPY_WINDOWS: usize = 8;
+pub(crate) const CPU_HASH_WINDOW_BYTES: usize = 32 * 1024 * 1024;
+
+/// GPU hash routing derives both knobs from one measured single-thread SHA-256
+/// throughput on device memory:
+///   - launch budget targets ~100 ms per kernel to stay well below Windows TDR
+///   - CPU routing threshold targets ~250 ms, above which a single stream is
+///     better left to SHA-NI/AVX2 on CPU
+/// Hard clamps keep behavior stable on unusually slow/fast devices.
+const GPU_HASH_CALIBRATION_BYTES: u64 = 1 * 1024 * 1024;
+const GPU_HASH_LAUNCH_TARGET_SECS: f64 = 0.10;
+const GPU_HASH_ROUTE_TARGET_SECS: f64 = 0.25;
+const GPU_HASH_LAUNCH_BUDGET_MIN_BYTES: u64 = 4 * 1024 * 1024;
+const GPU_HASH_LAUNCH_BUDGET_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const GPU_HASH_ROUTE_THRESHOLD_MIN_BYTES: u64 = 1 * 1024 * 1024;
+const GPU_HASH_ROUTE_THRESHOLD_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpuHashCalibration {
+    pub sample_bytes: u64,
+    pub sample_elapsed_secs: f64,
+    pub throughput_bytes_per_sec: f64,
+    pub launch_budget_bytes: u64,
+    pub cpu_route_threshold_bytes: u64,
+}
+
+fn clamp_gpu_hash_launch_budget(budget: u64) -> u64 {
+    budget.clamp(
+        GPU_HASH_LAUNCH_BUDGET_MIN_BYTES,
+        GPU_HASH_LAUNCH_BUDGET_MAX_BYTES,
+    )
+}
+
+fn clamp_hash_cpu_route_threshold(threshold: u64) -> u64 {
+    threshold.clamp(
+        GPU_HASH_ROUTE_THRESHOLD_MIN_BYTES,
+        GPU_HASH_ROUTE_THRESHOLD_MAX_BYTES,
+    )
+}
+
+fn calibration_from_throughput(
+    sample_bytes: u64,
+    sample_elapsed_secs: f64,
+    throughput_bytes_per_sec: f64,
+) -> GpuHashCalibration {
+    let launch_budget_bytes =
+        clamp_gpu_hash_launch_budget((throughput_bytes_per_sec * GPU_HASH_LAUNCH_TARGET_SECS) as u64);
+    let cpu_route_threshold_bytes = clamp_hash_cpu_route_threshold(
+        (throughput_bytes_per_sec * GPU_HASH_ROUTE_TARGET_SECS) as u64,
+    );
+    GpuHashCalibration {
+        sample_bytes,
+        sample_elapsed_secs,
+        throughput_bytes_per_sec,
+        launch_budget_bytes,
+        cpu_route_threshold_bytes,
+    }
+}
 
 /// Compute the Shannon entropy (bits/byte) of a 256-byte window.
 fn window_entropy(window: &[u8]) -> f64 {
@@ -108,6 +171,8 @@ pub enum EngineError {
     NoSpace,
     /// Operation expected a file but found a directory.
     NotAFile,
+    /// Cooperative cancellation requested by the caller.
+    Cancelled,
     /// Underlying CUDA failure.
     Cuda(#[allow(dead_code)] String),
 }
@@ -122,6 +187,25 @@ pub type EResult<T> = Result<T, EngineError>;
 
 fn cuda<T>(r: anyhow::Result<T>) -> EResult<T> {
     r.map_err(|e| EngineError::Cuda(format!("{e:#}")))
+}
+
+fn cancelled<T>() -> EResult<T> {
+    Err(EngineError::Cancelled)
+}
+
+fn archive_vram_exhausted(detail: &str) -> EngineError {
+    EngineError::Cuda(format!(
+        "archive job needs more free VRAM to {detail}; free space, use a larger mount, or retry on an uncompressed mount"
+    ))
+}
+
+fn map_archive_job_result<T>(result: EResult<T>) -> EResult<T> {
+    result.map_err(|err| match err {
+        EngineError::NoSpace => {
+            archive_vram_exhausted("materialize compressed data or write temporary archive buffers")
+        }
+        other => other,
+    })
 }
 
 /// Number of logical chunks needed to hold `size` bytes.
@@ -219,6 +303,119 @@ pub struct ArchiveExtractStats {
     pub elapsed_ms: u128,
 }
 
+#[derive(Debug, Default)]
+struct ArchiveMaterializedSegments {
+    segs: Vec<HashSegment>,
+    temp_chunks: Vec<ChunkId>,
+}
+
+/// Upper bound for one encode staging pass (input side). Big enough to
+/// amortise launches, small enough to fit comfortably next to the user's
+/// data. Must be a multiple of 12 (lcm of all transcoding group sizes).
+const ENCODE_STAGE_BYTES: u64 = 48 * 1024 * 1024;
+
+/// Transcoding codec for GPU encode/decode jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodeCodec {
+    Base64,
+    Hex,
+}
+
+impl EncodeCodec {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "base64" | "b64" => Some(Self::Base64),
+            "hex" | "base16" => Some(Self::Hex),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Base64 => "base64",
+            Self::Hex => "hex",
+        }
+    }
+}
+
+/// Direction of a GPU encode/decode job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodeDirection {
+    Encode,
+    Decode,
+}
+
+impl EncodeDirection {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "encode" | "enc" => Some(Self::Encode),
+            "decode" | "dec" => Some(Self::Decode),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Encode => "encode",
+            Self::Decode => "decode",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EncodeJobStats {
+    pub codec: String,
+    pub direction: String,
+    pub input: String,
+    pub output: String,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub elapsed_ms: u128,
+}
+
+/// Decode the final 4-character Base64 group, which is the only place `=`
+/// padding is legal. Returns the 1–3 decoded bytes.
+fn decode_base64_quad(quad: &[u8]) -> EResult<Vec<u8>> {
+    if quad.len() != 4 {
+        return Err(EngineError::Cuda("truncated base64 group".into()));
+    }
+    fn val(c: u8) -> EResult<u32> {
+        match c {
+            b'A'..=b'Z' => Ok((c - b'A') as u32),
+            b'a'..=b'z' => Ok((c - b'a') as u32 + 26),
+            b'0'..=b'9' => Ok((c - b'0') as u32 + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(EngineError::Cuda(format!(
+                "invalid base64 character 0x{c:02x}"
+            ))),
+        }
+    }
+    let pads = match (quad[2], quad[3]) {
+        (b'=', b'=') => 2,
+        (b'=', _) => {
+            return Err(EngineError::Cuda(
+                "invalid base64 padding: '=' may only end the data".into(),
+            ))
+        }
+        (_, b'=') => 1,
+        _ => 0,
+    };
+    let v0 = val(quad[0])?;
+    let v1 = val(quad[1])?;
+    let v2 = if pads >= 2 { 0 } else { val(quad[2])? };
+    let v3 = if pads >= 1 { 0 } else { val(quad[3])? };
+    let word = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+    let mut out = vec![(word >> 16) as u8];
+    if pads < 2 {
+        out.push((word >> 8) as u8);
+    }
+    if pads < 1 {
+        out.push(word as u8);
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkPlacementReport {
     Sparse,
@@ -248,26 +445,23 @@ pub enum ChunkPlacementReport {
 /// existing VRAM chunk.
 fn fnv1a(data: &[u8]) -> u64 {
     debug_assert_eq!(data.len(), CHUNK_SIZE as usize);
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-
     // Phase 1: hash each 256-byte segment independently.
     let mut seg_hashes = [0u64; 256];
     for t in 0..256 {
-        let mut h = BASIS;
+        let mut h = FNV1A64_OFFSET_BASIS;
         for &b in &data[t * 256..(t + 1) * 256] {
             h ^= b as u64;
-            h = h.wrapping_mul(PRIME);
+            h = h.wrapping_mul(FNV1A64_PRIME);
         }
         seg_hashes[t] = h;
     }
 
     // Phase 2: FNV-1a over the segment hashes (8 LE bytes each).
-    let mut h = BASIS;
+    let mut h = FNV1A64_OFFSET_BASIS;
     for sh in seg_hashes {
         for byte_idx in 0..8u64 {
             h ^= (sh >> (byte_idx * 8)) & 0xff;
-            h = h.wrapping_mul(PRIME);
+            h = h.wrapping_mul(FNV1A64_PRIME);
         }
     }
     h
@@ -324,6 +518,47 @@ fn fnv1a_chunks(data: &[u8]) -> Vec<u64> {
     out
 }
 
+pub(crate) enum CpuHashState {
+    Md5(Md5),
+    Sha1(Sha1),
+    Sha256(Sha256),
+    Fnv1a64(u64),
+}
+
+impl CpuHashState {
+    pub(crate) fn new(alg: HashAlgorithm) -> Self {
+        match alg {
+            HashAlgorithm::Md5 => Self::Md5(Md5::new()),
+            HashAlgorithm::Sha1 => Self::Sha1(Sha1::new()),
+            HashAlgorithm::Sha256 => Self::Sha256(Sha256::new()),
+            HashAlgorithm::Fnv1a64 => Self::Fnv1a64(FNV1A64_OFFSET_BASIS),
+        }
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Md5(hasher) => hasher.update(bytes),
+            Self::Sha1(hasher) => hasher.update(bytes),
+            Self::Sha256(hasher) => hasher.update(bytes),
+            Self::Fnv1a64(state) => {
+                for &b in bytes {
+                    *state ^= b as u64;
+                    *state = state.wrapping_mul(FNV1A64_PRIME);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn finalize(self) -> Vec<u8> {
+        match self {
+            Self::Md5(hasher) => hasher.finalize().to_vec(),
+            Self::Sha1(hasher) => hasher.finalize().to_vec(),
+            Self::Sha256(hasher) => hasher.finalize().to_vec(),
+            Self::Fnv1a64(state) => state.to_be_bytes().to_vec(),
+        }
+    }
+}
+
 pub struct StorageEngine {
     vram: Vram,
     alloc: ChunkAllocator,
@@ -358,6 +593,11 @@ pub struct StorageEngine {
     gpu_hasher: Option<GpuHasher>,
     /// Generic CUDA kernels used by `$VRAMDISK` virtual APIs.
     api_kernel: Option<ApiKernel>,
+    gpu_hash_launch_budget: u64,
+    hash_cpu_route_threshold: u64,
+    gpu_hash_launch_budget_override: bool,
+    hash_cpu_route_threshold_override: bool,
+    gpu_hash_calibration: Option<GpuHashCalibration>,
     trace: EngineTrace,
 }
 
@@ -404,6 +644,11 @@ impl StorageEngine {
             vram_base,
             gpu_hasher,
             api_kernel: None,
+            gpu_hash_launch_budget: GPU_HASH_LAUNCH_BUDGET_MIN_BYTES,
+            hash_cpu_route_threshold: GPU_HASH_ROUTE_THRESHOLD_MIN_BYTES,
+            gpu_hash_launch_budget_override: false,
+            hash_cpu_route_threshold_override: false,
+            gpu_hash_calibration: None,
             trace: EngineTrace::default(),
         })
     }
@@ -422,6 +667,15 @@ impl StorageEngine {
 
     pub fn used_chunks(&self) -> u32 {
         self.alloc.used()
+    }
+
+    /// O(1) volume totals for `GetDiskFreeSpaceEx`-style callers. Explorer
+    /// polls volume info continuously during copies, so this must not walk the
+    /// namespace the way [`stats`](Self::stats) does.
+    pub fn volume_usage(&self) -> (u64, u64) {
+        let total = self.total_chunks() as u64 * CHUNK_SIZE;
+        let free = (self.total_chunks() - self.used_chunks()) as u64 * CHUNK_SIZE;
+        (total, free)
     }
 
     pub fn stats(&self) -> EngineStats {
@@ -483,6 +737,41 @@ impl StorageEngine {
 
     pub fn trace_snapshot(&self) -> EngineTrace {
         self.trace.clone()
+    }
+
+    pub fn gpu_hash_launch_budget(&self) -> u64 {
+        self.gpu_hash_launch_budget
+    }
+
+    pub fn hash_cpu_route_threshold(&self) -> u64 {
+        self.hash_cpu_route_threshold
+    }
+
+    pub fn gpu_hash_calibration(&self) -> Option<GpuHashCalibration> {
+        self.gpu_hash_calibration
+    }
+
+    pub fn set_gpu_hash_launch_budget(&mut self, budget: u64) {
+        self.gpu_hash_launch_budget = clamp_gpu_hash_launch_budget(budget);
+        self.gpu_hash_launch_budget_override = true;
+    }
+
+    pub fn set_hash_cpu_route_threshold(&mut self, threshold: u64) {
+        self.hash_cpu_route_threshold = clamp_hash_cpu_route_threshold(threshold);
+        self.hash_cpu_route_threshold_override = true;
+    }
+
+    pub fn file_size(&self, path: &str) -> EResult<u64> {
+        let node = self.table.get(path).ok_or(LookupError::NotFound)?;
+        if node.is_dir {
+            return Err(EngineError::NotAFile);
+        }
+        Ok(node.size)
+    }
+
+    pub fn should_hash_on_gpu_routed(&mut self, path: &str) -> EResult<bool> {
+        self.ensure_hash_calibration()?;
+        self.should_hash_on_gpu(path)
     }
 
     #[allow(dead_code)]
@@ -745,6 +1034,15 @@ impl StorageEngine {
                         }
                         self.compressed_refcount.remove(&offset);
                         self.compressed_index_remove(Placement::Compressed { offset, len, codec });
+                    } else {
+                        // Every compressed placement created under dedup seeds
+                        // its refcount via compressed_index_insert; a missing
+                        // entry means the invariant broke somewhere and
+                        // freeing the blob could double-free a shared region.
+                        debug_assert!(
+                            false,
+                            "compressed placement at {offset} missing refcount under dedup"
+                        );
                     }
                 }
                 if let Some(freed_chunk) = self.carena.free(offset, len) {
@@ -768,18 +1066,26 @@ impl StorageEngine {
     fn decompress_blob(&mut self, offset: u64, len: u32, codec: Codec) -> EResult<Vec<u8>> {
         let mut buf = vec![0u8; len as usize];
         cuda(self.vram.read_at(offset, &mut buf))?;
-        match codec {
+        let full = match codec {
             Codec::Lz4 => {
-                let lz4 = self
-                    .codec
-                    .as_mut()
-                    .expect("nvCOMP codec present when compress=true");
-                cuda(lz4.decompress(&buf, CHUNK_SIZE as usize))
+                let lz4 = self.codec.as_mut().ok_or_else(|| {
+                    EngineError::Cuda("LZ4 chunk without nvCOMP codec".into())
+                })?;
+                cuda(lz4.decompress(&buf, CHUNK_SIZE as usize))?
             }
             Codec::Zstd => {
-                zstd::decode_all(buf.as_slice()).map_err(|e| EngineError::Cuda(e.to_string()))
+                zstd::decode_all(buf.as_slice()).map_err(|e| EngineError::Cuda(e.to_string()))?
             }
+        };
+        // Consumers slice/overwrite the result as a full chunk; a short or
+        // oversized decode would panic or spill into a neighbouring chunk.
+        if full.len() != CHUNK_SIZE as usize {
+            return Err(EngineError::Cuda(format!(
+                "compressed blob decoded to {} bytes, expected {CHUNK_SIZE}",
+                full.len()
+            )));
         }
+        Ok(full)
     }
 
     /// Materialize the full 64KiB content of logical chunk `lc` (zeros for a
@@ -809,6 +1115,114 @@ impl StorageEngine {
         cuda(self.api_kernel()?.update(segments))
     }
 
+    fn ensure_hash_calibration(&mut self) -> EResult<()> {
+        if self.gpu_hash_calibration.is_some() {
+            return Ok(());
+        }
+        let calibration = {
+            let vram_base = self.vram_base;
+            let vram_size = self.vram.size();
+            let kernel = self.api_kernel()?;
+            Self::measure_gpu_hash_calibration(kernel, vram_base, vram_size)?
+        };
+        if !self.gpu_hash_launch_budget_override {
+            self.gpu_hash_launch_budget = calibration.launch_budget_bytes;
+        }
+        if !self.hash_cpu_route_threshold_override {
+            self.hash_cpu_route_threshold = calibration.cpu_route_threshold_bytes;
+        }
+        self.gpu_hash_calibration = Some(calibration);
+        Ok(())
+    }
+
+    fn measure_gpu_hash_calibration(
+        kernel: &mut ApiKernel,
+        vram_base: u64,
+        vram_size: u64,
+    ) -> EResult<GpuHashCalibration> {
+        let sample_bytes = GPU_HASH_CALIBRATION_BYTES.min(vram_size).max(1);
+        let started = Instant::now();
+        cuda(kernel.begin(HashAlgorithm::Sha256))?;
+        cuda(kernel.update(&[HashSegment {
+            ptr: vram_base,
+            len: u32::try_from(sample_bytes).unwrap_or(u32::MAX),
+            kind: 0,
+        }]))?;
+        let _ = cuda(kernel.finish(HashAlgorithm::Sha256))?;
+        let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
+        let throughput = sample_bytes as f64 / elapsed;
+        Ok(calibration_from_throughput(
+            sample_bytes,
+            elapsed,
+            throughput,
+        ))
+    }
+
+    fn file_has_only_raw_sparse(&self, path: &str) -> EResult<bool> {
+        let node = self.table.get(path).ok_or(LookupError::NotFound)?;
+        if node.is_dir {
+            return Err(EngineError::NotAFile);
+        }
+        Ok(node
+            .coords
+            .iter()
+            .all(|placement| matches!(placement, None | Some(Placement::Raw { .. }))))
+    }
+
+    fn file_supports_gpu_hash(&self, path: &str) -> EResult<bool> {
+        let node = self.table.get(path).ok_or(LookupError::NotFound)?;
+        if node.is_dir {
+            return Err(EngineError::NotAFile);
+        }
+        Ok(node.coords.iter().all(|placement| {
+            matches!(
+                placement,
+                None
+                    | Some(Placement::Raw { .. })
+                    | Some(Placement::Compressed {
+                        codec: Codec::Lz4,
+                        ..
+                    })
+            )
+        }))
+    }
+
+    fn should_hash_on_gpu(&self, path: &str) -> EResult<bool> {
+        let node = self.table.get(path).ok_or(LookupError::NotFound)?;
+        if node.is_dir {
+            return Err(EngineError::NotAFile);
+        }
+        Ok(node.size <= self.hash_cpu_route_threshold && self.file_supports_gpu_hash(path)?)
+    }
+
+    pub fn hash_file_cpu(&mut self, path: &str, alg: HashAlgorithm) -> EResult<Vec<u8>> {
+        let (size, is_dir) = {
+            let node = self.table.get(path).ok_or(LookupError::NotFound)?;
+            (node.size, node.is_dir)
+        };
+        if is_dir {
+            return Err(EngineError::NotAFile);
+        }
+        let mut hasher = CpuHashState::new(alg);
+        let mut offset = 0u64;
+        while offset < size {
+            let take = ((size - offset).min(CPU_HASH_WINDOW_BYTES as u64)) as usize;
+            let chunk = self.read(path, offset, take)?;
+            hasher.update(&chunk);
+            offset += chunk.len() as u64;
+        }
+        Ok(hasher.finalize())
+    }
+
+    pub fn hash_file(&mut self, path: &str, alg: HashAlgorithm) -> EResult<Vec<u8>> {
+        self.ensure_hash_calibration()?;
+        if self.should_hash_on_gpu(path)? {
+            self.hash_file_gpu(path, alg)
+        } else {
+            self.hash_file_cpu(path, alg)
+        }
+    }
+
     /// Hash a file using CUDA-resident data only. Raw chunks are read in place
     /// from the VRAM buffer; LZ4-compressed chunks are decompressed by nvCOMP
     /// into device scratch and immediately consumed by the API hash kernel.
@@ -817,6 +1231,19 @@ impl StorageEngine {
     /// CPU zstd fallback chunks cannot satisfy the GPU-only contract and are
     /// rejected instead of silently pulling file bytes through host memory.
     pub fn hash_file_gpu(&mut self, path: &str, alg: HashAlgorithm) -> EResult<Vec<u8>> {
+        self.hash_file_gpu_cancellable(path, alg, || false)
+    }
+
+    pub fn hash_file_gpu_cancellable<F>(
+        &mut self,
+        path: &str,
+        alg: HashAlgorithm,
+        mut should_cancel: F,
+    ) -> EResult<Vec<u8>>
+    where
+        F: FnMut() -> bool,
+    {
+        self.ensure_hash_calibration()?;
         let (size, is_dir) = {
             let node = self.table.get(path).ok_or(LookupError::NotFound)?;
             (node.size, node.is_dir)
@@ -830,90 +1257,100 @@ impl StorageEngine {
             return cuda(self.api_kernel()?.finish(alg));
         }
 
-        let max_segments = self.api_kernel()?.max_segments().min(crate::nvcomp::BATCH);
-        let logical = logical_chunks(size);
-        let mut lc = 0usize;
-        while lc < logical {
-            let mut segs = Vec::with_capacity(max_segments);
-
-            while lc < logical && segs.len() < max_segments {
-                let in_file_off = lc as u64 * CHUNK_SIZE;
-                let take = (size - in_file_off).min(CHUNK_SIZE) as u32;
-                match self.coord(path, lc) {
-                    None => segs.push(HashSegment {
-                        ptr: 0,
-                        len: take,
-                        kind: 1,
-                    }),
-                    Some(Placement::Raw { chunk }) => segs.push(HashSegment {
-                        ptr: self.vram_base + chunk as u64 * CHUNK_SIZE,
-                        len: take,
-                        kind: 0,
-                    }),
-                    Some(Placement::Compressed {
-                        codec: Codec::Lz4, ..
-                    }) => break,
-                    Some(Placement::Compressed {
-                        codec: Codec::Zstd, ..
-                    }) => {
-                        return Err(EngineError::Cuda(
-                            "GPU-only hash is unavailable for CPU zstd fallback chunks".into(),
-                        ));
+        let budget = self.gpu_hash_launch_budget;
+        let raw_seg_limit = budget.div_ceil(CHUNK_SIZE) as usize;
+        let comp_seg_limit = raw_seg_limit.min(crate::nvcomp::BATCH);
+        let mut pos = 0u64;
+        while pos < size {
+            if should_cancel() {
+                return cancelled();
+            }
+            let lc = (pos / CHUNK_SIZE) as usize;
+            match self.coord(path, lc) {
+                None | Some(Placement::Raw { .. }) => {
+                    let mut segs = Vec::with_capacity(raw_seg_limit);
+                    let mut used = 0u64;
+                    while pos < size && segs.len() < raw_seg_limit && used < budget {
+                        let lc = (pos / CHUNK_SIZE) as usize;
+                        let in_off = pos % CHUNK_SIZE;
+                        let take = (size - pos).min(CHUNK_SIZE - in_off).min(budget - used) as u32;
+                        match self.coord(path, lc) {
+                            None => segs.push(HashSegment {
+                                ptr: 0,
+                                len: take,
+                                kind: 1,
+                            }),
+                            Some(Placement::Raw { chunk }) => segs.push(HashSegment {
+                                ptr: self.vram_base + chunk as u64 * CHUNK_SIZE + in_off,
+                                len: take,
+                                kind: 0,
+                            }),
+                            Some(Placement::Compressed { .. }) => break,
+                        }
+                        pos += take as u64;
+                        used += take as u64;
+                    }
+                    if !segs.is_empty() {
+                        self.update_api_hash(&segs)?;
                     }
                 }
-                lc += 1;
-            }
-
-            if !segs.is_empty() {
-                self.update_api_hash(&segs)?;
-                continue;
-            }
-
-            let mut blobs = Vec::with_capacity(max_segments);
-            let start_lc = lc;
-            while lc < logical && blobs.len() < max_segments {
-                match self.coord(path, lc) {
-                    Some(Placement::Compressed {
-                        offset,
-                        len,
-                        codec: Codec::Lz4,
-                    }) => {
-                        blobs.push((offset, len));
-                        lc += 1;
+                Some(Placement::Compressed {
+                    codec: Codec::Lz4, ..
+                }) => {
+                    let mut blobs = Vec::with_capacity(comp_seg_limit);
+                    let mut parts = Vec::with_capacity(comp_seg_limit);
+                    let mut used = 0u64;
+                    while pos < size && blobs.len() < comp_seg_limit && used < budget {
+                        let lc = (pos / CHUNK_SIZE) as usize;
+                        let in_off = pos % CHUNK_SIZE;
+                        let take = (size - pos).min(CHUNK_SIZE - in_off).min(budget - used) as u32;
+                        match self.coord(path, lc) {
+                            Some(Placement::Compressed {
+                                offset,
+                                len,
+                                codec: Codec::Lz4,
+                            }) => {
+                                blobs.push((offset, len));
+                                parts.push((in_off, take));
+                                pos += take as u64;
+                                used += take as u64;
+                            }
+                            Some(Placement::Compressed {
+                                codec: Codec::Zstd, ..
+                            }) => {
+                                return Err(EngineError::Cuda(
+                                    "GPU-only hash is unavailable for CPU zstd fallback chunks"
+                                        .into(),
+                                ));
+                            }
+                            _ => break,
+                        }
                     }
-                    Some(Placement::Compressed {
-                        codec: Codec::Zstd, ..
-                    }) => {
-                        return Err(EngineError::Cuda(
-                            "GPU-only hash is unavailable for CPU zstd fallback chunks".into(),
-                        ));
+
+                    let vram_base = self.vram_base;
+                    let codec = self.codec.as_mut().ok_or_else(|| {
+                        EngineError::Cuda("LZ4 chunk without nvCOMP codec".into())
+                    })?;
+                    cuda(codec.decompress_from_arena_dev(vram_base, &blobs))?;
+
+                    let mut segs = Vec::with_capacity(parts.len());
+                    for (i, (in_off, take)) in parts.into_iter().enumerate() {
+                        segs.push(HashSegment {
+                            ptr: codec.uncomp_slot_ptr(i) + in_off,
+                            len: take,
+                            kind: 0,
+                        });
                     }
-                    _ => break,
+                    self.update_api_hash(&segs)?;
+                }
+                Some(Placement::Compressed {
+                    codec: Codec::Zstd, ..
+                }) => {
+                    return Err(EngineError::Cuda(
+                        "GPU-only hash is unavailable for CPU zstd fallback chunks".into(),
+                    ));
                 }
             }
-
-            if blobs.is_empty() {
-                continue;
-            }
-            let vram_base = self.vram_base;
-            let codec = self
-                .codec
-                .as_mut()
-                .ok_or_else(|| EngineError::Cuda("LZ4 chunk without nvCOMP codec".into()))?;
-            cuda(codec.decompress_from_arena_dev(vram_base, &blobs))?;
-
-            let mut comp_segs = Vec::with_capacity(blobs.len());
-            for i in 0..blobs.len() {
-                let chunk_lc = start_lc + i;
-                let in_file_off = chunk_lc as u64 * CHUNK_SIZE;
-                let take = (size - in_file_off).min(CHUNK_SIZE) as u32;
-                comp_segs.push(HashSegment {
-                    ptr: codec.uncomp_slot_ptr(i),
-                    len: take,
-                    kind: 0,
-                });
-            }
-            self.update_api_hash(&comp_segs)?;
         }
 
         cuda(self.api_kernel()?.finish(alg))
@@ -924,8 +1361,24 @@ impl StorageEngine {
         paths: &[String],
         alg: HashAlgorithm,
     ) -> EResult<Vec<Vec<u8>>> {
-        let mut files = Vec::with_capacity(paths.len());
-        for path in paths {
+        self.hash_files_gpu_many_cancellable(paths, alg, || false)
+    }
+
+    pub fn hash_files_gpu_many_cancellable<F>(
+        &mut self,
+        paths: &[String],
+        alg: HashAlgorithm,
+        mut should_cancel: F,
+    ) -> EResult<Vec<Vec<u8>>>
+    where
+        F: FnMut() -> bool,
+    {
+        self.ensure_hash_calibration()?;
+        let mut out = vec![Vec::new(); paths.len()];
+        let mut batch_paths = Vec::new();
+        let mut batch_sizes = Vec::new();
+        let mut batch_indices = Vec::new();
+        for (idx, path) in paths.iter().enumerate() {
             let (size, is_dir) = {
                 let node = self.table.get(path).ok_or(LookupError::NotFound)?;
                 (node.size, node.is_dir)
@@ -933,33 +1386,98 @@ impl StorageEngine {
             if is_dir {
                 return Err(EngineError::NotAFile);
             }
-
-            let logical = logical_chunks(size);
-            let mut segs = Vec::with_capacity(logical);
-            for lc in 0..logical {
-                let in_file_off = lc as u64 * CHUNK_SIZE;
-                let take = (size - in_file_off).min(CHUNK_SIZE) as u32;
-                match self.coord(path, lc) {
-                    None => segs.push(HashSegment {
-                        ptr: 0,
-                        len: take,
-                        kind: 1,
-                    }),
-                    Some(Placement::Raw { chunk }) => segs.push(HashSegment {
-                        ptr: self.vram_base + chunk as u64 * CHUNK_SIZE,
-                        len: take,
-                        kind: 0,
-                    }),
-                    Some(Placement::Compressed { .. }) => {
-                        return Err(EngineError::Cuda(
-                            "batched GPU hash currently requires raw/sparse file placements".into(),
-                        ));
-                    }
-                }
+            if self.file_has_only_raw_sparse(path)? {
+                batch_indices.push(idx);
+                batch_paths.push(path.clone());
+                batch_sizes.push(size);
+            } else {
+                out[idx] = self.hash_file_gpu_cancellable(path, alg, &mut should_cancel)?;
             }
-            files.push(segs);
         }
-        cuda(self.api_kernel()?.hash_many(alg, &files))
+
+        if batch_paths.is_empty() {
+            return Ok(out);
+        }
+
+        let budget = self.gpu_hash_launch_budget;
+        let nfiles = batch_paths.len();
+        let mut offsets = vec![0u64; nfiles];
+        cuda(self.api_kernel()?.begin_many(alg, nfiles))?;
+        while offsets
+            .iter()
+            .zip(batch_sizes.iter())
+            .any(|(&offset, &size)| offset < size)
+        {
+            if should_cancel() {
+                return cancelled();
+            }
+            let mut round = Vec::with_capacity(nfiles);
+            let mut progressed = false;
+            for ((path, &size), offset) in batch_paths
+                .iter()
+                .zip(batch_sizes.iter())
+                .zip(offsets.iter_mut())
+            {
+                let take = size.saturating_sub(*offset).min(budget);
+                if take == 0 {
+                    round.push(Vec::new());
+                    continue;
+                }
+                round.push(self.file_segments_raw(path, *offset, take)?);
+                *offset += take;
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+            cuda(self.api_kernel()?.update_many(&round))?;
+        }
+
+        let digests = cuda(self.api_kernel()?.finish_many(alg, nfiles))?;
+        for (idx, digest) in batch_indices.into_iter().zip(digests.into_iter()) {
+            out[idx] = digest;
+        }
+        Ok(out)
+    }
+
+    pub fn hash_files_many(
+        &mut self,
+        paths: &[String],
+        alg: HashAlgorithm,
+    ) -> EResult<Vec<Vec<u8>>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ensure_hash_calibration()?;
+
+        let mut out = vec![Vec::new(); paths.len()];
+        let mut gpu_paths = Vec::new();
+        let mut gpu_indices = Vec::new();
+        let mut cpu_paths = Vec::new();
+        let mut cpu_indices = Vec::new();
+
+        for (idx, path) in paths.iter().enumerate() {
+            if self.should_hash_on_gpu(path)? {
+                gpu_indices.push(idx);
+                gpu_paths.push(path.clone());
+            } else {
+                cpu_indices.push(idx);
+                cpu_paths.push(path.clone());
+            }
+        }
+
+        if !gpu_paths.is_empty() {
+            let digests = self.hash_files_gpu_many(&gpu_paths, alg)?;
+            for (idx, digest) in gpu_indices.into_iter().zip(digests.into_iter()) {
+                out[idx] = digest;
+            }
+        }
+
+        for (idx, path) in cpu_indices.into_iter().zip(cpu_paths.iter()) {
+            out[idx] = self.hash_file_cpu(path, alg)?;
+        }
+
+        Ok(out)
     }
 
     /// Store a full 64KiB chunk for logical position `lc`, compressing it when
@@ -1065,6 +1583,19 @@ impl StorageEngine {
     pub fn remove(&mut self, path: &str) -> EResult<()> {
         let node = self.table.remove(path)?;
         self.free_coords(&node.coords);
+        Ok(())
+    }
+
+    /// Rename/move `from` to `to`, freeing the VRAM placements of any file
+    /// that was replaced at the destination. Going through the lookup table
+    /// directly would leak the replaced file's chunks (the classic editor
+    /// save pattern — write temp file, rename over the original — would then
+    /// leak the original's entire content on every save).
+    pub fn rename(&mut self, from: &str, to: &str, replace: bool) -> EResult<()> {
+        let replaced = self.table.rename(from, to, replace)?;
+        if let Some(node) = replaced {
+            self.free_coords(&node.coords);
+        }
         Ok(())
     }
 
@@ -1213,6 +1744,13 @@ impl StorageEngine {
                 .as_mut()
                 .expect("nvCOMP codec present for Lz4 placements");
             let pieces = cuda(codec.decompress_from_arena_slices(base, &requests))?;
+            if pieces.len() != pending.len() {
+                return Err(EngineError::Cuda(format!(
+                    "decompress returned {} pieces for {} requests",
+                    pieces.len(),
+                    pending.len()
+                )));
+            }
             for (p, piece) in pending.iter().zip(pieces.iter()) {
                 out[p.out_pos..p.out_pos + p.take].copy_from_slice(piece);
             }
@@ -1294,18 +1832,21 @@ impl StorageEngine {
             return Ok(0);
         }
         let n = len.min(src_size - src_offset);
+        // Guard the destination end against u64 overflow: offsets arrive
+        // straight from a user-issued FSCTL_DUPLICATE_EXTENTS_TO_FILE.
+        let dst_end = dst_offset.checked_add(n).ok_or(EngineError::NoSpace)?;
         if !self.dedup {
             let data = self.read(src_path, src_offset, n as usize)?;
             return self.write(dst_path, dst_offset, &data);
         }
         if src_path.eq_ignore_ascii_case(dst_path)
-            && ranges_overlap(src_offset, src_offset + n, dst_offset, dst_offset + n)
+            && ranges_overlap(src_offset, src_offset + n, dst_offset, dst_end)
         {
             let data = self.read(src_path, src_offset, n as usize)?;
             return self.write(dst_path, dst_offset, &data);
         }
 
-        self.ensure_logical_len(dst_path, dst_offset + n)?;
+        self.ensure_logical_len(dst_path, dst_end)?;
         let mut done = 0u64;
         while done < n
             && ((src_offset + done) % CHUNK_SIZE != 0 || (dst_offset + done) % CHUNK_SIZE != 0)
@@ -1346,7 +1887,7 @@ impl StorageEngine {
         }
 
         let node = self.table.get_mut(dst_path).unwrap();
-        node.size = node.size.max(dst_offset + n);
+        node.size = node.size.max(dst_end);
         let now = crate::lookup::now_filetime();
         node.modified = now;
         node.changed = now;
@@ -1641,13 +2182,27 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Allocate up to `count` contiguous chunks, halving the request on
+    /// failure (O(log count) bitmap scans instead of the old decrement-by-one
+    /// retry, which was O(count) full scans on a fragmented volume). When
+    /// dedup is enabled the refcount slot of every returned chunk is
+    /// initialised to 1, matching `alloc_chunk` — `release_chunk` relies on it.
     fn alloc_contiguous_run(&mut self, count: u32) -> EResult<(ChunkId, u32)> {
-        for n in (1..=count).rev() {
+        let mut n = count;
+        loop {
             if let Some(start) = self.alloc.alloc_contiguous(n) {
+                if self.dedup {
+                    for c in start..start + n {
+                        self.refcount[c as usize] = 1;
+                    }
+                }
                 return Ok((start, n));
             }
+            if n == 1 {
+                return Err(EngineError::NoSpace);
+            }
+            n = n.div_ceil(2);
         }
-        Err(EngineError::NoSpace)
     }
 
     /// Compress-mode write (no dedup, nvCOMP present). Splits the write into an
@@ -1877,6 +2432,10 @@ impl StorageEngine {
                     self.trace.compress_raw_fallback_chunks += 1;
                     self.trace.dedup_unique_chunks += 1;
                 }
+                // `miss_buf` is dropped at the end of this iteration, but the
+                // fallback writes above were enqueued async *from* it — flush
+                // them before the buffer goes away.
+                cuda(self.vram.sync())?;
                 j += m;
                 continue;
             }
@@ -1916,10 +2475,11 @@ impl StorageEngine {
                 }
                 self.trace.dedup_unique_chunks += 1;
             }
+            // Flush the arena copies and any raw-fallback writes enqueued from
+            // this iteration's `miss_buf` before it is dropped/reused.
+            cuda(self.vram.sync())?;
             j += m;
         }
-
-        cuda(self.vram.sync())?;
 
         if end > full_end {
             let lc = (full_end / cs) as usize;
@@ -2155,76 +2715,126 @@ impl StorageEngine {
         files: &[String],
         output: &str,
     ) -> EResult<ArchiveJobStats> {
-        let start = Instant::now();
-        let output = crate::lookup::normalize(output);
-        if format == NvcompFrameCodec::Deflate {
-            let stats = self.archive_zip_compress_gpu(files, &output, start)?;
-            return Ok(stats);
-        }
-        let tmp = format!("\\.__vramdisk_archive_tmp_{}", crate::lookup::now_filetime());
-        self.create_or_truncate_file(&tmp)?;
-        let mut planned = Vec::with_capacity(files.len());
-        let mut tar_total = 1024u64;
-        for file in files {
-            let path = crate::lookup::normalize(file);
-            let (size, is_dir) = {
-                let node = self.table.get(&path).ok_or(LookupError::NotFound)?;
-                (node.size, node.is_dir)
-            };
-            if is_dir {
-                return Err(EngineError::NotAFile);
-            }
-            tar_total += 512 + size + pad512(size);
-            planned.push((path, size));
-        }
-        self.allocate_raw_file(&tmp, tar_total)?;
-        let mut tar_pos = 0u64;
-        let mut input_bytes = 0u64;
-        for (path, size) in planned {
-            let name = path.trim_start_matches('\\').replace('\\', "/");
-            let header = tar_header(&name, size)?;
-            self.write(&tmp, tar_pos, &header)?;
-            tar_pos += 512;
-            self.copy_file_payload_raw(&path, 0, &tmp, tar_pos, size)?;
-            tar_pos += size;
-            input_bytes += size;
-            let pad = pad512(size);
-            if pad != 0 {
-                self.write(&tmp, tar_pos, &vec![0u8; pad as usize])?;
-                tar_pos += pad;
-            }
-        }
-        self.write(&tmp, tar_pos, &[0u8; 1024])?;
-        tar_pos += 1024;
+        self.archive_compress_gpu_cancellable(format, files, output, || false)
+    }
 
-        self.create_or_truncate_file(&output)?;
-        let comp_len = if format == NvcompFrameCodec::Gzip {
-            self.write_gzip_deflate_members(&tmp, tar_pos, &output)?
-        } else if format == NvcompFrameCodec::Lz4 {
-            self.write_lz4_frame(&tmp, tar_pos, &output)?
-        } else {
-            let mut codec = cuda(NvcompBatchedCodec::load(&self.vram, format))?;
-            let src_ptr = self.contiguous_file_ptr(&tmp, tar_pos)?;
-            let sizes = cuda(codec.compress_device(&[src_ptr], &[tar_pos]))?;
-            let comp_len = sizes[0];
-            self.write_device_bytes(&output, 0, codec.compressed_slot_ptr(0), comp_len)?;
-            comp_len
-        };
-        self.set_size(&output, comp_len)?;
-        let _ = self.remove(&tmp);
-        Ok(ArchiveJobStats {
-            format: match format {
-                NvcompFrameCodec::Zstd => "tar.zst".to_string(),
-                NvcompFrameCodec::Lz4 => "tar.lz4".to_string(),
-                NvcompFrameCodec::Gzip => "tar.gz".to_string(),
-                NvcompFrameCodec::Deflate => "zip".to_string(),
-            },
-            output,
-            file_count: files.len(),
-            input_bytes,
-            archive_bytes: comp_len,
-            elapsed_ms: start.elapsed().as_millis(),
-        })
+    pub fn archive_compress_gpu_cancellable<F>(
+        &mut self,
+        format: NvcompFrameCodec,
+        files: &[String],
+        output: &str,
+        mut should_cancel: F,
+    ) -> EResult<ArchiveJobStats>
+    where
+        F: FnMut() -> bool,
+    {
+        let mut output_created = false;
+        let result = map_archive_job_result((|| {
+            let start = Instant::now();
+            let output = crate::lookup::normalize(output);
+            if format == NvcompFrameCodec::Deflate {
+                let stats = self.archive_zip_compress_gpu(
+                    files,
+                    &output,
+                    start,
+                    &mut output_created,
+                    &mut should_cancel,
+                )?;
+                return Ok(stats);
+            }
+            let tmp = format!(
+                "\\.__vramdisk_archive_tmp_{}",
+                crate::lookup::now_filetime()
+            );
+            self.create_or_truncate_file(&tmp)?;
+            let mut planned = Vec::with_capacity(files.len());
+            let mut tar_total = 1024u64;
+            for file in files {
+                if should_cancel() {
+                    let _ = self.remove(&tmp);
+                    return cancelled();
+                }
+                let path = crate::lookup::normalize(file);
+                let (size, is_dir) = {
+                    let node = self.table.get(&path).ok_or(LookupError::NotFound)?;
+                    (node.size, node.is_dir)
+                };
+                if is_dir {
+                    return Err(EngineError::NotAFile);
+                }
+                // Build (and thereby validate) the tar header now, before the
+                // whole tar buffer is reserved: a single over-long or
+                // non-ASCII name must fail the job while it is still cheap.
+                let name = path.trim_start_matches('\\').replace('\\', "/");
+                let header = tar_header(&name, size)?;
+                tar_total += 512 + size + pad512(size);
+                planned.push((path, size, header));
+            }
+            self.allocate_raw_file(&tmp, tar_total)?;
+            let mut tar_pos = 0u64;
+            let mut input_bytes = 0u64;
+            for (path, size, header) in planned {
+                if should_cancel() {
+                    let _ = self.remove(&tmp);
+                    return cancelled();
+                }
+                self.write_raw_internal(&tmp, tar_pos, &header)?;
+                tar_pos += 512;
+                self.copy_file_payload_raw(&path, 0, &tmp, tar_pos, size)?;
+                tar_pos += size;
+                input_bytes += size;
+                let pad = pad512(size);
+                if pad != 0 {
+                    self.write_raw_internal(&tmp, tar_pos, &vec![0u8; pad as usize])?;
+                    tar_pos += pad;
+                }
+            }
+            self.write_raw_internal(&tmp, tar_pos, &[0u8; 1024])?;
+            tar_pos += 1024;
+
+            if should_cancel() {
+                let _ = self.remove(&tmp);
+                return cancelled();
+            }
+            self.create_or_truncate_file(&output)?;
+            output_created = true;
+            let comp_len = if format == NvcompFrameCodec::Gzip {
+                self.write_gzip_deflate_members(&tmp, tar_pos, &output)?
+            } else if format == NvcompFrameCodec::Lz4 {
+                self.write_lz4_frame(&tmp, tar_pos, &output)?
+            } else {
+                let mut codec = cuda(NvcompBatchedCodec::load(&self.vram, format))?;
+                let src_ptr = self.contiguous_file_ptr(&tmp, tar_pos)?;
+                let sizes = cuda(codec.compress_device(&[src_ptr], &[tar_pos]))?;
+                let comp_len = sizes[0];
+                self.write_device_bytes(&output, 0, codec.compressed_slot_ptr(0), comp_len)?;
+                comp_len
+            };
+            self.set_size(&output, comp_len)?;
+            let _ = self.remove(&tmp);
+            Ok(ArchiveJobStats {
+                format: match format {
+                    NvcompFrameCodec::Zstd => "tar.zst".to_string(),
+                    NvcompFrameCodec::Lz4 => "tar.lz4".to_string(),
+                    NvcompFrameCodec::Gzip => "tar.gz".to_string(),
+                    NvcompFrameCodec::Deflate => "zip".to_string(),
+                },
+                output,
+                file_count: files.len(),
+                input_bytes,
+                archive_bytes: comp_len,
+                elapsed_ms: start.elapsed().as_millis(),
+            })
+        })());
+        if result.is_err() {
+            // A failed (or cancelled) job must not leave a half-written
+            // archive at the requested output path, nor leak staging temps.
+            if output_created {
+                let _ = self.remove(&crate::lookup::normalize(output));
+            }
+            self.cleanup_archive_temp_files();
+        }
+        result
     }
 
     pub fn archive_extract_gpu(
@@ -2233,86 +2843,124 @@ impl StorageEngine {
         archive: &str,
         output_dir: &str,
     ) -> EResult<ArchiveExtractStats> {
-        let start = Instant::now();
-        let archive = crate::lookup::normalize(archive);
-        if format == NvcompFrameCodec::Deflate {
-            return self.archive_zip_extract_gpu(&archive, output_dir, start);
-        }
-        let archive_size = {
-            let node = self.table.get(&archive).ok_or(LookupError::NotFound)?;
-            if node.is_dir {
-                return Err(EngineError::NotAFile);
-            }
-            node.size
-        };
-        let tmp = format!("\\.__vramdisk_extract_tmp_{}", crate::lookup::now_filetime());
-        self.create_or_truncate_file(&tmp)?;
-        let (tar_size, packed_archive) = if format == NvcompFrameCodec::Gzip {
-            let tar_size = self.extract_gzip_deflate_members(&archive, archive_size, &tmp)?;
-            (tar_size, None)
-        } else if format == NvcompFrameCodec::Lz4 {
-            let tar_size = self.extract_lz4_frame(&archive, archive_size, &tmp)?;
-            (tar_size, None)
-        } else {
-            let packed_archive = format!("\\.__vramdisk_extract_src_{}", crate::lookup::now_filetime());
-            self.create_or_truncate_file(&packed_archive)?;
-            self.allocate_raw_file(&packed_archive, archive_size)?;
-            self.copy_file_payload_raw(&archive, 0, &packed_archive, 0, archive_size)?;
-            let archive_ptr = self.contiguous_file_ptr(&packed_archive, archive_size)?;
-            let mut codec = cuda(NvcompBatchedCodec::load(&self.vram, format))?;
-            let tar_size = cuda(codec.decompress_sizes_device(&[archive_ptr], &[archive_size]))?[0];
-            self.allocate_raw_file(&tmp, tar_size)?;
-            let tmp_ptr = self.contiguous_file_ptr(&tmp, tar_size)?;
-            cuda(codec.decompress_device(
-                &[archive_ptr],
-                &[archive_size],
-                &[tmp_ptr],
-                &[tar_size],
-            ))?;
-            (tar_size, Some(packed_archive))
-        };
+        self.archive_extract_gpu_cancellable(format, archive, output_dir, || false)
+    }
 
-        let out_base = crate::lookup::normalize(output_dir);
-        self.ensure_dir_path(&out_base)?;
-        let mut pos = 0u64;
-        let mut files = 0usize;
-        let mut output_bytes = 0u64;
-        while pos + 512 <= tar_size {
-            let hdr = self.read(&tmp, pos, 512)?;
-            if hdr.iter().all(|&b| b == 0) {
-                break;
+    pub fn archive_extract_gpu_cancellable<F>(
+        &mut self,
+        format: NvcompFrameCodec,
+        archive: &str,
+        output_dir: &str,
+        mut should_cancel: F,
+    ) -> EResult<ArchiveExtractStats>
+    where
+        F: FnMut() -> bool,
+    {
+        let result = map_archive_job_result((|| {
+            let start = Instant::now();
+            let archive = crate::lookup::normalize(archive);
+            if format == NvcompFrameCodec::Deflate {
+                return self.archive_zip_extract_gpu(&archive, output_dir, start, &mut should_cancel);
             }
-            let name_end = hdr[..100].iter().position(|&b| b == 0).unwrap_or(100);
-            let name = std::str::from_utf8(&hdr[..name_end])
-                .map_err(|e| EngineError::Cuda(format!("invalid tar path UTF-8: {e}")))?;
-            let size = parse_tar_octal(&hdr[124..136])?;
-            let out_path = join_archive_output(&out_base, name)?;
-            self.ensure_parent_dirs(&out_path)?;
-            self.create_or_truncate_file(&out_path)?;
-            self.copy_file_payload_raw(&tmp, pos + 512, &out_path, 0, size)?;
-            self.set_size(&out_path, size)?;
-            files += 1;
-            output_bytes += size;
-            pos += 512 + size + pad512(size);
+            let archive_size = {
+                let node = self.table.get(&archive).ok_or(LookupError::NotFound)?;
+                if node.is_dir {
+                    return Err(EngineError::NotAFile);
+                }
+                node.size
+            };
+            let tmp = format!(
+                "\\.__vramdisk_extract_tmp_{}",
+                crate::lookup::now_filetime()
+            );
+            self.create_or_truncate_file(&tmp)?;
+            let (tar_size, packed_archive) = if format == NvcompFrameCodec::Gzip {
+                let tar_size = self.extract_gzip_deflate_members(&archive, archive_size, &tmp)?;
+                (tar_size, None)
+            } else if format == NvcompFrameCodec::Lz4 {
+                let tar_size = self.extract_lz4_frame(&archive, archive_size, &tmp)?;
+                (tar_size, None)
+            } else {
+                let packed_archive = format!(
+                    "\\.__vramdisk_extract_src_{}",
+                    crate::lookup::now_filetime()
+                );
+                self.create_or_truncate_file(&packed_archive)?;
+                self.allocate_raw_file(&packed_archive, archive_size)?;
+                self.copy_file_payload_raw(&archive, 0, &packed_archive, 0, archive_size)?;
+                let archive_ptr = self.contiguous_file_ptr(&packed_archive, archive_size)?;
+                let mut codec = cuda(NvcompBatchedCodec::load(&self.vram, format))?;
+                let tar_size =
+                    cuda(codec.decompress_sizes_device(&[archive_ptr], &[archive_size]))?[0];
+                self.allocate_raw_file(&tmp, tar_size)?;
+                let tmp_ptr = self.contiguous_file_ptr(&tmp, tar_size)?;
+                cuda(codec.decompress_device(
+                    &[archive_ptr],
+                    &[archive_size],
+                    &[tmp_ptr],
+                    &[tar_size],
+                ))?;
+                (tar_size, Some(packed_archive))
+            };
+
+            let out_base = crate::lookup::normalize(output_dir);
+            self.ensure_dir_path(&out_base)?;
+            let mut pos = 0u64;
+            let mut files = 0usize;
+            let mut output_bytes = 0u64;
+            while pos + 512 <= tar_size {
+                if should_cancel() {
+                    let _ = self.remove(&tmp);
+                    if let Some(packed_archive) = packed_archive.as_ref() {
+                        let _ = self.remove(packed_archive);
+                    }
+                    return cancelled();
+                }
+                let hdr = self.read(&tmp, pos, 512)?;
+                if hdr.len() < 512 {
+                    return Err(EngineError::Cuda("truncated tar header".into()));
+                }
+                if hdr.iter().all(|&b| b == 0) {
+                    break;
+                }
+                let name_end = hdr[..100].iter().position(|&b| b == 0).unwrap_or(100);
+                let name = std::str::from_utf8(&hdr[..name_end])
+                    .map_err(|e| EngineError::Cuda(format!("invalid tar path UTF-8: {e}")))?;
+                let size = parse_tar_octal(&hdr[124..136])?;
+                let out_path = join_archive_output(&out_base, name)?;
+                self.ensure_parent_dirs(&out_path)?;
+                self.create_or_truncate_file(&out_path)?;
+                self.copy_file_payload_raw(&tmp, pos + 512, &out_path, 0, size)?;
+                self.set_size(&out_path, size)?;
+                files += 1;
+                output_bytes += size;
+                pos += 512 + size + pad512(size);
+            }
+            let _ = self.remove(&tmp);
+            if let Some(packed_archive) = packed_archive {
+                let _ = self.remove(&packed_archive);
+            }
+            Ok(ArchiveExtractStats {
+                format: match format {
+                    NvcompFrameCodec::Zstd => "tar.zst".to_string(),
+                    NvcompFrameCodec::Lz4 => "tar.lz4".to_string(),
+                    NvcompFrameCodec::Gzip => "tar.gz".to_string(),
+                    NvcompFrameCodec::Deflate => "zip".to_string(),
+                },
+                archive,
+                output_dir: out_base,
+                file_count: files,
+                archive_bytes: archive_size,
+                output_bytes,
+                elapsed_ms: start.elapsed().as_millis(),
+            })
+        })());
+        if result.is_err() {
+            // Partially extracted output files are left in place (useful for
+            // diagnosing a bad archive), but staging temps must not leak.
+            self.cleanup_archive_temp_files();
         }
-        let _ = self.remove(&tmp);
-        if let Some(packed_archive) = packed_archive {
-            let _ = self.remove(&packed_archive);
-        }
-        Ok(ArchiveExtractStats {
-            format: match format {
-                NvcompFrameCodec::Zstd => "tar.zst".to_string(),
-                NvcompFrameCodec::Lz4 => "tar.lz4".to_string(),
-                NvcompFrameCodec::Gzip => "tar.gz".to_string(),
-                NvcompFrameCodec::Deflate => "zip".to_string(),
-            },
-            archive,
-            output_dir: out_base,
-            file_count: files,
-            archive_bytes: archive_size,
-            output_bytes,
-            elapsed_ms: start.elapsed().as_millis(),
-        })
+        result
     }
 
     fn create_or_truncate_file(&mut self, path: &str) -> EResult<()> {
@@ -2323,6 +2971,77 @@ impl StorageEngine {
             None => {
                 self.table.create_file(&path, 0)?;
             }
+        }
+        Ok(())
+    }
+
+    fn write_raw_internal(&mut self, path: &str, offset: u64, data: &[u8]) -> EResult<u64> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        {
+            let node = self.table.get(path).ok_or(LookupError::NotFound)?;
+            if node.is_dir {
+                return Err(EngineError::NotAFile);
+            }
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(EngineError::NoSpace)?;
+        self.ensure_logical_len(path, end)?;
+        self.trace.write_calls += 1;
+        self.trace.logical_write_bytes += data.len() as u64;
+
+        let mut done = 0usize;
+        let mut pos = offset;
+        while done < data.len() {
+            let lc = (pos / CHUNK_SIZE) as usize;
+            let in_off = pos % CHUNK_SIZE;
+            let take = ((CHUNK_SIZE - in_off) as usize).min(data.len() - done);
+            self.write_chunk_raw_internal(path, lc, in_off, &data[done..done + take])?;
+            done += take;
+            pos += take as u64;
+        }
+
+        let node = self.table.get_mut(path).unwrap();
+        node.size = node.size.max(end);
+        let now = crate::lookup::now_filetime();
+        node.modified = now;
+        node.changed = now;
+        Ok(data.len() as u64)
+    }
+
+    fn write_chunk_raw_internal(
+        &mut self,
+        path: &str,
+        lc: usize,
+        in_off: u64,
+        sub: &[u8],
+    ) -> EResult<()> {
+        let full = in_off == 0 && sub.len() as u64 == CHUNK_SIZE;
+        let existing = self.coord(path, lc);
+        let (chunk, fresh) = match existing {
+            Some(Placement::Raw { chunk }) => (chunk, false),
+            Some(Placement::Compressed { .. }) => {
+                return Err(EngineError::Cuda(
+                    "archive internal raw stream unexpectedly contains compressed placement".into(),
+                ));
+            }
+            None if self.dedup => (self.alloc_chunk()?, true),
+            None => (self.alloc.alloc_one().ok_or(EngineError::NoSpace)?, true),
+        };
+        let base = chunk as u64 * CHUNK_SIZE;
+        if fresh && !full {
+            cuda(self.vram.zero_at_async(base, CHUNK_SIZE))?;
+            cuda(self.vram.write_at_async(base + in_off, sub))?;
+            cuda(self.vram.sync())?;
+        } else {
+            cuda(self.vram.write_at(base + in_off, sub))?;
+        }
+        self.trace.raw_write_ops += 1;
+        self.trace.raw_write_bytes += sub.len() as u64;
+        if fresh {
+            self.set_coord(path, lc, Some(Placement::Raw { chunk }));
         }
         Ok(())
     }
@@ -2349,14 +3068,69 @@ impl StorageEngine {
                 Some(Placement::Raw { chunk }) => {
                     self.vram_base + chunk as u64 * CHUNK_SIZE + src_in
                 }
-                Some(Placement::Compressed { .. }) => {
-                    return Err(EngineError::Cuda(
-                        "archive jobs currently require raw source file placements".into(),
-                    ));
+                Some(Placement::Compressed {
+                    codec: Codec::Lz4, ..
+                }) => {
+                    let mut blobs = Vec::new();
+                    let mut parts = Vec::new();
+                    while done < len && blobs.len() < crate::nvcomp::BATCH {
+                        let src_pos = src_offset + done;
+                        let src_lc = (src_pos / CHUNK_SIZE) as usize;
+                        let src_in = src_pos % CHUNK_SIZE;
+                        let take = (len - done).min(CHUNK_SIZE - src_in);
+                        match self.coord(src_path, src_lc) {
+                            Some(Placement::Compressed {
+                                offset,
+                                len,
+                                codec: Codec::Lz4,
+                            }) => {
+                                blobs.push((offset, len));
+                                parts.push((done, src_in, take));
+                                done += take;
+                            }
+                            _ => break,
+                        }
+                    }
+                    let slot_ptrs = {
+                        let vram_base = self.vram_base;
+                        let codec = self.codec.as_mut().ok_or_else(|| {
+                            EngineError::Cuda(
+                                "archive job found an LZ4-compressed source chunk but nvCOMP LZ4 is unavailable".into(),
+                            )
+                        })?;
+                        cuda(codec.decompress_from_arena_dev(vram_base, &blobs))?;
+                        (0..blobs.len())
+                            .map(|i| codec.uncomp_slot_ptr(i))
+                            .collect::<Vec<_>>()
+                    };
+                    for (i, (dst_done, src_in, take)) in parts.into_iter().enumerate() {
+                        self.write_device_bytes(
+                            dst_path,
+                            dst_offset + dst_done,
+                            slot_ptrs[i] + src_in,
+                            take,
+                        )?;
+                    }
+                    continue;
+                }
+                Some(Placement::Compressed {
+                    offset,
+                    len,
+                    codec: Codec::Zstd,
+                }) => {
+                    let full = self.decompress_blob(offset, len, Codec::Zstd)?;
+                    let start = src_in as usize;
+                    self.write_raw_internal(
+                        dst_path,
+                        dst_offset + done,
+                        &full[start..start + take as usize],
+                    )?;
+                    done += take;
+                    continue;
                 }
                 None => {
-                    self.write(
-                        &vec_path(dst_path),
+                    self.write_raw_internal(
+                        dst_path,
                         dst_offset + done,
                         &vec![0u8; take as usize],
                     )?;
@@ -2366,6 +3140,154 @@ impl StorageEngine {
             };
             self.write_device_bytes(dst_path, dst_offset + done, src_ptr, take)?;
             done += take;
+        }
+        Ok(())
+    }
+
+    /// Remove any leftover `\.__vramdisk_*` temp files from the root.
+    ///
+    /// Archive jobs stage data in uniquely named root-level temp files; the
+    /// success and cancellation paths remove them inline, and this sweep backs
+    /// up every `?` error path so a failed job can never leak the temp file's
+    /// VRAM (or leave a stray node visible in the namespace). Only one archive
+    /// job runs at a time (single job worker + engine mutex), so sweeping by
+    /// prefix cannot hit another job's temps.
+    fn cleanup_archive_temp_files(&mut self) {
+        let stale: Vec<String> = match self.table.readdir("\\") {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|(name, node)| !node.is_dir && name.starts_with(".__vramdisk_"))
+                .map(|(name, _)| format!("\\{}", name.to_ascii_lowercase()))
+                .collect(),
+            Err(_) => return,
+        };
+        for path in stale {
+            let _ = self.remove(&path);
+        }
+    }
+
+    fn archive_temp_chunk(&mut self) -> EResult<ChunkId> {
+        self.alloc_chunk().map_err(|err| match err {
+            EngineError::NoSpace => archive_vram_exhausted("materialize compressed source data"),
+            other => other,
+        })
+    }
+
+    fn release_temp_chunks(&mut self, temp_chunks: Vec<ChunkId>) {
+        for chunk in temp_chunks {
+            self.release_chunk(chunk);
+        }
+    }
+
+    /// Build the GPU hash segments for `[offset, offset+len)` of `path` into
+    /// `out`, materializing compressed chunks into freshly allocated temp
+    /// chunks recorded in `out.temp_chunks`.
+    ///
+    /// `out` is caller-provided (rather than returned) so that on an error
+    /// mid-build the caller still sees — and can release — the temp chunks
+    /// allocated so far; returning the struct would drop them on the `?` path
+    /// and leak the VRAM.
+    fn archive_crc32_segments(
+        &mut self,
+        path: &str,
+        offset: u64,
+        len: u64,
+        out: &mut ArchiveMaterializedSegments,
+    ) -> EResult<()> {
+        let mut done = 0u64;
+        while done < len {
+            let pos = offset + done;
+            let lc = (pos / CHUNK_SIZE) as usize;
+            let in_off = pos % CHUNK_SIZE;
+            let take = (len - done).min(CHUNK_SIZE - in_off) as u32;
+            match self.coord(path, lc) {
+                None => {
+                    out.segs.push(HashSegment {
+                        ptr: 0,
+                        len: take,
+                        kind: 1,
+                    });
+                    done += take as u64;
+                }
+                Some(Placement::Raw { chunk }) => {
+                    out.segs.push(HashSegment {
+                        ptr: self.vram_base + chunk as u64 * CHUNK_SIZE + in_off,
+                        len: take,
+                        kind: 0,
+                    });
+                    done += take as u64;
+                }
+                Some(Placement::Compressed {
+                    offset,
+                    len,
+                    codec: Codec::Zstd,
+                }) => {
+                    let full = self.decompress_blob(offset, len, Codec::Zstd)?;
+                    let chunk = self.archive_temp_chunk()?;
+                    cuda(self.vram.write_at(chunk as u64 * CHUNK_SIZE, &full))?;
+                    out.temp_chunks.push(chunk);
+                    out.segs.push(HashSegment {
+                        ptr: self.vram_base + chunk as u64 * CHUNK_SIZE + in_off,
+                        len: take,
+                        kind: 0,
+                    });
+                    done += take as u64;
+                }
+                Some(Placement::Compressed {
+                    codec: Codec::Lz4, ..
+                }) => {
+                    let mut blobs = Vec::new();
+                    let mut parts = Vec::new();
+                    while done < len && blobs.len() < crate::nvcomp::BATCH {
+                        let pos = offset + done;
+                        let lc = (pos / CHUNK_SIZE) as usize;
+                        let in_off = pos % CHUNK_SIZE;
+                        let take = (len - done).min(CHUNK_SIZE - in_off) as u32;
+                        match self.coord(path, lc) {
+                            Some(Placement::Compressed {
+                                offset,
+                                len,
+                                codec: Codec::Lz4,
+                            }) => {
+                                blobs.push((offset, len));
+                                parts.push((in_off, take));
+                                done += take as u64;
+                            }
+                            _ => break,
+                        }
+                    }
+                    let base_chunk = out.temp_chunks.len();
+                    for _ in 0..blobs.len() {
+                        out.temp_chunks.push(self.archive_temp_chunk()?);
+                    }
+                    let slot_ptrs = {
+                        let vram_base = self.vram_base;
+                        let codec = self.codec.as_mut().ok_or_else(|| {
+                            EngineError::Cuda(
+                                "archive job found an LZ4-compressed source chunk but nvCOMP LZ4 is unavailable".into(),
+                            )
+                        })?;
+                        cuda(codec.decompress_from_arena_dev(vram_base, &blobs))?;
+                        (0..blobs.len())
+                            .map(|i| codec.uncomp_slot_ptr(i))
+                            .collect::<Vec<_>>()
+                    };
+                    for (i, (in_off, take)) in parts.into_iter().enumerate() {
+                        let chunk = out.temp_chunks[base_chunk + i];
+                        cuda(self.vram.copy_dev_into(
+                            chunk as u64 * CHUNK_SIZE,
+                            slot_ptrs[i],
+                            CHUNK_SIZE,
+                        ))?;
+                        out.segs.push(HashSegment {
+                            ptr: self.vram_base + chunk as u64 * CHUNK_SIZE + in_off,
+                            len: take,
+                            kind: 0,
+                        });
+                    }
+                    cuda(self.vram.sync())?;
+                }
+            }
         }
         Ok(())
     }
@@ -2412,6 +3334,11 @@ impl StorageEngine {
         }
         let (start, got) = self.alloc_contiguous_run(chunks as u32)?;
         if got != chunks as u32 {
+            // A shorter run than requested is useless here: give it back
+            // instead of leaking `got` freshly marked chunks.
+            for c in start..start + got {
+                self.release_chunk(c);
+            }
             return Err(EngineError::NoSpace);
         }
         for lc in 0..chunks {
@@ -2423,17 +3350,36 @@ impl StorageEngine {
                 }),
             );
         }
+        // The recycled chunks still hold whatever a previously freed file left
+        // in them. Callers overwrite [0, len) but not the tail of the last
+        // chunk, which would otherwise leak stale data if the file is later
+        // grown with SetFileSize.
+        let tail = len % CHUNK_SIZE;
+        if tail != 0 {
+            let last = start as u64 + chunks as u64 - 1;
+            cuda(self
+                .vram
+                .zero_at(last * CHUNK_SIZE + tail, CHUNK_SIZE - tail))?;
+        }
         self.set_size(path, len)
     }
 
-    fn archive_zip_compress_gpu(
+    fn archive_zip_compress_gpu<F>(
         &mut self,
         files: &[String],
         output: &str,
         start: Instant,
-    ) -> EResult<ArchiveJobStats> {
+        output_created: &mut bool,
+        should_cancel: &mut F,
+    ) -> EResult<ArchiveJobStats>
+    where
+        F: FnMut() -> bool,
+    {
         let mut planned = Vec::with_capacity(files.len());
         for file in files {
+            if should_cancel() {
+                return cancelled();
+            }
             let path = crate::lookup::normalize(file);
             let (size, is_dir) = {
                 let node = self.table.get(&path).ok_or(LookupError::NotFound)?;
@@ -2446,10 +3392,11 @@ impl StorageEngine {
             if !name.is_ascii() {
                 return Err(EngineError::Cuda(format!("zip path must be ASCII: {name}")));
             }
-            let crc = self.crc32_file_gpu(&path, size)?;
+            let crc = self.crc32_file_gpu(&path, size, should_cancel)?;
             planned.push((path, name, size, 0u64, crc));
         }
         self.create_or_truncate_file(output)?;
+        *output_created = true;
         let mut deflate = cuda(NvcompBatchedCodec::load(
             &self.vram,
             NvcompFrameCodec::Deflate,
@@ -2458,6 +3405,9 @@ impl StorageEngine {
         let mut central = Vec::new();
         let mut input_bytes = 0u64;
         for (path, name, size, _comp_size, crc) in &planned {
+            if should_cancel() {
+                return cancelled();
+            }
             let local_offset = out_pos;
             let name_bytes = name.as_bytes();
             let zip_chunks = zip_deflate_chunk_count(*size);
@@ -2476,10 +3426,13 @@ impl StorageEngine {
                 &mut hdr,
                 u16_checked(name_bytes.len(), "zip file name length")?,
             );
-            push_u16(&mut hdr, u16_checked(extra.len(), "zip64 local extra length")?);
+            push_u16(
+                &mut hdr,
+                u16_checked(extra.len(), "zip64 local extra length")?,
+            );
             hdr.extend_from_slice(name_bytes);
             hdr.extend_from_slice(&extra);
-            self.write(output, out_pos, &hdr)?;
+            self.write_raw_internal(output, out_pos, &hdr)?;
             out_pos += hdr.len() as u64;
             let (comp_size, chunk_sizes) =
                 self.write_zip_deflate_payload(path, *size, output, out_pos, &mut deflate)?;
@@ -2520,7 +3473,10 @@ impl StorageEngine {
                 &mut hdr,
                 u16_checked(name_bytes.len(), "zip central file name length")?,
             );
-            push_u16(&mut hdr, u16_checked(extra.len(), "zip64 central extra length")?);
+            push_u16(
+                &mut hdr,
+                u16_checked(extra.len(), "zip64 central extra length")?,
+            );
             push_u16(&mut hdr, 0);
             push_u16(&mut hdr, 0);
             push_u16(&mut hdr, 0);
@@ -2528,7 +3484,7 @@ impl StorageEngine {
             push_u32(&mut hdr, u32::MAX);
             hdr.extend_from_slice(name_bytes);
             hdr.extend_from_slice(&extra);
-            self.write(output, out_pos, &hdr)?;
+            self.write_raw_internal(output, out_pos, &hdr)?;
             out_pos += hdr.len() as u64;
         }
         let cd_len = out_pos - cd_start;
@@ -2544,7 +3500,7 @@ impl StorageEngine {
         push_u64(&mut zip64, central.len() as u64);
         push_u64(&mut zip64, cd_len);
         push_u64(&mut zip64, cd_start);
-        self.write(output, out_pos, &zip64)?;
+        self.write_raw_internal(output, out_pos, &zip64)?;
         out_pos += zip64.len() as u64;
 
         let mut zip64_locator = Vec::with_capacity(20);
@@ -2552,7 +3508,7 @@ impl StorageEngine {
         push_u32(&mut zip64_locator, 0);
         push_u64(&mut zip64_locator, zip64_eocd_offset);
         push_u32(&mut zip64_locator, 1);
-        self.write(output, out_pos, &zip64_locator)?;
+        self.write_raw_internal(output, out_pos, &zip64_locator)?;
         out_pos += zip64_locator.len() as u64;
 
         let mut eocd = Vec::with_capacity(22);
@@ -2564,7 +3520,7 @@ impl StorageEngine {
         push_u32(&mut eocd, u32::MAX);
         push_u32(&mut eocd, u32::MAX);
         push_u16(&mut eocd, 0);
-        self.write(output, out_pos, &eocd)?;
+        self.write_raw_internal(output, out_pos, &eocd)?;
         out_pos += eocd.len() as u64;
         self.set_size(output, out_pos)?;
         Ok(ArchiveJobStats {
@@ -2577,12 +3533,16 @@ impl StorageEngine {
         })
     }
 
-    fn archive_zip_extract_gpu(
+    fn archive_zip_extract_gpu<F>(
         &mut self,
         archive: &str,
         output_dir: &str,
         start: Instant,
-    ) -> EResult<ArchiveExtractStats> {
+        should_cancel: &mut F,
+    ) -> EResult<ArchiveExtractStats>
+    where
+        F: FnMut() -> bool,
+    {
         let archive_size = {
             let node = self.table.get(archive).ok_or(LookupError::NotFound)?;
             if node.is_dir {
@@ -2600,6 +3560,9 @@ impl StorageEngine {
         let mut files = 0usize;
         let mut output_bytes = 0u64;
         while pos + 4 <= archive_size {
+            if should_cancel() {
+                return cancelled();
+            }
             let sig = self.read(archive, pos, 4)?;
             let sig = read_u32_le(&sig);
             if sig == 0x0201_4b50 || sig == 0x0605_4b50 {
@@ -2611,6 +3574,9 @@ impl StorageEngine {
                 )));
             }
             let hdr = self.read(archive, pos, 30)?;
+            if hdr.len() < 30 {
+                return Err(EngineError::Cuda("truncated zip local header".into()));
+            }
             let method = read_u16_le(&hdr[8..10]);
             let comp32 = read_u32_le(&hdr[18..22]);
             let uncomp32 = read_u32_le(&hdr[22..26]);
@@ -2623,6 +3589,9 @@ impl StorageEngine {
                 usize::try_from(extra_len)
                     .map_err(|_| EngineError::Cuda("zip extra length exceeds usize".into()))?,
             )?;
+            if name_bytes.len() as u64 != name_len || extra.len() as u64 != extra_len {
+                return Err(EngineError::Cuda("truncated zip local header fields".into()));
+            }
             let (uncomp_size, comp_size) = zip_sizes_from_local_extra(uncomp32, comp32, &extra)?;
             let name = std::str::from_utf8(&name_bytes)
                 .map_err(|e| EngineError::Cuda(format!("invalid zip path UTF-8: {e}")))?;
@@ -2694,7 +3663,7 @@ impl StorageEngine {
         codec: &mut NvcompBatchedCodec,
     ) -> EResult<(u64, Vec<u64>)> {
         if len == 0 {
-            self.write(dst_path, out_pos, &[1, 0, 0, 255, 255])?;
+            self.write_raw_internal(dst_path, out_pos, &[1, 0, 0, 255, 255])?;
             return Ok((5, vec![5]));
         }
         let tmp = format!("\\.__vramdisk_zip_src_{}", crate::lookup::now_filetime());
@@ -2719,7 +3688,12 @@ impl StorageEngine {
             let comp_sizes = cuda(codec.compress_device(&ptrs, &sizes))?;
             for (i, comp_size) in comp_sizes.into_iter().enumerate() {
                 let is_last = chunk_idx + i as u64 + 1 == total_chunks;
-                self.write_device_bytes(dst_path, out_pos, codec.compressed_slot_ptr(i), comp_size)?;
+                self.write_device_bytes(
+                    dst_path,
+                    out_pos,
+                    codec.compressed_slot_ptr(i),
+                    comp_size,
+                )?;
                 if !is_last {
                     self.clear_zip_deflate_bfinal(dst_path, out_pos)?;
                 }
@@ -2739,7 +3713,7 @@ impl StorageEngine {
             return Err(EngineError::Cuda("truncated deflate payload".into()));
         }
         b[0] &= !1;
-        self.write(path, offset, &b)?;
+        self.write_raw_internal(path, offset, &b)?;
         Ok(())
     }
 
@@ -2749,7 +3723,7 @@ impl StorageEngine {
             return Err(EngineError::Cuda("truncated deflate payload".into()));
         }
         b[0] |= 1;
-        self.write(path, offset, &b)?;
+        self.write_raw_internal(path, offset, &b)?;
         Ok(())
     }
 
@@ -2772,18 +3746,16 @@ impl StorageEngine {
         let mut out_pos = 0u64;
         for &comp_len in chunk_comp_sizes {
             let take = (out_len - out_pos).min(ZIP_DEFLATE_CHUNK);
-            let tmp = format!("\\.__vramdisk_zip_deflate_src_{}", crate::lookup::now_filetime());
+            let tmp = format!(
+                "\\.__vramdisk_zip_deflate_src_{}",
+                crate::lookup::now_filetime()
+            );
             self.create_or_truncate_file(&tmp)?;
             self.allocate_raw_file(&tmp, comp_len)?;
             self.copy_file_payload_raw(src_path, comp_pos, &tmp, 0, comp_len)?;
             self.set_zip_deflate_bfinal(&tmp, 0)?;
             let src_ptr = self.contiguous_file_ptr(&tmp, comp_len)?;
-            cuda(codec.decompress_device(
-                &[src_ptr],
-                &[comp_len],
-                &[dst_base + out_pos],
-                &[take],
-            ))?;
+            cuda(codec.decompress_device(&[src_ptr], &[comp_len], &[dst_base + out_pos], &[take]))?;
             let _ = self.remove(&tmp);
             comp_pos += comp_len;
             out_pos += take;
@@ -2792,20 +3764,57 @@ impl StorageEngine {
             }
         }
         if out_pos != out_len {
-            return Err(EngineError::Cuda("ZIP Deflate chunk table ended early".into()));
+            return Err(EngineError::Cuda(
+                "ZIP Deflate chunk table ended early".into(),
+            ));
         }
         Ok(())
     }
 
-    fn crc32_file_gpu(&mut self, path: &str, len: u64) -> EResult<u32> {
-        let segs = self.file_segments_raw(path, 0, len)?;
-        let out = cuda(self.api_kernel()?.crc32_many(&[segs]))?;
-        Ok(out[0])
+    fn crc32_file_gpu<F>(&mut self, path: &str, len: u64, should_cancel: &mut F) -> EResult<u32>
+    where
+        F: FnMut() -> bool,
+    {
+        self.crc32_range_gpu_cancellable(path, 0, len, should_cancel)
     }
 
     fn crc32_range_gpu(&mut self, path: &str, offset: u64, len: u64) -> EResult<u32> {
-        let segs = self.file_segments_raw(path, offset, len)?;
-        let out = cuda(self.api_kernel()?.crc32_many(&[segs]))?;
+        self.crc32_range_gpu_cancellable(path, offset, len, &mut || false)
+    }
+
+    fn crc32_range_gpu_cancellable<F>(
+        &mut self,
+        path: &str,
+        offset: u64,
+        len: u64,
+        should_cancel: &mut F,
+    ) -> EResult<u32>
+    where
+        F: FnMut() -> bool,
+    {
+        self.ensure_hash_calibration()?;
+        cuda(self.api_kernel()?.begin_crc32_many(1))?;
+        let mut done = 0u64;
+        while done < len {
+            if should_cancel() {
+                return cancelled();
+            }
+            let take = (len - done).min(self.gpu_hash_launch_budget);
+            // Build segments into a caller-owned struct, then release its temp
+            // chunks whether or not the build or the kernel update succeeded.
+            let mut materialized = ArchiveMaterializedSegments::default();
+            let built =
+                self.archive_crc32_segments(path, offset + done, take, &mut materialized);
+            let update = built.and_then(|_| {
+                cuda(self
+                    .api_kernel()?
+                    .update_crc32_many(std::slice::from_ref(&materialized.segs)))
+            });
+            self.release_temp_chunks(std::mem::take(&mut materialized.temp_chunks));
+            update?;
+            done += take;
+        }
+        let out = cuda(self.api_kernel()?.finish_crc32_many(1))?;
         Ok(out[0])
     }
 
@@ -2859,7 +3868,7 @@ impl StorageEngine {
                 }),
                 Some(Placement::Compressed { .. }) => {
                     return Err(EngineError::Cuda(
-                        "archive CRC32 currently requires raw/sparse placements".into(),
+                        "GPU batch hash currently requires raw/sparse placements".into(),
                     ));
                 }
             }
@@ -2878,7 +3887,10 @@ impl StorageEngine {
         dst_offset: u64,
         out_len: u64,
     ) -> EResult<()> {
-        let tmp = format!("\\.__vramdisk_deflate_src_{}", crate::lookup::now_filetime());
+        let tmp = format!(
+            "\\.__vramdisk_deflate_src_{}",
+            crate::lookup::now_filetime()
+        );
         self.create_or_truncate_file(&tmp)?;
         self.allocate_raw_file(&tmp, comp_len)?;
         self.copy_file_payload_raw(src_path, src_offset, &tmp, 0, comp_len)?;
@@ -2950,7 +3962,7 @@ impl StorageEngine {
                 header.extend_from_slice(b"GS");
                 push_u16(&mut header, 8);
                 header.extend_from_slice(&comp_sizes[i].to_le_bytes());
-                self.write(dst_path, out_pos, &header)?;
+                self.write_raw_internal(dst_path, out_pos, &header)?;
                 out_pos += header.len() as u64;
                 self.write_device_bytes(
                     dst_path,
@@ -2962,7 +3974,7 @@ impl StorageEngine {
                 let mut trailer = Vec::with_capacity(8);
                 push_u32(&mut trailer, crcs[i]);
                 push_u32(&mut trailer, (sizes[i] & 0xffff_ffff) as u32);
-                self.write(dst_path, out_pos, &trailer)?;
+                self.write_raw_internal(dst_path, out_pos, &trailer)?;
                 out_pos += 8;
             }
             base += n;
@@ -2974,9 +3986,9 @@ impl StorageEngine {
             header.extend_from_slice(b"GS");
             push_u16(&mut header, 8);
             header.extend_from_slice(&0u64.to_le_bytes());
-            self.write(dst_path, out_pos, &header)?;
+            self.write_raw_internal(dst_path, out_pos, &header)?;
             out_pos += header.len() as u64;
-            self.write(dst_path, out_pos, &[0, 0, 0, 0, 0, 0, 0, 0])?;
+            self.write_raw_internal(dst_path, out_pos, &[0, 0, 0, 0, 0, 0, 0, 0])?;
             out_pos += 8;
         }
         Ok(out_pos)
@@ -3006,9 +4018,15 @@ impl StorageEngine {
             }
             src_pos += 10;
             let xlen_buf = self.read(archive, src_pos, 2)?;
+            if xlen_buf.len() < 2 {
+                return Err(EngineError::Cuda("truncated gzip extra length".into()));
+            }
             let xlen = read_u16_le(&xlen_buf) as u64;
             src_pos += 2;
             let extra = self.read(archive, src_pos, xlen as usize)?;
+            if extra.len() as u64 != xlen {
+                return Err(EngineError::Cuda("truncated gzip extra field".into()));
+            }
             src_pos += xlen;
             let comp_len = gzip_extra_comp_len(&extra)?;
             let trailer_pos = src_pos + comp_len;
@@ -3051,7 +4069,7 @@ impl StorageEngine {
         header.extend_from_slice(&len.to_le_bytes());
         let hc = lz4_header_checksum(&header[4..]);
         header.push(hc);
-        self.write(dst_path, 0, &header)?;
+        self.write_raw_internal(dst_path, 0, &header)?;
         let mut out_pos = header.len() as u64;
         let chunks = logical_chunks(len);
         let mut base = 0usize;
@@ -3069,13 +4087,13 @@ impl StorageEngine {
             for i in 0..n {
                 let sz = comp_sizes[i];
                 if sz > 0 && sz < sizes[i] {
-                    self.write(dst_path, out_pos, &(sz as u32).to_le_bytes())?;
+                    self.write_raw_internal(dst_path, out_pos, &(sz as u32).to_le_bytes())?;
                     out_pos += 4;
                     self.write_device_bytes(dst_path, out_pos, codec.compressed_slot_ptr(i), sz)?;
                     out_pos += sz;
                 } else {
                     let marker = (sizes[i] as u32) | 0x8000_0000;
-                    self.write(dst_path, out_pos, &marker.to_le_bytes())?;
+                    self.write_raw_internal(dst_path, out_pos, &marker.to_le_bytes())?;
                     out_pos += 4;
                     self.copy_file_payload_raw(
                         src_path,
@@ -3089,7 +4107,7 @@ impl StorageEngine {
             }
             base += n;
         }
-        self.write(dst_path, out_pos, &0u32.to_le_bytes())?;
+        self.write_raw_internal(dst_path, out_pos, &0u32.to_le_bytes())?;
         out_pos += 4;
         Ok(out_pos)
     }
@@ -3163,7 +4181,7 @@ impl StorageEngine {
     ) -> EResult<u64> {
         let mut done = 0u64;
         if len == 0 {
-            self.write(dst_path, out_pos, &[1, 0, 0, 255, 255])?;
+            self.write_raw_internal(dst_path, out_pos, &[1, 0, 0, 255, 255])?;
             return Ok(out_pos + 5);
         }
         while done < len {
@@ -3179,7 +4197,7 @@ impl StorageEngine {
                 (nlen & 0xff) as u8,
                 (nlen >> 8) as u8,
             ];
-            self.write(dst_path, out_pos, &hdr)?;
+            self.write_raw_internal(dst_path, out_pos, &hdr)?;
             out_pos += 5;
             self.copy_file_payload_raw(src_path, done, dst_path, out_pos, take)?;
             out_pos += take;
@@ -3311,6 +4329,229 @@ impl StorageEngine {
         }
         self.ensure_dir_path(&path[..pos])
     }
+
+    // ---- GPU encode/decode jobs (Base64 / hex) ------------------------------
+
+    /// GPU file transcoding: Base64/hex encode or decode `input` into
+    /// `output`, both on the mounted volume.
+    ///
+    /// Works in fixed-size staged passes so it never needs one contiguous
+    /// VRAM run the size of the file: each pass materializes a slice of the
+    /// input (raw/sparse/compressed placements all accepted) into a small
+    /// contiguous staging area, transcodes it on the GPU, and scatters the
+    /// result into the output file's chunks device-to-device. File payload
+    /// bytes never round-trip through host memory; only the trailing partial
+    /// Base64 group is finished on the CPU.
+    pub fn encode_file_gpu_cancellable<F>(
+        &mut self,
+        codec: EncodeCodec,
+        direction: EncodeDirection,
+        input: &str,
+        output: &str,
+        mut should_cancel: F,
+    ) -> EResult<EncodeJobStats>
+    where
+        F: FnMut() -> bool,
+    {
+        let start = Instant::now();
+        let input = crate::lookup::normalize(input);
+        let output = crate::lookup::normalize(output);
+        if input == output {
+            return Err(EngineError::Cuda(
+                "encode input and output must be different files".into(),
+            ));
+        }
+        let mut output_created = false;
+        let result = map_archive_job_result(self.encode_file_gpu_inner(
+            codec,
+            direction,
+            &input,
+            &output,
+            &mut output_created,
+            &mut should_cancel,
+        ));
+        match result {
+            Ok((input_bytes, output_bytes)) => Ok(EncodeJobStats {
+                codec: codec.name().to_string(),
+                direction: direction.name().to_string(),
+                input,
+                output,
+                input_bytes,
+                output_bytes,
+                elapsed_ms: start.elapsed().as_millis(),
+            }),
+            Err(e) => {
+                if output_created {
+                    let _ = self.remove(&output);
+                }
+                self.cleanup_archive_temp_files();
+                Err(e)
+            }
+        }
+    }
+
+    fn encode_file_gpu_inner<F>(
+        &mut self,
+        codec: EncodeCodec,
+        direction: EncodeDirection,
+        input: &str,
+        output: &str,
+        output_created: &mut bool,
+        should_cancel: &mut F,
+    ) -> EResult<(u64, u64)>
+    where
+        F: FnMut() -> bool,
+    {
+        let size = {
+            let node = self.table.get(input).ok_or(LookupError::NotFound)?;
+            if node.is_dir {
+                return Err(EngineError::NotAFile);
+            }
+            node.size
+        };
+
+        // Effective input length: decodes ignore trailing ASCII whitespace
+        // (a final newline is near-universal in encoded text files).
+        let m = match direction {
+            EncodeDirection::Encode => size,
+            EncodeDirection::Decode => self.trim_trailing_whitespace_len(input, size)?,
+        };
+
+        // Input-unit / output-unit byte sizes for one transcoding group.
+        let (in_unit, out_unit): (u64, u64) = match (codec, direction) {
+            (EncodeCodec::Base64, EncodeDirection::Encode) => (3, 4),
+            (EncodeCodec::Base64, EncodeDirection::Decode) => (4, 3),
+            (EncodeCodec::Hex, EncodeDirection::Encode) => (1, 2),
+            (EncodeCodec::Hex, EncodeDirection::Decode) => (2, 1),
+        };
+
+        // Validate decode alignment and work out the exact output length.
+        let (gpu_in_len, out_len, tail_host): (u64, u64, Option<Vec<u8>>) =
+            match (codec, direction) {
+                (EncodeCodec::Base64, EncodeDirection::Encode) => {
+                    (m, m.div_ceil(3) * 4, None)
+                }
+                (EncodeCodec::Hex, EncodeDirection::Encode) => (m, m * 2, None),
+                (EncodeCodec::Hex, EncodeDirection::Decode) => {
+                    if m % 2 != 0 {
+                        return Err(EngineError::Cuda(
+                            "hex decode requires an even number of hex digits".into(),
+                        ));
+                    }
+                    (m, m / 2, None)
+                }
+                (EncodeCodec::Base64, EncodeDirection::Decode) => {
+                    if m % 4 != 0 {
+                        return Err(EngineError::Cuda(
+                            "base64 decode requires input length to be a multiple of 4 \
+                             (single-line base64 without embedded line breaks)"
+                                .into(),
+                        ));
+                    }
+                    if m == 0 {
+                        (0, 0, None)
+                    } else {
+                        // Decode the final (possibly '='-padded) group on the
+                        // host; the GPU handles only full non-padded groups.
+                        let last = self.read(input, m - 4, 4)?;
+                        let tail = decode_base64_quad(&last)?;
+                        let out_len = (m / 4 - 1) * 3 + tail.len() as u64;
+                        (m - 4, out_len, Some(tail))
+                    }
+                }
+            };
+
+        self.create_or_truncate_file(output)?;
+        *output_created = true;
+        if out_len == 0 {
+            self.set_size(output, 0)?;
+            return Ok((size, 0));
+        }
+
+        // Contiguous staging area: input slice + transcoded output slice in
+        // one temp file. Sized to the input (small files stage in one pass)
+        // and clamped so staging never eats more than half the free space.
+        let unit_lcm = 12u64; // lcm of every in_unit above
+        let free_bytes = (self.alloc.free() as u64) * CHUNK_SIZE;
+        let max_in_stage = ENCODE_STAGE_BYTES
+            .min((free_bytes / 2) / (1 + out_unit.div_ceil(in_unit)))
+            .max(unit_lcm);
+        let in_stage = gpu_in_len
+            .div_ceil(unit_lcm)
+            .saturating_mul(unit_lcm)
+            .min(max_in_stage / unit_lcm * unit_lcm)
+            .max(unit_lcm);
+        let out_stage = in_stage / in_unit * out_unit;
+        let staging = format!(
+            "\\.__vramdisk_encode_tmp_{}",
+            crate::lookup::now_filetime()
+        );
+        self.create_or_truncate_file(&staging)?;
+        self.allocate_raw_file(&staging, in_stage + out_stage)
+            .map_err(|err| match err {
+                EngineError::NoSpace => {
+                    archive_vram_exhausted("stage encode input and output slices")
+                }
+                other => other,
+            })?;
+        let stage_base = self.contiguous_file_ptr(&staging, in_stage + out_stage)?;
+        let out_stage_ptr = stage_base + in_stage;
+
+        let mut in_pos = 0u64;
+        let mut out_pos = 0u64;
+        while in_pos < gpu_in_len {
+            if should_cancel() {
+                let _ = self.remove(&staging);
+                return cancelled();
+            }
+            let take = (gpu_in_len - in_pos).min(in_stage);
+            self.copy_file_payload_raw(input, in_pos, &staging, 0, take)?;
+            let kernel = self.api_kernel()?;
+            match (codec, direction) {
+                (EncodeCodec::Base64, EncodeDirection::Encode) => {
+                    cuda(kernel.base64_encode(stage_base, take, out_stage_ptr))?
+                }
+                (EncodeCodec::Base64, EncodeDirection::Decode) => {
+                    cuda(kernel.base64_decode(stage_base, take / 4, out_stage_ptr))?
+                }
+                (EncodeCodec::Hex, EncodeDirection::Encode) => {
+                    cuda(kernel.hex_encode(stage_base, take, out_stage_ptr))?
+                }
+                (EncodeCodec::Hex, EncodeDirection::Decode) => {
+                    cuda(kernel.hex_decode(stage_base, take / 2, out_stage_ptr))?
+                }
+            }
+            let out_take = take.div_ceil(in_unit) * out_unit;
+            self.write_device_bytes(output, out_pos, out_stage_ptr, out_take)?;
+            in_pos += take;
+            out_pos += out_take;
+        }
+        if let Some(tail) = tail_host {
+            self.write_raw_internal(output, out_pos, &tail)?;
+        }
+        self.set_size(output, out_len)?;
+        let _ = self.remove(&staging);
+        Ok((size, out_len))
+    }
+
+    /// Length of `path`'s content once trailing ASCII whitespace is dropped.
+    fn trim_trailing_whitespace_len(&mut self, path: &str, size: u64) -> EResult<u64> {
+        let mut end = size;
+        while end > 0 {
+            let take = end.min(4096);
+            let block = self.read(path, end - take, take as usize)?;
+            let kept = block
+                .iter()
+                .rposition(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+                .map(|i| i as u64 + 1)
+                .unwrap_or(0);
+            end = end - take + kept;
+            if kept != 0 {
+                break;
+            }
+        }
+        Ok(end)
+    }
 }
 
 struct ZipCentralEntry {
@@ -3319,10 +4560,6 @@ struct ZipCentralEntry {
     comp_size: u64,
     local_offset: u64,
     name: String,
-}
-
-fn vec_path(path: &str) -> String {
-    path.to_string()
 }
 
 fn pad512(n: u64) -> u64 {
@@ -3501,10 +4738,14 @@ fn zip_deflate_chunks_from_extra(extra: &[u8]) -> EResult<Option<Vec<u64>>> {
             let start = read_u32_le(&extra[pos..pos + 4]) as usize;
             let count = read_u32_le(&extra[pos + 4..pos + 8]) as usize;
             if count != (len - 8) / 8 {
-                return Err(EngineError::Cuda("VRAMDISK ZIP chunk table count mismatch".into()));
+                return Err(EngineError::Cuda(
+                    "VRAMDISK ZIP chunk table count mismatch".into(),
+                ));
             }
             if sizes.len() < start {
-                return Err(EngineError::Cuda("VRAMDISK ZIP chunk table has a gap".into()));
+                return Err(EngineError::Cuda(
+                    "VRAMDISK ZIP chunk table has a gap".into(),
+                ));
             }
             if sizes.len() == start {
                 sizes.reserve(count);
@@ -3534,7 +4775,7 @@ fn patch_zip64_local_sizes(
 ) -> EResult<()> {
     let extra = zip_local_extra(uncomp_size, chunk_comp_sizes);
     debug_assert_eq!(chunk_comp_sizes.iter().sum::<u64>(), comp_size);
-    engine.write(path, extra_offset, &extra)?;
+    engine.write_raw_internal(path, extra_offset, &extra)?;
     Ok(())
 }
 
@@ -3645,7 +4886,10 @@ mod tests {
 
     #[test]
     fn join_archive_output_joins_under_base() {
-        assert_eq!(join_archive_output("\\out", "a.txt").unwrap(), "\\out\\a.txt");
+        assert_eq!(
+            join_archive_output("\\out", "a.txt").unwrap(),
+            "\\out\\a.txt"
+        );
         assert_eq!(join_archive_output("\\", "a.txt").unwrap(), "\\a.txt");
         assert_eq!(
             join_archive_output("\\out", "sub/a.txt").unwrap(),
@@ -3666,6 +4910,12 @@ mod tests {
         StorageEngine::new(vram, false, dedup).expect("engine")
     }
 
+    fn engine_with_hash_budget(mib: u64, dedup: bool, budget: u64) -> StorageEngine {
+        let mut e = engine(mib, dedup);
+        e.set_gpu_hash_launch_budget(budget);
+        e
+    }
+
     fn engine_compress(mib: u64) -> StorageEngine {
         let vram = Vram::new(0, mib * 1024 * 1024).expect("alloc vram for test");
         StorageEngine::new(vram, true, false).expect("compress engine (nvCOMP)")
@@ -3674,6 +4924,71 @@ mod tests {
     fn archive_engine(mib: u64) -> StorageEngine {
         let vram = Vram::new(0, mib * 1024 * 1024).expect("alloc vram for archive test");
         StorageEngine::new(vram, false, false).expect("archive engine")
+    }
+
+    fn write_archive_fixture(e: &mut StorageEngine) -> Vec<(String, Vec<u8>)> {
+        e.table_mut().create_dir("\\data", 0).unwrap();
+        let specs = [
+            ("\\data\\a.bin", vec![b'A'; CHUNK_SIZE as usize * 2]),
+            (
+                "\\data\\b.bin",
+                (0..(CHUNK_SIZE as usize + 12_345))
+                    .map(|i| ((i / 251) & 0xff) as u8)
+                    .collect(),
+            ),
+            ("\\data\\c.bin", vec![b'Z'; 8192]),
+        ];
+        let mut originals = Vec::with_capacity(specs.len());
+        for (path, data) in specs {
+            e.table_mut().create_file(path, 0).unwrap();
+            e.write(path, 0, &data).unwrap();
+            originals.push((path.to_string(), data));
+        }
+        originals
+    }
+
+    fn assert_archive_tree(
+        e: &mut StorageEngine,
+        base: &str,
+        originals: &[(String, Vec<u8>)],
+    ) {
+        for (path, expected) in originals {
+            let rel = path.trim_start_matches('\\');
+            let got = e.read(&format!("{base}\\{rel}"), 0, expected.len()).unwrap();
+            assert_eq!(got, *expected, "archive roundtrip mismatch for {path}");
+        }
+    }
+
+    fn assert_first_chunk_codec(e: &StorageEngine, path: &str, codec: Codec) {
+        assert!(matches!(
+            e.coord(path, 0),
+            Some(Placement::Compressed {
+                codec: got, ..
+            }) if got == codec
+        ));
+    }
+
+    fn force_file_zstd_compressed(e: &mut StorageEngine, path: &str) {
+        let size = e.get(path).unwrap().size;
+        assert!(size <= CHUNK_SIZE, "test fixture expects a single archive chunk");
+        let original = e.read(path, 0, size as usize).unwrap();
+        for lc in 0..logical_chunks(size) {
+            let chunk_start = lc * CHUNK_SIZE as usize;
+            let chunk_end = ((lc + 1) * CHUNK_SIZE as usize).min(original.len());
+            let mut full = vec![0u8; CHUNK_SIZE as usize];
+            if chunk_start < chunk_end {
+                full[..chunk_end - chunk_start].copy_from_slice(&original[chunk_start..chunk_end]);
+            }
+            let compressed = zstd::encode_all(full.as_slice(), 3).unwrap();
+            assert!(
+                compressed.len() < CHUNK_SIZE as usize,
+                "test fixture archive chunk should fit in compressed storage"
+            );
+            let old = e.coord(path, lc);
+            e.place_chunk(path, lc, &full, old, Some((compressed, Codec::Zstd)), None)
+                .unwrap();
+        }
+        e.set_size(path, size).unwrap();
     }
 
     #[test]
@@ -3731,10 +5046,103 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore]
+    fn archive_jobs_roundtrip_lz4_source_placements() {
+        let mut e = engine_compress(512);
+        let originals = write_archive_fixture(&mut e);
+        assert_first_chunk_codec(&e, "\\data\\a.bin", Codec::Lz4);
+        assert_first_chunk_codec(&e, "\\data\\b.bin", Codec::Lz4);
+        let paths: Vec<String> = originals.iter().map(|(path, _)| path.clone()).collect();
+        for (codec, archive, out_dir) in [
+            (NvcompFrameCodec::Zstd, "\\lz4-src.tar.zst", "\\lz4-zstd-out"),
+            (NvcompFrameCodec::Deflate, "\\lz4-src.zip", "\\lz4-zip-out"),
+        ] {
+            e.archive_compress_gpu(codec, &paths, archive).unwrap();
+            e.archive_extract_gpu(codec, archive, out_dir).unwrap();
+            assert_archive_tree(&mut e, out_dir, &originals);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn archive_jobs_roundtrip_zstd_source_placements() {
+        let mut e = engine_compress(512);
+        e.codec = None;
+        let originals = write_archive_fixture(&mut e);
+        assert_first_chunk_codec(&e, "\\data\\a.bin", Codec::Zstd);
+        assert_first_chunk_codec(&e, "\\data\\b.bin", Codec::Zstd);
+        let paths: Vec<String> = originals.iter().map(|(path, _)| path.clone()).collect();
+        for (codec, archive, out_dir) in [
+            (NvcompFrameCodec::Zstd, "\\zstd-src.tar.zst", "\\zstd-zstd-out"),
+            (NvcompFrameCodec::Deflate, "\\zstd-src.zip", "\\zstd-zip-out"),
+        ] {
+            e.archive_compress_gpu(codec, &paths, archive).unwrap();
+            e.archive_extract_gpu(codec, archive, out_dir).unwrap();
+            assert_archive_tree(&mut e, out_dir, &originals);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn archive_extract_accepts_compressed_archive_file() {
+        let mut e = engine_compress(512);
+        let originals = write_archive_fixture(&mut e);
+        let paths: Vec<String> = originals.iter().map(|(path, _)| path.clone()).collect();
+        let stats = e
+            .archive_compress_gpu(NvcompFrameCodec::Zstd, &paths, "\\packed.tar.zst")
+            .unwrap();
+        assert!(stats.archive_bytes > 0);
+        force_file_zstd_compressed(&mut e, "\\packed.tar.zst");
+        assert_first_chunk_codec(&e, "\\packed.tar.zst", Codec::Zstd);
+        e.archive_extract_gpu(NvcompFrameCodec::Zstd, "\\packed.tar.zst", "\\packed-out")
+            .unwrap();
+        assert_archive_tree(&mut e, "\\packed-out", &originals);
+    }
+
     #[allow(dead_code)]
     fn engine_compress_dedup(mib: u64) -> StorageEngine {
         let vram = Vram::new(0, mib * 1024 * 1024).expect("alloc vram for test");
         StorageEngine::new(vram, true, true).expect("compress+dedup engine (nvCOMP)")
+    }
+
+    fn patterned_bytes(len: usize, seed: u32) -> Vec<u8> {
+        (0..len)
+            .map(|i| {
+                let x = i as u32;
+                x.wrapping_mul(37)
+                    .wrapping_add((x >> 3) * 11)
+                    .wrapping_add(seed) as u8
+            })
+            .collect()
+    }
+
+    fn hash_reference(alg: HashAlgorithm, data: &[u8]) -> Vec<u8> {
+        match alg {
+            HashAlgorithm::Md5 => {
+                let mut hasher = Md5::new();
+                hasher.update(data);
+                hasher.finalize().to_vec()
+            }
+            HashAlgorithm::Sha1 => {
+                let mut hasher = Sha1::new();
+                hasher.update(data);
+                hasher.finalize().to_vec()
+            }
+            HashAlgorithm::Sha256 => {
+                let mut hasher = Sha256::new();
+                hasher.update(data);
+                hasher.finalize().to_vec()
+            }
+            HashAlgorithm::Fnv1a64 => {
+                let mut state = FNV1A64_OFFSET_BASIS;
+                for &b in data {
+                    state ^= b as u64;
+                    state = state.wrapping_mul(FNV1A64_PRIME);
+                }
+                state.to_be_bytes().to_vec()
+            }
+        }
     }
 
     #[test]
@@ -3785,6 +5193,130 @@ mod tests {
         let _ = e
             .hash_file_gpu("\\sparse", crate::api_kernel::HashAlgorithm::Sha256)
             .unwrap();
+    }
+
+    #[test]
+    fn gpu_api_hash_small_budget_matches_known_digests() {
+        let mut e = engine_with_hash_budget(8, false, 64 * 1024);
+        e.table_mut().create_file("\\multi_a", 0).unwrap();
+        let file1: Vec<u8> = (0..(CHUNK_SIZE as usize * 3 + 123))
+            .map(|i| ((i * 17) + (i / 512) + 3) as u8)
+            .collect();
+        e.write("\\multi_a", 0, &file1).unwrap();
+
+        e.table_mut().create_file("\\multi_b", 0).unwrap();
+        e.set_size("\\multi_b", CHUNK_SIZE * 2 + 4096 + 17).unwrap();
+        let part1: Vec<u8> = (0..7000).map(|i| ((i * 29) + 11) as u8).collect();
+        e.write("\\multi_b", 8192, &part1).unwrap();
+        let part2: Vec<u8> = (0..3000).map(|i| ((i * 7) + 5) as u8).collect();
+        let tail_off = CHUNK_SIZE * 2 + 4096 + 17 - part2.len() as u64;
+        e.write("\\multi_b", tail_off, &part2).unwrap();
+
+        let expected = [
+            (
+                "\\multi_a",
+                "52d82b3d1e16800efbe069a25e9d8869",
+                "01f386977fa106de35ab560a750df36a7a453e2c",
+                "f59cb9d9ab6d6f82efb85f5e7ce6e424a8db21a342b8623f77ba546e6296ec6c",
+            ),
+            (
+                "\\multi_b",
+                "9d662de4fe8a49a2f1eb727e7d891645",
+                "cb9ad859560b033f7d3810cf0cd5fbdf3b7a30bd",
+                "087746a4b3aa9a38a52802dfecfd99cd85a94a88f8fe0d7381772b4ae9569bd8",
+            ),
+        ];
+
+        for &(path, md5, sha1, sha256) in &expected {
+            assert_eq!(
+                crate::api_kernel::digest_hex(&e.hash_file_gpu(path, HashAlgorithm::Md5).unwrap()),
+                md5
+            );
+            assert_eq!(
+                crate::api_kernel::digest_hex(&e.hash_file_gpu(path, HashAlgorithm::Sha1).unwrap()),
+                sha1
+            );
+            assert_eq!(
+                crate::api_kernel::digest_hex(
+                    &e.hash_file_gpu(path, HashAlgorithm::Sha256).unwrap()
+                ),
+                sha256
+            );
+        }
+
+        let paths = vec!["\\multi_a".to_string(), "\\multi_b".to_string()];
+        let md5 = e.hash_files_gpu_many(&paths, HashAlgorithm::Md5).unwrap();
+        let sha1 = e.hash_files_gpu_many(&paths, HashAlgorithm::Sha1).unwrap();
+        let sha256 = e
+            .hash_files_gpu_many(&paths, HashAlgorithm::Sha256)
+            .unwrap();
+        assert_eq!(crate::api_kernel::digest_hex(&md5[0]), expected[0].1);
+        assert_eq!(crate::api_kernel::digest_hex(&md5[1]), expected[1].1);
+        assert_eq!(crate::api_kernel::digest_hex(&sha1[0]), expected[0].2);
+        assert_eq!(crate::api_kernel::digest_hex(&sha1[1]), expected[1].2);
+        assert_eq!(crate::api_kernel::digest_hex(&sha256[0]), expected[0].3);
+        assert_eq!(crate::api_kernel::digest_hex(&sha256[1]), expected[1].3);
+    }
+
+    #[test]
+    fn cpu_and_gpu_hash_digests_match_all_algorithms() {
+        let mut e = engine(16, false);
+        let path = "\\hash-fixture";
+        let data = patterned_bytes(CHUNK_SIZE as usize * 2 + 12_345, 17);
+        e.table_mut().create_file(path, 0).unwrap();
+        e.write(path, 0, &data).unwrap();
+
+        for alg in [
+            HashAlgorithm::Md5,
+            HashAlgorithm::Sha1,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Fnv1a64,
+        ] {
+            let cpu = e.hash_file_cpu(path, alg).unwrap();
+            let gpu = e.hash_file_gpu(path, alg).unwrap();
+            let reference = hash_reference(alg, &data);
+            assert_eq!(cpu, gpu, "CPU/GPU digest mismatch for {}", alg.name());
+            assert_eq!(cpu, reference, "reference digest mismatch for {}", alg.name());
+        }
+    }
+
+    #[test]
+    fn routed_large_file_hash_uses_cpu_and_matches_rustcrypto() {
+        let mut e = engine(16, false);
+        e.hash_cpu_route_threshold = 1 * 1024 * 1024;
+        e.hash_cpu_route_threshold_override = true;
+
+        let path = "\\large-hash";
+        let data = patterned_bytes(5 * 1024 * 1024 + 321, 99);
+        e.table_mut().create_file(path, 0).unwrap();
+        e.write(path, 0, &data).unwrap();
+
+        assert!(!e.should_hash_on_gpu(path).unwrap());
+        let digest = e.hash_file(path, HashAlgorithm::Sha256).unwrap();
+        assert_eq!(digest, hash_reference(HashAlgorithm::Sha256, &data));
+    }
+
+    #[test]
+    fn routed_hash_succeeds_for_cpu_zstd_fallback_chunks() {
+        let mut e = engine_compress(16);
+        e.codec = None;
+
+        let path = "\\zstd-hash";
+        let data = vec![b'A'; CHUNK_SIZE as usize * 2];
+        e.table_mut().create_file(path, 0).unwrap();
+        e.write(path, 0, &data).unwrap();
+
+        assert!(matches!(
+            e.coord(path, 0),
+            Some(Placement::Compressed {
+                codec: Codec::Zstd,
+                ..
+            })
+        ));
+        assert!(!e.file_supports_gpu_hash(path).unwrap());
+
+        let digest = e.hash_file(path, HashAlgorithm::Sha256).unwrap();
+        assert_eq!(digest, hash_reference(HashAlgorithm::Sha256, &data));
     }
 
     #[test]
@@ -4185,5 +5717,221 @@ mod tests {
         // Deleting the last sharer frees it.
         e.remove("\\q").unwrap();
         assert_eq!(e.used_chunks(), shared - 1);
+    }
+
+    // ---- rename fixes --------------------------------------------------------
+
+    #[test]
+    fn rename_replace_frees_target_chunks() {
+        let mut e = engine(4, false);
+        e.table_mut().create_file("\\a", 0).unwrap();
+        e.table_mut().create_file("\\b", 0).unwrap();
+        e.write("\\a", 0, &vec![1u8; CHUNK_SIZE as usize]).unwrap();
+        e.write("\\b", 0, &vec![2u8; CHUNK_SIZE as usize * 2]).unwrap();
+        assert_eq!(e.used_chunks(), 3);
+        // The editor save pattern: write temp, rename over the original. The
+        // replaced file's two chunks must be freed, not leaked.
+        e.rename("\\a", "\\b", true).unwrap();
+        assert_eq!(e.used_chunks(), 1, "replaced file's chunks must be freed");
+        let got = e.read("\\b", 0, CHUNK_SIZE as usize).unwrap();
+        assert!(got.iter().all(|&b| b == 1));
+    }
+
+    #[test]
+    fn case_only_rename_updates_display_name() {
+        let mut e = engine(2, false);
+        e.table_mut().create_file("\\lower.txt", 0).unwrap();
+        e.rename("\\lower.txt", "\\LOWER.TXT", false).unwrap();
+        assert_eq!(e.get("\\lower.txt").unwrap().name, "LOWER.TXT");
+        let kids = e.table().readdir("\\").unwrap();
+        assert_eq!(kids[0].0, "LOWER.TXT");
+    }
+
+    // ---- GPU encode/decode ---------------------------------------------------
+
+    fn b64_reference(data: &[u8]) -> String {
+        const CHARS: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for group in data.chunks(3) {
+            let b0 = group[0] as u32;
+            let b1 = group.get(1).copied().unwrap_or(0) as u32;
+            let b2 = group.get(2).copied().unwrap_or(0) as u32;
+            let w = (b0 << 16) | (b1 << 8) | b2;
+            out.push(CHARS[(w >> 18) as usize & 63] as char);
+            out.push(CHARS[(w >> 12) as usize & 63] as char);
+            out.push(if group.len() > 1 {
+                CHARS[(w >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if group.len() > 2 {
+                CHARS[w as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    fn encode_roundtrip_case(e: &mut StorageEngine, tag: &str, data: &[u8]) {
+        let src = format!("\\{tag}.bin");
+        let b64 = format!("\\{tag}.b64");
+        let back = format!("\\{tag}.back");
+        let hex = format!("\\{tag}.hex");
+        let hexback = format!("\\{tag}.hexback");
+        e.table_mut().create_file(&src, 0).unwrap();
+        if !data.is_empty() {
+            e.write(&src, 0, data).unwrap();
+        }
+
+        let stats = e
+            .encode_file_gpu_cancellable(
+                EncodeCodec::Base64,
+                EncodeDirection::Encode,
+                &src,
+                &b64,
+                || false,
+            )
+            .unwrap();
+        assert_eq!(stats.output_bytes, (data.len() as u64).div_ceil(3) * 4);
+        let encoded = e.read(&b64, 0, stats.output_bytes as usize).unwrap();
+        assert_eq!(
+            String::from_utf8(encoded).unwrap(),
+            b64_reference(data),
+            "base64 output mismatch for {tag}"
+        );
+
+        e.encode_file_gpu_cancellable(
+            EncodeCodec::Base64,
+            EncodeDirection::Decode,
+            &b64,
+            &back,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(e.file_size(&back).unwrap(), data.len() as u64);
+        assert_eq!(e.read(&back, 0, data.len().max(1)).unwrap(), data);
+
+        let stats = e
+            .encode_file_gpu_cancellable(
+                EncodeCodec::Hex,
+                EncodeDirection::Encode,
+                &src,
+                &hex,
+                || false,
+            )
+            .unwrap();
+        assert_eq!(stats.output_bytes, data.len() as u64 * 2);
+        let hexed = e.read(&hex, 0, data.len() * 2).unwrap();
+        let expect: String = data.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(String::from_utf8(hexed).unwrap(), expect);
+
+        e.encode_file_gpu_cancellable(
+            EncodeCodec::Hex,
+            EncodeDirection::Decode,
+            &hex,
+            &hexback,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(e.read(&hexback, 0, data.len().max(1)).unwrap(), data);
+    }
+
+    #[test]
+    fn encode_base64_hex_roundtrip_all_paddings() {
+        let mut e = engine(16, false);
+        // Lengths mod 3 = 0, 1, 2, plus empty and >1 chunk with all byte values.
+        encode_roundtrip_case(&mut e, "empty", b"");
+        encode_roundtrip_case(&mut e, "pad0", b"abcdef");
+        encode_roundtrip_case(&mut e, "pad1", b"abcdefg");
+        encode_roundtrip_case(&mut e, "pad2", b"abcdefgh");
+        let big: Vec<u8> = (0..CHUNK_SIZE as usize * 2 + 7)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        encode_roundtrip_case(&mut e, "big", &big);
+    }
+
+    #[test]
+    fn encode_decode_accepts_trailing_newline_and_rejects_garbage() {
+        let mut e = engine(8, false);
+        e.table_mut().create_file("\\ok.b64", 0).unwrap();
+        e.write("\\ok.b64", 0, b"aGVsbG8=\r\n").unwrap();
+        e.encode_file_gpu_cancellable(
+            EncodeCodec::Base64,
+            EncodeDirection::Decode,
+            "\\ok.b64",
+            "\\ok.out",
+            || false,
+        )
+        .unwrap();
+        assert_eq!(e.read("\\ok.out", 0, 16).unwrap(), b"hello");
+
+        e.table_mut().create_file("\\bad.b64", 0).unwrap();
+        e.write("\\bad.b64", 0, b"aGVs!G8=").unwrap();
+        let err = e.encode_file_gpu_cancellable(
+            EncodeCodec::Base64,
+            EncodeDirection::Decode,
+            "\\bad.b64",
+            "\\bad.out",
+            || false,
+        );
+        assert!(err.is_err(), "invalid base64 must be rejected");
+        assert!(
+            e.get("\\bad.out").is_none(),
+            "failed decode must not leave a partial output file"
+        );
+
+        e.table_mut().create_file("\\bad.hex", 0).unwrap();
+        e.write("\\bad.hex", 0, b"00ff0z").unwrap();
+        assert!(e
+            .encode_file_gpu_cancellable(
+                EncodeCodec::Hex,
+                EncodeDirection::Decode,
+                "\\bad.hex",
+                "\\badhex.out",
+                || false,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn encode_handles_sparse_input_and_leaves_no_temp_files() {
+        let mut e = engine(16, false);
+        e.table_mut().create_file("\\sparse.bin", 0).unwrap();
+        // First chunk is a hole, the write after it lands in a second chunk.
+        e.set_size("\\sparse.bin", CHUNK_SIZE).unwrap();
+        e.write("\\sparse.bin", CHUNK_SIZE, b"tail").unwrap();
+        let size = e.file_size("\\sparse.bin").unwrap();
+        let raw = e.read("\\sparse.bin", 0, size as usize).unwrap();
+
+        e.encode_file_gpu_cancellable(
+            EncodeCodec::Base64,
+            EncodeDirection::Encode,
+            "\\sparse.bin",
+            "\\sparse.b64",
+            || false,
+        )
+        .unwrap();
+        e.encode_file_gpu_cancellable(
+            EncodeCodec::Base64,
+            EncodeDirection::Decode,
+            "\\sparse.b64",
+            "\\sparse.back",
+            || false,
+        )
+        .unwrap();
+        assert_eq!(e.read("\\sparse.back", 0, size as usize).unwrap(), raw);
+
+        // No .__vramdisk_* staging temp may survive.
+        let leftovers: Vec<String> = e
+            .table()
+            .readdir("\\")
+            .unwrap()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with(".__vramdisk_"))
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert!(leftovers.is_empty(), "staging temp leaked: {leftovers:?}");
     }
 }

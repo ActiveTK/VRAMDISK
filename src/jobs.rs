@@ -2,8 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAX_JOBS: usize = 1_000_000;
+const MAX_JOBS: usize = 100_000;
+/// When the registry is full, up to this many of the oldest *terminal* jobs
+/// are evicted to make room for a new submission, so a long-lived mount can
+/// keep accepting jobs instead of hitting a permanent `TooManyJobs` wall.
+const EVICT_BATCH: usize = 1_000;
 const MAX_DESCRIPTOR_BYTES: usize = 1024 * 1024;
+pub const JOB_CANCELLED_MESSAGE: &str = "cancelled by user";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobState {
@@ -74,6 +79,7 @@ struct JobRecord {
     descriptor: String,
     result: String,
     error: Option<String>,
+    cancel_requested: bool,
 }
 
 impl JobRegistry {
@@ -86,7 +92,21 @@ impl JobRegistry {
             return Err(JobSubmitError::AlreadyExists);
         }
         if inner.jobs.len() >= MAX_JOBS {
-            return Err(JobSubmitError::TooManyJobs);
+            // Evict the oldest finished jobs; refuse only when the registry is
+            // genuinely full of jobs that are still pending or running.
+            let mut terminal: Vec<(u128, String)> = inner
+                .jobs
+                .iter()
+                .filter(|(_, job)| job.state.is_terminal())
+                .map(|(id, job)| (job.updated_at_ms, id.clone()))
+                .collect();
+            terminal.sort();
+            for (_, old_id) in terminal.into_iter().take(EVICT_BATCH) {
+                inner.jobs.remove(&old_id);
+            }
+            if inner.jobs.len() >= MAX_JOBS {
+                return Err(JobSubmitError::TooManyJobs);
+            }
         }
         let now = now_ms();
         inner.jobs.insert(
@@ -98,6 +118,7 @@ impl JobRegistry {
                 descriptor: String::new(),
                 result: "{}\r\n".to_string(),
                 error: None,
+                cancel_requested: false,
             },
         );
         self.changed.notify_all();
@@ -119,6 +140,14 @@ impl JobRegistry {
         }
 
         job.descriptor = descriptor;
+        if job.cancel_requested {
+            job.state = JobState::Cancelled;
+            job.error = Some(JOB_CANCELLED_MESSAGE.to_string());
+            job.result = result_json(id, &job.state, job.error.as_deref());
+            job.updated_at_ms = now_ms();
+            self.changed.notify_all();
+            return Err(JobSubmitError::AlreadySubmitted);
+        }
         job.state = JobState::Queued;
         job.updated_at_ms = now_ms();
         self.changed.notify_all();
@@ -129,6 +158,14 @@ impl JobRegistry {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let job = inner.jobs.get_mut(id)?;
         if job.state != JobState::Queued {
+            return None;
+        }
+        if job.cancel_requested {
+            job.state = JobState::Cancelled;
+            job.error = Some(JOB_CANCELLED_MESSAGE.to_string());
+            job.result = result_json(id, &job.state, job.error.as_deref());
+            job.updated_at_ms = now_ms();
+            self.changed.notify_all();
             return None;
         }
         job.state = JobState::Running;
@@ -159,12 +196,34 @@ impl JobRegistry {
         if job.state.is_terminal() {
             return true;
         }
-        job.state = JobState::Cancelled;
-        job.error = Some("cancelled by user".to_string());
-        job.result = result_json(id, &job.state, job.error.as_deref());
+        job.cancel_requested = true;
+        if job.state != JobState::Running {
+            job.state = JobState::Cancelled;
+            job.error = Some(JOB_CANCELLED_MESSAGE.to_string());
+            job.result = result_json(id, &job.state, job.error.as_deref());
+        }
         job.updated_at_ms = now_ms();
         self.changed.notify_all();
         true
+    }
+
+    pub fn cancel_requested(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .jobs
+            .get(id)
+            .map(|job| job.cancel_requested)
+            .unwrap_or(false)
+    }
+
+    pub fn finish_cancelled(&self, id: &str) {
+        self.finish(
+            id,
+            JobState::Cancelled,
+            result_json(id, &JobState::Cancelled, Some(JOB_CANCELLED_MESSAGE)),
+            Some(JOB_CANCELLED_MESSAGE.to_string()),
+        );
     }
 
     pub fn exists(&self, id: &str) -> bool {
@@ -366,5 +425,23 @@ mod tests {
         let snap = jobs.snapshot("job2").unwrap();
         assert_eq!(snap.state, JobState::Failed);
         assert!(snap.result.contains("no GPU executor"));
+    }
+
+    #[test]
+    fn cancelling_running_job_sets_request_until_worker_finishes() {
+        let jobs = JobRegistry::default();
+        jobs.reserve("job3").unwrap();
+        jobs.complete_submission("job3", br#"{"op":"hash"}"#).unwrap();
+        assert!(jobs.start("job3").is_some());
+
+        assert!(jobs.cancel("job3"));
+        let running = jobs.snapshot("job3").unwrap();
+        assert_eq!(running.state, JobState::Running);
+        assert!(jobs.cancel_requested("job3"));
+
+        jobs.finish_cancelled("job3");
+        let snap = jobs.wait("job3").unwrap();
+        assert_eq!(snap.state, JobState::Cancelled);
+        assert!(snap.result.contains(JOB_CANCELLED_MESSAGE));
     }
 }

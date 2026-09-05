@@ -252,7 +252,13 @@ impl ManagerState {
             Ok(m) => m,
             Err(e) => {
                 if removed_existing {
-                    let _ = std::fs::create_dir(&mount_point);
+                    if let Err(restore) = std::fs::create_dir(&mount_point) {
+                        // Both the mount and the restore failed: say so
+                        // instead of silently leaving the user's folder gone.
+                        return Err(anyhow::anyhow!(
+                            "{e:#}（さらに、マウント先フォルダの復元にも失敗しました: {restore}）"
+                        ));
+                    }
                 }
                 return Err(e);
             }

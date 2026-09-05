@@ -213,7 +213,11 @@ impl LookupTable {
 
     /// Rename/move `from` to `to`. If `to` exists: replaced when `replace`,
     /// else `AlreadyExists`. Moves the whole subtree for directories.
-    pub fn rename(&mut self, from: &str, to: &str, replace: bool) -> LResult<()> {
+    ///
+    /// Returns the node that was replaced at `to` (if any) so the caller —
+    /// the storage engine — can free the VRAM placements it still owns.
+    /// Dropping that node without freeing its coords would leak its chunks.
+    pub fn rename(&mut self, from: &str, to: &str, replace: bool) -> LResult<Option<Node>> {
         let from_key = normalize(from);
         let to_key = normalize(to);
         if from_key == ROOT {
@@ -223,7 +227,22 @@ impl LookupTable {
             return Err(LookupError::NotFound);
         }
         if from_key == to_key {
-            return Ok(());
+            // Same lookup key, but possibly a different display case
+            // (`foo.txt` -> `FOO.txt`). The volume is case-preserving, so a
+            // case-only rename must update the stored display name instead of
+            // silently doing nothing.
+            let new_name = display_name(to);
+            let old_name = self.nodes.get(&from_key).unwrap().name.clone();
+            if new_name != old_name && !new_name.is_empty() {
+                if let Some((parent, _)) = split_parent(&from_key) {
+                    if let Some(p) = self.nodes.get_mut(&parent) {
+                        p.children.remove(&old_name);
+                        p.children.insert(new_name.clone());
+                    }
+                }
+                self.nodes.get_mut(&from_key).unwrap().name = new_name;
+            }
+            return Ok(None);
         }
         // Disallow moving a directory into itself or one of its own
         // descendants (e.g. `\a` -> `\a\b`): re-rooting the subtree under a key
@@ -232,6 +251,7 @@ impl LookupTable {
         if from_is_dir && to_key.starts_with(&format!("{from_key}\\")) {
             return Err(LookupError::InvalidName);
         }
+        let mut replaced = None;
         if self.nodes.contains_key(&to_key) {
             if !replace {
                 return Err(LookupError::AlreadyExists);
@@ -240,7 +260,7 @@ impl LookupTable {
             if existing.is_dir {
                 return Err(LookupError::IsADirectory);
             }
-            self.remove(to)?;
+            replaced = Some(self.remove(to)?);
         }
         let (to_parent, _) = split_parent(&to_key).ok_or(LookupError::InvalidName)?;
         match self.nodes.get(&to_parent) {
@@ -281,7 +301,7 @@ impl LookupTable {
             }
             self.nodes.insert(new_key, node);
         }
-        Ok(())
+        Ok(replaced)
     }
 }
 

@@ -51,11 +51,20 @@ VRAMDISK 内部API
       ジョブ状態を JSON で表示します。
 
   \\$VRAMDISK\\jobs\\<id>\\wait
-      ジョブ完了まで read をブロックし、完了時に result.json と同じ内容を返します。
+      投入済みジョブの完了まで read をブロックし、完了時に result.json と同じ内容を返します。
 
   hash job descriptor 例:
       {\"op\":\"hash\",\"algorithm\":\"sha256\",\"paths\":[\"\\\\data\"],\"recursive\":true}
       md5, sha1, sha256, fnv1a64 に対応します。
+
+  archive job descriptor 例:
+      {\"op\":\"archive.compress\",\"format\":\"tar.zst\",\"paths\":[\"\\\\data\"],\"output\":\"\\\\out.tar.zst\"}
+      {\"op\":\"archive.extract\",\"format\":\"tar.zst\",\"archive\":\"\\\\out.tar.zst\",\"output_dir\":\"\\\\restore\"}
+      tar.zst, tar.lz4, tar.gz, zip に対応します（nvCOMP が必要）。
+
+  encode job descriptor 例:
+      {\"op\":\"encode\",\"codec\":\"base64\",\"direction\":\"encode\",\"input\":\"\\\\a.bin\",\"output\":\"\\\\a.b64\"}
+      codec は base64 / hex、direction は encode / decode に対応します。
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,7 +234,7 @@ pub fn content(entry: &Entry, engine: &mut StorageEngine) -> Result<Vec<u8>, Eng
         Entry::TraceJsonFile => Ok(trace_json(engine).into_bytes()),
         Entry::ChunksJsonFile { target_file } => Ok(chunks_json(engine, target_file)?.into_bytes()),
         Entry::HashFile { alg, target_file } => {
-            let digest = engine.hash_file_gpu(target_file, *alg)?;
+            let digest = engine.hash_file(target_file, *alg)?;
             Ok(format!("{}\r\n", digest_hex(&digest)).into_bytes())
         }
         Entry::RootDir

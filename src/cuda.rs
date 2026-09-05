@@ -115,9 +115,11 @@ impl Drop for RegisteredHost {
 }
 
 fn sync_used_streams(streams: &[Arc<CudaStream>], used: &[usize]) -> Result<()> {
-    let mut seen = [false; TRANSFER_STREAMS];
+    // Sized from `streams`, not the `TRANSFER_STREAMS` constant, so the bound
+    // checked below is the same one used to index both arrays.
+    let mut seen = vec![false; streams.len()];
     for &idx in used {
-        if idx < streams.len() && !seen[idx] {
+        if idx < seen.len() && !seen[idx] {
             streams[idx].synchronize()?;
             seen[idx] = true;
         }
@@ -137,8 +139,9 @@ impl Vram {
 
     /// Name of the given CUDA device (for logging).
     pub fn device_name(ordinal: usize) -> Result<String> {
-        result::init().ok();
-        let dev = result::device::get(ordinal as i32)?;
+        result::init().context("cuInit failed (no CUDA driver / GPU?)")?;
+        let dev = result::device::get(ordinal as i32)
+            .with_context(|| format!("no CUDA device with ordinal {ordinal}"))?;
         let name = result::device::get_name(dev).context("cuDeviceGetName failed")?;
         Ok(name)
     }
@@ -231,10 +234,14 @@ impl Vram {
                 format!("write_at out of bounds: offset={offset} len={}", data.len())
             })?;
         self.bind()?;
+        // Both large-transfer paths below run on the non-blocking transfer
+        // streams, which are not ordered against the default stream. Fence the
+        // work already queued there (async writes, hash kernels) once here,
+        // before either path can race it.
+        self.stream.synchronize()?;
         let base = self.buf_device_ptr();
         if data.len() >= HOST_REGISTER_THRESHOLD {
             if let Some(_registered) = RegisteredHost::try_register(data.as_ptr(), data.len()) {
-                self.stream.synchronize()?;
                 self.copy_registered_h2d(base + offset, data)?;
                 debug_assert_eq!(end, offset + data.len() as u64);
                 return Ok(());
@@ -326,10 +333,13 @@ impl Vram {
             .filter(|&e| e <= self.size)
             .with_context(|| format!("read_at out of bounds: offset={offset} len={}", out.len()))?;
         self.bind()?;
+        // As in `write_at`: the transfer streams below are non-blocking, so
+        // fence the default stream once here to order this read after any work
+        // still queued on it.
+        self.stream.synchronize()?;
         let base = self.buf_device_ptr();
         if out.len() >= HOST_REGISTER_THRESHOLD {
             if let Some(_registered) = RegisteredHost::try_register(out.as_mut_ptr(), out.len()) {
-                self.stream.synchronize()?;
                 self.copy_registered_d2h(base + offset, out)?;
                 debug_assert_eq!(end, offset + out.len() as u64);
                 return Ok(());

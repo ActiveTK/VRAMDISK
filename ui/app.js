@@ -3,7 +3,11 @@
 // Uses the global Tauri API (app.withGlobalTauri = true) so no bundler/import
 // step is required. Only one disk can ever be mounted at a time, so the UI is
 // a simple screen switch: setup (nothing mounted) <-> mounted (+ hash /
-// archive tool panels reachable from it).
+// archive / encode tool panels reachable from it).
+//
+// GPU jobs are asynchronous: the backend returns a job id immediately, the
+// frontend polls `job_status` (keeping the UI responsive and the job
+// cancellable via `job_cancel`), and reads `job_result` once terminal.
 
 "use strict";
 
@@ -12,14 +16,263 @@ const listen = window.__TAURI__.event.listen;
 const dialog = window.__TAURI__.dialog;
 
 const el = (id) => document.getElementById(id);
-const UNMOUNT_WARNING = "本当にアンマウントしますか？\nドライブ上のデータは全て失われます。";
 
 // GB/MB use the Windows convention (binary, 1024-based) so the size field
-// agrees with the "既定値: X" hint and the GPU's reported VRAM.
+// agrees with the default hint and the GPU's reported VRAM.
 const UNIT_BYTES = { MB: 1024 ** 2, GB: 1024 ** 3 };
 
+const JOB_POLL_MS = 400;
+
 let currentStatus = null; // MountStatus (from backend) or null
-let gpuList = []; // [{ordinal, name, total_vram, default_size}, ...], cached from list_gpus()
+let gpuList = []; // cached from list_gpus()
+
+// --- i18n -------------------------------------------------------------------
+//
+// The language is persisted by the backend (registry, HKCU\Software\VRAMDISK)
+// and defaults to the Windows display language; `navigator.language` is only
+// the fallback if the backend command itself fails.
+
+const I18N = {
+  ja: {
+    device: "GPU",
+    target: "マウント先",
+    driveLetter: "ドライブレター",
+    folder: "フォルダ",
+    browse: "参照...",
+    capacity: "容量",
+    options: "オプション",
+    compressOpt: "データを圧縮（nvCOMP / GPU）",
+    dedupOpt: "同一内容のチャンクを共有",
+    compressHint:
+      "nvCOMP が見つからないため、この GUI では圧縮を利用できません（CLI では CPU zstd にフォールバックします）",
+    mount: "マウント",
+    statFiles: "ファイル数",
+    statLogical: "論理データ",
+    statDedup: "共有による節約",
+    statPacked: "圧縮による節約",
+    toolsLabel: "マウント中のファイルを GPU で処理",
+    toolHash: "ハッシュ計算",
+    toolArchive: "圧縮・展開",
+    toolEncode: "エンコード",
+    unmount: "アンマウント",
+    back: "← 戻る",
+    hashPath: "対象（ファイル / フォルダ）",
+    algorithm: "アルゴリズム",
+    recursive: "サブフォルダも含める",
+    hashRun: "計算する",
+    cancel: "中止",
+    compressTab: "圧縮",
+    extractTab: "展開",
+    archiveSource: "対象（フォルダは常に再帰）",
+    archiveOutput: "出力先アーカイブ",
+    format: "形式",
+    formatZst: "tar.zst（推奨・高速）",
+    archiveInput: "展開するアーカイブ",
+    archiveOutdir: "展開先フォルダ",
+    encodeTab: "エンコード",
+    decodeTab: "デコード",
+    codec: "形式",
+    hexOption: "hex（16進テキスト）",
+    encodeInput: "変換するファイル",
+    encodeOutput: "出力ファイル",
+
+    noCudaOption: "CUDA デバイスが見つかりません",
+    noGpuError:
+      "NVIDIA GPU と CUDA ドライバが見つかりません。ドライバを更新して再起動してください。",
+    sizeDefaultHint: "空欄で {0}",
+    sizePlaceholder: "既定",
+    sizeInvalid: "サイズが不正です",
+    sizeTooBig: "サイズが GPU の VRAM 容量 ({0}) を超えています",
+    folderPickFail: "フォルダを選択できません: {0}",
+    nvcompToolTitle: "nvCOMP が見つからないため利用できません",
+    chooseDrive: "ドライブレターを選択してください",
+    chooseFolder: "フォルダを指定してください",
+    mounting: "マウント中…",
+    mountFail: "マウントできません: {0}",
+    unmountWarning: "本当にアンマウントしますか？\nドライブ上のデータは全て失われます。",
+    continueBtn: "続行",
+    cancelBtn: "キャンセル",
+    unmounting: "アンマウント中…",
+    unmountFail: "アンマウントできません: {0}",
+    badgeCompress: "圧縮",
+    badgeDedup: "共有",
+    usageUsed: "使用 {0} / {1}",
+    interrupted: "アンマウントされたため中断しました",
+    jobStatusFail: "失敗: ジョブの状態を確認できません",
+    processing: "GPU で処理中… {0} 秒",
+    jobFailed: "失敗: {0}",
+    jobError: "処理に失敗しました",
+    cancelled: "中止しました",
+    done: "完了（{0} 秒）",
+    cancelling: "中止しています…",
+    resultKey: "結果",
+    noFiles: "対象ファイルがありません",
+    runCompress: "圧縮を実行",
+    runExtract: "展開を実行",
+    outputRequired: "出力先を入力してください",
+    archiveRequired: "アーカイブのパスを入力してください",
+    formatUnknown: "拡張子から形式を判定できません（.tar.zst / .tar.lz4 / .tar.gz / .zip）",
+    kvOutput: "出力",
+    kvArchive: "アーカイブ",
+    kvOutdir: "展開先",
+    kvFileCount: "ファイル数",
+    kvInputSize: "入力サイズ",
+    kvArchiveSize: "アーカイブサイズ",
+    kvOutputSize: "出力サイズ",
+    kvThroughput: "スループット",
+    runEncode: "エンコードを実行",
+    runDecode: "デコードを実行",
+    inputRequired: "変換するファイルを指定してください",
+    encodeOutputRequired: "出力ファイルを指定してください",
+    stepGpus: "GPU の列挙",
+    stepDrives: "ドライブの列挙",
+    stepNvcomp: "nvCOMP の確認",
+    stepCli: "起動オプションの反映",
+    stepMount: "マウント状態の取得",
+    stepEvents: "イベント購読",
+    stepFail: "{0}に失敗しました: {1}",
+    bootFail: "初期化に失敗しました: {0}",
+  },
+  en: {
+    device: "GPU",
+    target: "Mount point",
+    driveLetter: "Drive letter",
+    folder: "Folder",
+    browse: "Browse...",
+    capacity: "Capacity",
+    options: "Options",
+    compressOpt: "Compress data (nvCOMP / GPU)",
+    dedupOpt: "Share identical chunks",
+    compressHint:
+      "nvCOMP was not found, so compression is unavailable in this GUI (the CLI falls back to CPU zstd).",
+    mount: "Mount",
+    statFiles: "Files",
+    statLogical: "Logical data",
+    statDedup: "Saved by dedup",
+    statPacked: "Saved by compression",
+    toolsLabel: "Process mounted files on the GPU",
+    toolHash: "Hash",
+    toolArchive: "Compress / extract",
+    toolEncode: "Encode",
+    unmount: "Unmount",
+    back: "← Back",
+    hashPath: "Target (file or folder)",
+    algorithm: "Algorithm",
+    recursive: "Include subfolders",
+    hashRun: "Compute",
+    cancel: "Cancel",
+    compressTab: "Compress",
+    extractTab: "Extract",
+    archiveSource: "Source (folders recurse)",
+    archiveOutput: "Output archive",
+    format: "Format",
+    formatZst: "tar.zst (recommended, fast)",
+    archiveInput: "Archive to extract",
+    archiveOutdir: "Destination folder",
+    encodeTab: "Encode",
+    decodeTab: "Decode",
+    codec: "Format",
+    hexOption: "hex (hex text)",
+    encodeInput: "Input file",
+    encodeOutput: "Output file",
+
+    noCudaOption: "No CUDA device found",
+    noGpuError:
+      "No NVIDIA GPU / CUDA driver found. Update the driver and restart.",
+    sizeDefaultHint: "Leave empty for {0}",
+    sizePlaceholder: "default",
+    sizeInvalid: "Invalid size",
+    sizeTooBig: "Size exceeds the GPU's VRAM ({0})",
+    folderPickFail: "Could not pick a folder: {0}",
+    nvcompToolTitle: "Unavailable because nvCOMP was not found",
+    chooseDrive: "Choose a drive letter",
+    chooseFolder: "Enter a folder",
+    mounting: "Mounting…",
+    mountFail: "Could not mount: {0}",
+    unmountWarning: "Unmount now?\nAll data on the drive will be lost.",
+    continueBtn: "Continue",
+    cancelBtn: "Cancel",
+    unmounting: "Unmounting…",
+    unmountFail: "Could not unmount: {0}",
+    badgeCompress: "compressed",
+    badgeDedup: "dedup",
+    usageUsed: "{0} of {1} used",
+    interrupted: "Interrupted by unmount",
+    jobStatusFail: "Failed: cannot read the job's status",
+    processing: "Processing on the GPU… {0} s",
+    jobFailed: "Failed: {0}",
+    jobError: "The operation failed",
+    cancelled: "Cancelled",
+    done: "Done ({0} s)",
+    cancelling: "Cancelling…",
+    resultKey: "Result",
+    noFiles: "No matching files",
+    runCompress: "Compress",
+    runExtract: "Extract",
+    outputRequired: "Enter an output path",
+    archiveRequired: "Enter the archive's path",
+    formatUnknown: "Cannot infer the format from the extension (.tar.zst / .tar.lz4 / .tar.gz / .zip)",
+    kvOutput: "Output",
+    kvArchive: "Archive",
+    kvOutdir: "Extracted to",
+    kvFileCount: "Files",
+    kvInputSize: "Input size",
+    kvArchiveSize: "Archive size",
+    kvOutputSize: "Output size",
+    kvThroughput: "Throughput",
+    runEncode: "Encode",
+    runDecode: "Decode",
+    inputRequired: "Enter the file to convert",
+    encodeOutputRequired: "Enter an output file",
+    stepGpus: "GPU enumeration",
+    stepDrives: "drive enumeration",
+    stepNvcomp: "nvCOMP detection",
+    stepCli: "applying launch options",
+    stepMount: "reading the mount state",
+    stepEvents: "event subscription",
+    stepFail: "{0} failed: {1}",
+    bootFail: "Initialization failed: {0}",
+  },
+};
+
+let LANG = "ja";
+
+function t(key, ...args) {
+  let s = (I18N[LANG] && I18N[LANG][key]) || I18N.ja[key] || key;
+  for (let i = 0; i < args.length; i++) {
+    s = s.replaceAll(`{${i}}`, String(args[i]));
+  }
+  return s;
+}
+
+// Re-render every localized string for the current LANG: static labels via
+// data-i18n, then the handful of dynamic bits that reflect current state.
+function applyLanguage() {
+  document.documentElement.lang = LANG;
+  el("lang-select").value = LANG;
+  for (const node of document.querySelectorAll("[data-i18n]")) {
+    node.textContent = t(node.dataset.i18n);
+  }
+  el("size-value").placeholder = t("sizePlaceholder");
+  updateSizeHint();
+  applyNvcompAvailability(nvcompOk);
+  setArchiveMode(archiveMode());
+  setEncodeDirection(encodeDirection(), { keepOutput: true });
+  if (currentStatus) {
+    renderMountedHead(currentStatus);
+    pollStats();
+  }
+}
+
+async function switchLanguage(lang) {
+  LANG = lang;
+  applyLanguage();
+  try {
+    await invoke("set_ui_language", { language: lang });
+  } catch (e) {
+    console.error("set_ui_language", e);
+  }
+}
 
 // --- helpers ---------------------------------------------------------------
 
@@ -41,14 +294,14 @@ function setText(id, msg, kind) {
 }
 
 function screenName() {
-  for (const s of ["setup", "mounted", "hash", "archive"]) {
+  for (const s of ["setup", "mounted", "hash", "archive", "encode"]) {
     if (!el("screen-" + s).hidden) return s;
   }
   return null;
 }
 
 function showScreen(name) {
-  for (const s of ["setup", "mounted", "hash", "archive"]) {
+  for (const s of ["setup", "mounted", "hash", "archive", "encode"]) {
     el("screen-" + s).hidden = s !== name;
   }
 }
@@ -102,38 +355,37 @@ function loadSavedConfig() {
 async function loadDevices() {
   const sel = el("device");
   const saved = loadSavedConfig();
-  try {
-    const gpus = await invoke("list_gpus");
-    gpuList = gpus;
-    sel.innerHTML = "";
-    if (!gpus.length) {
-      const o = document.createElement("option");
-      o.textContent = "CUDA デバイスが見つかりません";
-      o.disabled = true;
-      sel.appendChild(o);
-      return;
-    }
-    for (const g of gpus) {
-      const o = document.createElement("option");
-      o.value = String(g.ordinal);
-      o.dataset.default = String(g.default_size);
-      o.dataset.total = String(g.total_vram);
-      o.textContent = `[${g.ordinal}] ${g.name} — ${formatSize(g.total_vram)}`;
-      sel.appendChild(o);
-    }
-    if (saved && saved.device != null) {
-      const match = Array.from(sel.options).find((o) => o.value === String(saved.device));
-      if (match) sel.value = String(saved.device);
-    }
-    updateSizeHint();
-    validateSizeField();
-  } catch (e) {
-    alert("GPU 列挙に失敗: " + e);
+  const gpus = await invoke("list_gpus");
+  gpuList = gpus;
+  sel.innerHTML = "";
+  if (!gpus.length) {
+    const o = document.createElement("option");
+    o.value = "";
+    o.textContent = t("noCudaOption");
+    o.disabled = true;
+    o.selected = true;
+    sel.appendChild(o);
+    el("mount-btn").disabled = true;
+    setText("setup-status", t("noGpuError"), "error");
+    return;
   }
+  for (const g of gpus) {
+    const o = document.createElement("option");
+    o.value = String(g.ordinal);
+    o.dataset.default = String(g.default_size);
+    o.dataset.total = String(g.total_vram);
+    o.textContent = `[${g.ordinal}] ${g.name} — ${formatSize(g.total_vram)}`;
+    sel.appendChild(o);
+  }
+  if (saved && saved.device != null) {
+    const match = Array.from(sel.options).find((o) => o.value === String(saved.device));
+    if (match) sel.value = String(saved.device);
+  }
+  updateSizeHint();
+  validateSizeField();
 }
 
-// GPU model name for a device ordinal (e.g. "RTX 4070"), or null if unknown
-// (e.g. the cached list hasn't loaded yet).
+// GPU model name for a device ordinal, or null if the list hasn't loaded.
 function gpuName(ordinal) {
   const g = gpuList.find((g) => g.ordinal === ordinal);
   return g ? g.name : null;
@@ -142,22 +394,18 @@ function gpuName(ordinal) {
 async function loadFreeDrives() {
   const sel = el("drive");
   const saved = loadSavedConfig();
-  try {
-    const drives = await invoke("list_free_drives");
-    sel.innerHTML = "";
-    for (const d of drives) {
-      const o = document.createElement("option");
-      o.value = d;
-      o.textContent = d;
-      sel.appendChild(o);
-    }
-    if (saved && saved.drive && drives.includes(saved.drive)) {
-      sel.value = saved.drive;
-    } else if (drives.includes("R:")) {
-      sel.value = "R:";
-    }
-  } catch (e) {
-    alert("ドライブ列挙に失敗: " + e);
+  const drives = await invoke("list_free_drives");
+  sel.innerHTML = "";
+  for (const d of drives) {
+    const o = document.createElement("option");
+    o.value = d;
+    o.textContent = d;
+    sel.appendChild(o);
+  }
+  if (saved && saved.drive && drives.includes(saved.drive)) {
+    sel.value = saved.drive;
+  } else if (drives.includes("R:")) {
+    sel.value = "R:";
   }
 }
 
@@ -165,28 +413,26 @@ function updateSizeHint() {
   const sel = el("device");
   const opt = sel.options[sel.selectedIndex];
   const def = opt && opt.dataset.default ? Number(opt.dataset.default) : null;
-  el("size-label").textContent = def
-    ? `容量（既定値 = ${formatSize(def)}）：`
-    : "容量：";
+  el("size-default-hint").textContent = def ? t("sizeDefaultHint", formatSize(def)) : "";
 }
 
-// Re-checks the size field against the selected GPU's total VRAM every time
-// either changes, instead of waiting for the mount attempt to fail. Grays out
-// the mount button while the value is invalid or too large.
+// Re-checks the size field against the selected GPU's total VRAM whenever
+// either changes, instead of waiting for the mount attempt to fail.
 function validateSizeField() {
+  if (!gpuList.length) return false;
   const raw = el("size-value").value.trim();
   let error = "";
   if (raw) {
     const n = Number(raw);
     if (!Number.isFinite(n) || n <= 0) {
-      error = "サイズが不正です";
+      error = t("sizeInvalid");
     } else {
       const bytes = n * UNIT_BYTES[el("size-unit").value];
       const sel = el("device");
       const opt = sel.options[sel.selectedIndex];
       const total = opt && opt.dataset.total ? Number(opt.dataset.total) : null;
       if (total && bytes > total) {
-        error = `サイズが GPU の VRAM 容量 (${formatSize(total)}) を超えています`;
+        error = t("sizeTooBig", formatSize(total));
       }
     }
   }
@@ -200,8 +446,6 @@ function restoreSizeAndFlags() {
   const saved = loadSavedConfig();
   if (!saved) return;
   if (saved.sizeValue) el("size-value").value = saved.sizeValue;
-  // Ignore a stale saved unit (e.g. old "GiB"/"TiB") that no longer exists as
-  // an option, so el("size-unit").value stays a valid UNIT_BYTES key.
   if (saved.sizeUnit && el("size-unit").querySelector(`option[value="${saved.sizeUnit}"]`)) {
     el("size-unit").value = saved.sizeUnit;
   }
@@ -214,7 +458,7 @@ function restoreSizeAndFlags() {
 // --- mount mode (drive letter vs. folder) -----------------------------------
 
 function setMountMode(mode) {
-  for (const tab of document.querySelectorAll("#screen-setup .tab")) {
+  for (const tab of document.querySelectorAll("#screen-setup .seg-btn")) {
     tab.classList.toggle("active", tab.dataset.mountMode === mode);
   }
   el("mount-drive-field").hidden = mode !== "drive";
@@ -222,7 +466,7 @@ function setMountMode(mode) {
 }
 
 function mountMode() {
-  const active = document.querySelector("#screen-setup .tab.active");
+  const active = document.querySelector("#screen-setup .seg-btn.active");
   return active ? active.dataset.mountMode : "drive";
 }
 
@@ -234,11 +478,11 @@ async function doBrowseFolder() {
       saveConfig();
     }
   } catch (e) {
-    alert("フォルダ選択に失敗: " + e);
+    setText("setup-status", t("folderPickFail", e), "error");
   }
 }
 
-// --- nvCOMP availability (gates GPU compression, no silent CPU fallback in the GUI) ---
+// --- nvCOMP availability (gates GPU compression; no silent CPU fallback here) ---
 
 let nvcompOk = true;
 
@@ -252,14 +496,10 @@ function applyNvcompAvailability(available) {
 
   const archiveBtn = el("open-archive");
   archiveBtn.disabled = !available;
-  archiveBtn.title = available ? "" : "nvCOMP が見つからないため利用できません";
+  archiveBtn.title = available ? "" : t("nvcompToolTitle");
 }
 
 // --- CLI-flag seed (e.g. a shortcut with `vramdisk.exe --mount R: --compress`) ---
-// Pre-fills the setup screen's fields; it never mounts automatically. Only
-// fields the user actually passed are touched (see `vramdisk::cli::scan_overrides`
-// on the Rust side) so this layers on top of, rather than replacing, the
-// saved `localStorage` config restored by `restoreSizeAndFlags()`.
 
 function bytesToSizeField(bytes) {
   if (bytes >= UNIT_BYTES.GB) return { value: +(bytes / UNIT_BYTES.GB).toFixed(2), unit: "GB" };
@@ -271,9 +511,9 @@ function applyCliOverrides(ov) {
 
   if (ov.mount) {
     const mount = ov.mount.trim();
-    if (/^[A-Za-z]:\\?$/.test(mount)) {
+    if (/^[A-Za-z]:?\\?$/.test(mount)) {
       setMountMode("drive");
-      const letter = mount.replace(/\\$/, "").toUpperCase();
+      const letter = mount.replace(/[\\:]+$/, "").toUpperCase() + ":";
       if (Array.from(el("drive").options).some((o) => o.value === letter)) {
         el("drive").value = letter;
       }
@@ -289,7 +529,6 @@ function applyCliOverrides(ov) {
     el("size-unit").value = unit;
   }
 
-  // Respect the nvCOMP gate: never force-check a disabled "compress" box.
   if (ov.compress != null && nvcompOk) el("compress").checked = ov.compress;
   if (ov.dedup != null) el("dedup").checked = ov.dedup;
 
@@ -306,23 +545,17 @@ function applyCliOverrides(ov) {
 
 async function doMount(ev) {
   ev.preventDefault();
+  if (!gpuList.length) return;
   const btn = el("mount-btn");
   const mode = mountMode();
   const mountPoint = mode === "drive" ? el("drive").value : el("mount-folder").value.trim();
   const device = Number(el("device").value);
 
   if (!mountPoint) {
-    alert(mode === "drive" ? "ドライブレターを選択してください" : "フォルダを指定してください");
+    setText("setup-status", mode === "drive" ? t("chooseDrive") : t("chooseFolder"), "error");
     return;
   }
-  if (Number.isNaN(device)) {
-    alert("GPU デバイスを選択してください");
-    return;
-  }
-  if (!validateSizeField()) {
-    alert(el("size-error").textContent);
-    return;
-  }
+  if (!validateSizeField()) return;
 
   let size = null;
   const raw = el("size-value").value.trim();
@@ -330,9 +563,9 @@ async function doMount(ev) {
     size = Math.round(Number(raw) * UNIT_BYTES[el("size-unit").value]);
   }
 
-  const originalLabel = btn.textContent;
   btn.disabled = true;
-  btn.textContent = "マウント中…";
+  btn.textContent = t("mounting");
+  setText("setup-status", "");
   try {
     await invoke("mount", {
       cfg: {
@@ -347,31 +580,32 @@ async function doMount(ev) {
     // The backend hides the window and shows a confirmation; our screen
     // switches via the "mount-changed" event listener.
   } catch (e) {
-    alert("マウント失敗: " + e);
+    setText("setup-status", t("mountFail", e), "error");
   } finally {
-    btn.textContent = originalLabel;
+    btn.textContent = t("mount");
     validateSizeField();
   }
 }
 
 async function doUnmount() {
+  const warning = t("unmountWarning");
   const confirmed = dialog
-    ? await dialog.confirm(UNMOUNT_WARNING, {
+    ? await dialog.confirm(warning, {
         title: "VRAMDISK",
         kind: "warning",
-        okLabel: "続行",
-        cancelLabel: "キャンセル",
+        okLabel: t("continueBtn"),
+        cancelLabel: t("cancelBtn"),
       })
-    : confirm(UNMOUNT_WARNING);
+    : confirm(warning);
   if (!confirmed) return;
 
   const btn = el("unmount-btn");
   btn.disabled = true;
-  setText("mounted-status", "アンマウント中…");
+  setText("mounted-status", t("unmounting"));
   try {
     await invoke("unmount");
   } catch (e) {
-    setText("mounted-status", "アンマウント失敗: " + e, "error");
+    setText("mounted-status", t("unmountFail", e), "error");
   } finally {
     btn.disabled = false;
   }
@@ -380,25 +614,29 @@ async function doUnmount() {
 // --- mounted screen rendering ------------------------------------------------
 
 function renderMountedHead(status) {
-  const el1 = el("mounted-drive");
-  el1.textContent = status.mount_point;
-  el1.title = status.mount_point;
-  el1.classList.toggle("long", status.mount_point.length > 5);
+  const drive = el("mounted-drive");
+  drive.textContent = status.mount_point;
+  drive.title = status.mount_point;
+  drive.classList.toggle("long", status.mount_point.length > 5);
   const name = gpuName(status.device);
-  const gpuLabel = name ? `[GPU ${status.device}] ${name}` : `GPU ${status.device}`;
+  const gpuLabel = name ? name : `GPU ${status.device}`;
   el("mounted-sub").textContent =
     `${gpuLabel} · ${formatSize(status.size)}` +
-    (status.compress ? " · 圧縮" : "") +
-    (status.dedup ? " · dedup" : "");
+    (status.compress ? ` · ${t("badgeCompress")}` : "") +
+    (status.dedup ? ` · ${t("badgeDedup")}` : "");
 }
 
 function renderStats(stats) {
   const used = Number(stats.volume.used_physical_bytes);
   const total = Number(stats.volume.total_bytes);
-  const pct = total > 0 ? Math.min(100, (used / total) * 100) : 0;
-  el("usage-bar").style.width = pct.toFixed(1) + "%";
-  el("usage-text-left").textContent = `物理使用 ${formatSize(used)} / ${formatSize(total)}`;
-  el("usage-text-pct").textContent = pct.toFixed(1) + "%";
+  const frac = total > 0 ? Math.min(1, used / total) : 0;
+
+  const fill = el("usage-fill");
+  fill.style.width = (frac * 100).toFixed(1) + "%";
+  fill.classList.toggle("warn", frac >= 0.9);
+
+  el("usage-text-left").textContent = t("usageUsed", formatSize(used), formatSize(total));
+  el("usage-text-pct").textContent = (frac * 100).toFixed(1) + "%";
   el("stat-files").textContent = stats.namespace.file_count;
   el("stat-logical").textContent = formatSize(stats.namespace.logical_file_bytes);
   el("stat-dedup").textContent = formatSize(stats.dedup.saved_bytes);
@@ -418,57 +656,161 @@ async function pollStats() {
 
 function applyMountStatus(status) {
   currentStatus = status || null;
+  setText("mounted-status", "");
+  setText("setup-status", "");
   if (!currentStatus) {
+    // Unmounting invalidates every in-flight job: bump generations so their
+    // poll loops stop, and reset the per-panel job UI.
+    for (const panel of Object.keys(jobs)) {
+      const job = jobs[panel];
+      if (job.running) {
+        job.generation++;
+        job.running = false;
+        job.jobId = null;
+        jobUi(panel, false);
+        setText(`${panel}-done`, t("interrupted"));
+      }
+    }
     showScreen("setup");
+    loadFreeDrives().catch(() => {});
     return;
   }
   renderMountedHead(currentStatus);
-  if (screenName() !== "hash" && screenName() !== "archive") {
+  const s = screenName();
+  if (s !== "hash" && s !== "archive" && s !== "encode") {
     showScreen("mounted");
   }
   pollStats();
 }
 
-// --- GPU hash panel -----------------------------------------------------------
+// --- async GPU jobs ----------------------------------------------------------
+//
+// One in-flight job per panel. Each start bumps the panel's generation so a
+// stale poll loop (cancelled, superseded, or from a closed panel) can never
+// clobber newer UI state.
 
-async function doHashJob(ev) {
+const jobs = {
+  hash: { running: false, generation: 0, jobId: null },
+  archive: { running: false, generation: 0, jobId: null },
+  encode: { running: false, generation: 0, jobId: null },
+};
+
+function jobUi(panel, running) {
+  el(`${panel}-job-row`).hidden = !running;
+  el(`${panel}-btn`).disabled = running;
+}
+
+async function runJob(panel, submit, renderResult) {
+  const job = jobs[panel];
+  const generation = ++job.generation;
+  job.running = true;
+  job.jobId = null;
+  jobUi(panel, true);
+  setText(`${panel}-done`, "");
+  el(`${panel}-result`).innerHTML = "";
+  const startedAt = Date.now();
+
+  const finish = (msg, kind) => {
+    if (job.generation !== generation) return;
+    job.running = false;
+    job.jobId = null;
+    jobUi(panel, false);
+    setText(`${panel}-done`, msg, kind);
+  };
+
+  try {
+    const jobId = await submit();
+    if (job.generation !== generation) return;
+    job.jobId = jobId;
+
+    // Poll until the job turns terminal.
+    let pollFailures = 0;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, JOB_POLL_MS));
+      if (job.generation !== generation) return;
+      let status;
+      try {
+        status = await invoke("job_status", { jobId });
+        pollFailures = 0;
+      } catch (e) {
+        // Transient read failures are retried, but a wall of them (e.g. the
+        // volume disappeared underneath the job) must not poll forever.
+        if (++pollFailures > 12) {
+          finish(t("jobStatusFail"), "error");
+          return;
+        }
+        continue;
+      }
+      if (job.generation !== generation) return;
+      if (status.terminal) break;
+      const secs = ((Date.now() - startedAt) / 1000).toFixed(0);
+      setText(`${panel}-status`, t("processing", secs));
+    }
+
+    const result = await invoke("job_result", { jobId });
+    if (job.generation !== generation) return;
+    if (!result.ok) {
+      const err = result.error || t("jobError");
+      finish(
+        String(err).includes("cancelled") ? t("cancelled") : t("jobFailed", err),
+        String(err).includes("cancelled") ? "" : "error"
+      );
+      return;
+    }
+    const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+    finish(t("done", secs), "ok");
+    el(`${panel}-result`).innerHTML = renderResult(result);
+  } catch (e) {
+    finish(t("jobFailed", e), "error");
+  }
+}
+
+async function cancelJob(panel) {
+  const job = jobs[panel];
+  if (!job.jobId) return;
+  setText(`${panel}-status`, t("cancelling"));
+  try {
+    await invoke("job_cancel", { jobId: job.jobId });
+  } catch (e) {
+    /* job may have already finished */
+  }
+}
+
+// --- hash panel ---------------------------------------------------------------
+
+function doHashJob(ev) {
   ev.preventDefault();
-  const btn = el("hash-btn");
   const path = el("hash-path").value.trim() || "\\";
   const algorithm = el("hash-algo").value;
   const recursive = el("hash-recursive").checked;
 
-  btn.disabled = true;
-  setText("hash-status", "計算中…");
-  el("hash-result").innerHTML = "";
-  try {
-    const res = await invoke("hash_job", { paths: [path], algorithm, recursive });
-    if (!res.ok) throw new Error(res.error || "failed");
-    const files = res.files || [];
-    setText("hash-status", `${files.length} 件`, "ok");
-    el("hash-result").innerHTML =
-      files.map((f) => kvRow(f.path, f.digest)).join("") ||
-      kvRow("結果", "対象ファイルなし");
-  } catch (e) {
-    setText("hash-status", "失敗: " + e, "error");
-  } finally {
-    btn.disabled = false;
-  }
+  runJob(
+    "hash",
+    () => invoke("hash_job", { paths: [path], algorithm, recursive }),
+    (res) => {
+      const files = res.files || [];
+      return (
+        files.map((f) => kvRow(f.path, f.digest)).join("") ||
+        kvRow(t("resultKey"), t("noFiles"))
+      );
+    }
+  );
 }
 
-// --- GPU archive panel --------------------------------------------------------
+// --- archive panel ------------------------------------------------------------
 
 function setArchiveMode(mode) {
-  for (const tab of document.querySelectorAll("#screen-archive .tab")) {
+  for (const tab of document.querySelectorAll("#screen-archive .seg-btn")) {
     tab.classList.toggle("active", tab.dataset.mode === mode);
   }
   el("archive-compress-fields").hidden = mode !== "compress";
   el("archive-extract-fields").hidden = mode !== "extract";
-  el("archive-btn").textContent = mode === "compress" ? "圧縮を実行" : "展開を実行";
+  el("archive-btn").textContent = mode === "compress" ? t("runCompress") : t("runExtract");
 }
 
 function archiveMode() {
-  return document.querySelector("#screen-archive .tab.active").dataset.mode;
+  const active = document.querySelector("#screen-archive .seg-btn.active");
+  return active ? active.dataset.mode : "compress";
 }
 
 // Extract mode doesn't ask for a format; infer it from the archive's extension.
@@ -476,7 +818,7 @@ function detectArchiveFormat(path) {
   const p = path.toLowerCase();
   if (p.endsWith(".tar.zst")) return "tar.zst";
   if (p.endsWith(".tar.lz4")) return "tar.lz4";
-  if (p.endsWith(".tar.gz")) return "tar.gz";
+  if (p.endsWith(".tar.gz") || p.endsWith(".tgz")) return "tar.gz";
   if (p.endsWith(".zip")) return "zip";
   return null;
 }
@@ -488,8 +830,6 @@ function mountJoin(name) {
   return mount.replace(/\\+$/, "") + "\\" + name;
 }
 
-// Fill the archive fields' placeholders with absolute paths under the current
-// mount point (a "\..."-relative input still works, it's just not advertised).
 function updateArchivePlaceholders() {
   if (!currentStatus) return;
   el("archive-paths").placeholder = mountJoin("data");
@@ -498,70 +838,165 @@ function updateArchivePlaceholders() {
   el("archive-outdir").placeholder = mountJoin("restore");
 }
 
-async function doArchiveJob(ev) {
+function doArchiveJob(ev) {
   ev.preventDefault();
-  const btn = el("archive-btn");
   const mode = archiveMode();
 
-  btn.disabled = true;
-  setText("archive-status", mode === "compress" ? "圧縮中…" : "展開中…");
-  el("archive-result").innerHTML = "";
-  try {
-    let res;
-    if (mode === "compress") {
-      const format = el("archive-format").value;
-      const paths = el("archive-paths").value.trim() || "\\";
-      const output = el("archive-output").value.trim();
-      if (!output) throw new Error("出力先を入力してください");
-      res = await invoke("archive_compress_job", {
-        req: { format, paths: [paths], output },
-      });
-    } else {
-      const archive = el("archive-input").value.trim();
-      const outputDir = el("archive-outdir").value.trim() || "\\";
-      if (!archive) throw new Error("アーカイブパスを入力してください");
-      const format = detectArchiveFormat(archive);
-      if (!format) {
-        throw new Error("拡張子から形式を判定できません（.tar.zst / .tar.lz4 / .tar.gz / .zip）");
-      }
-      res = await invoke("archive_extract_job", {
-        req: { format, archive, output_dir: outputDir },
-      });
+  if (mode === "compress") {
+    const format = el("archive-format").value;
+    const paths = el("archive-paths").value.trim() || "\\";
+    const output = el("archive-output").value.trim();
+    if (!output) {
+      setText("archive-done", t("outputRequired"), "error");
+      return;
     }
-    if (!res.ok) throw new Error(res.error || "failed");
-    setText("archive-status", "完了", "ok");
-    el("archive-result").innerHTML = renderArchiveResult(res);
-  } catch (e) {
-    setText("archive-status", "失敗: " + e, "error");
-  } finally {
-    btn.disabled = false;
+    runJob(
+      "archive",
+      () => invoke("archive_compress_job", { req: { format, paths: [paths], output } }),
+      renderArchiveResult
+    );
+  } else {
+    const archive = el("archive-input").value.trim();
+    const outputDir = el("archive-outdir").value.trim() || "\\";
+    if (!archive) {
+      setText("archive-done", t("archiveRequired"), "error");
+      return;
+    }
+    const format = detectArchiveFormat(archive);
+    if (!format) {
+      setText("archive-done", t("formatUnknown"), "error");
+      return;
+    }
+    runJob(
+      "archive",
+      () => invoke("archive_extract_job", { req: { format, archive, output_dir: outputDir } }),
+      renderArchiveResult
+    );
   }
 }
 
 function renderArchiveResult(res) {
   const rows = [];
-  if (res.output) rows.push(kvRow("出力", res.output));
-  if (res.archive) rows.push(kvRow("アーカイブ", res.archive));
-  if (res.output_dir) rows.push(kvRow("展開先", res.output_dir));
-  if (res.file_count != null) rows.push(kvRow("ファイル数", res.file_count));
-  if (res.input_bytes != null) rows.push(kvRow("入力サイズ", formatSize(res.input_bytes)));
-  if (res.archive_bytes != null) rows.push(kvRow("アーカイブサイズ", formatSize(res.archive_bytes)));
-  if (res.output_bytes != null) rows.push(kvRow("展開後サイズ", formatSize(res.output_bytes)));
-  if (res.elapsed_ms != null) rows.push(kvRow("所要時間", `${res.elapsed_ms} ms`));
-  if (res.throughput_mib_s != null && res.throughput_mib_s !== null) {
-    rows.push(kvRow("スループット", `${Number(res.throughput_mib_s).toFixed(1)} MB/s`));
+  if (res.output) rows.push(kvRow(t("kvOutput"), res.output));
+  if (res.archive) rows.push(kvRow(t("kvArchive"), res.archive));
+  if (res.output_dir) rows.push(kvRow(t("kvOutdir"), res.output_dir));
+  if (res.file_count != null) rows.push(kvRow(t("kvFileCount"), res.file_count));
+  if (res.input_bytes != null) rows.push(kvRow(t("kvInputSize"), formatSize(res.input_bytes)));
+  if (res.archive_bytes != null) rows.push(kvRow(t("kvArchiveSize"), formatSize(res.archive_bytes)));
+  if (res.output_bytes != null) rows.push(kvRow(t("kvOutputSize"), formatSize(res.output_bytes)));
+  if (res.throughput_mib_s != null) {
+    rows.push(kvRow(t("kvThroughput"), `${Number(res.throughput_mib_s).toFixed(1)} MB/s`));
   }
   return rows.join("");
 }
 
+// --- encode panel -------------------------------------------------------------
+
+function encodeDirection() {
+  const active = document.querySelector("#screen-encode .seg-btn.active");
+  return active ? active.dataset.direction : "encode";
+}
+
+function setEncodeDirection(direction, opts) {
+  for (const tab of document.querySelectorAll("#screen-encode .seg-btn")) {
+    tab.classList.toggle("active", tab.dataset.direction === direction);
+  }
+  el("encode-btn").textContent = direction === "encode" ? t("runEncode") : t("runDecode");
+  updateEncodePlaceholders();
+  if (!(opts && opts.keepOutput)) suggestEncodeOutput();
+}
+
+function encodeExt() {
+  return el("encode-codec").value === "base64" ? ".b64" : ".hex";
+}
+
+function updateEncodePlaceholders() {
+  if (!currentStatus) return;
+  const enc = encodeDirection() === "encode";
+  el("encode-input").placeholder = enc ? mountJoin("data.bin") : mountJoin("data.bin" + encodeExt());
+  el("encode-output").placeholder = enc ? mountJoin("data.bin" + encodeExt()) : mountJoin("data.bin");
+}
+
+// Suggest an output path from the input path: append the codec extension when
+// encoding, strip it when decoding. Never overwrites what the user typed.
+let encodeOutputTouched = false;
+
+function suggestEncodeOutput() {
+  if (encodeOutputTouched) return;
+  const input = el("encode-input").value.trim();
+  if (!input) {
+    el("encode-output").value = "";
+    return;
+  }
+  const ext = encodeExt();
+  if (encodeDirection() === "encode") {
+    el("encode-output").value = input + ext;
+  } else {
+    el("encode-output").value = input.toLowerCase().endsWith(ext)
+      ? input.slice(0, -ext.length)
+      : input + ".decoded";
+  }
+}
+
+function doEncodeJob(ev) {
+  ev.preventDefault();
+  const codec = el("encode-codec").value;
+  const direction = encodeDirection();
+  const input = el("encode-input").value.trim();
+  const output = el("encode-output").value.trim();
+  if (!input) {
+    setText("encode-done", t("inputRequired"), "error");
+    return;
+  }
+  if (!output) {
+    setText("encode-done", t("encodeOutputRequired"), "error");
+    return;
+  }
+  runJob(
+    "encode",
+    () => invoke("encode_job", { req: { codec, direction, input, output } }),
+    (res) => {
+      const rows = [];
+      rows.push(kvRow(t("kvOutput"), res.output));
+      if (res.input_bytes != null) rows.push(kvRow(t("kvInputSize"), formatSize(res.input_bytes)));
+      if (res.output_bytes != null) rows.push(kvRow(t("kvOutputSize"), formatSize(res.output_bytes)));
+      if (res.throughput_mib_s != null) {
+        rows.push(kvRow(t("kvThroughput"), `${Number(res.throughput_mib_s).toFixed(1)} MB/s`));
+      }
+      return rows.join("");
+    }
+  );
+}
+
 // --- boot --------------------------------------------------------------------
 
-window.addEventListener("DOMContentLoaded", async () => {
-  await loadDevices();
-  await loadFreeDrives();
+// Each boot step is individually guarded: one failing invoke (e.g. a driver
+// hiccup during GPU enumeration) must degrade that feature, not leave the
+// whole window dead with no listeners attached.
+async function boot() {
+  const step = async (fn, whatKey) => {
+    try {
+      await fn();
+    } catch (e) {
+      console.error(whatKey, e);
+      setText("setup-status", t("stepFail", t(whatKey), e), "error");
+    }
+  };
+
+  // Language first, so every later step renders its strings in the right one.
+  try {
+    LANG = await invoke("get_ui_language");
+  } catch (e) {
+    LANG = String(navigator.language || "").toLowerCase().startsWith("ja") ? "ja" : "en";
+  }
+  applyLanguage();
+  el("lang-select").addEventListener("change", () => switchLanguage(el("lang-select").value));
+
+  await step(loadDevices, "stepGpus");
+  await step(loadFreeDrives, "stepDrives");
   restoreSizeAndFlags();
-  applyNvcompAvailability(await invoke("nvcomp_available"));
-  applyCliOverrides(await invoke("initial_overrides"));
+  await step(async () => applyNvcompAvailability(await invoke("nvcomp_available")), "stepNvcomp");
+  await step(async () => applyCliOverrides(await invoke("initial_overrides")), "stepCli");
 
   el("mount-form").addEventListener("submit", doMount);
   el("unmount-btn").addEventListener("click", doUnmount);
@@ -573,7 +1008,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   el("size-unit").addEventListener("change", validateSizeField);
   el("browse-folder-btn").addEventListener("click", doBrowseFolder);
 
-  for (const tab of document.querySelectorAll("#screen-setup .tab")) {
+  for (const tab of document.querySelectorAll("#screen-setup .seg-btn")) {
     tab.addEventListener("click", () => {
       setMountMode(tab.dataset.mountMode);
       saveConfig();
@@ -599,41 +1034,104 @@ window.addEventListener("DOMContentLoaded", async () => {
       showScreen("archive");
     }
   });
+  el("open-encode").addEventListener("click", () => {
+    updateEncodePlaceholders();
+    suggestEncodeOutput();
+    showScreen("encode");
+  });
   for (const back of document.querySelectorAll("[data-back]")) {
     back.addEventListener("click", () => showScreen("mounted"));
   }
 
   el("hash-form").addEventListener("submit", doHashJob);
+  el("hash-cancel").addEventListener("click", () => cancelJob("hash"));
 
-  for (const tab of document.querySelectorAll("#screen-archive .tab")) {
+  for (const tab of document.querySelectorAll("#screen-archive .seg-btn")) {
     tab.addEventListener("click", () => setArchiveMode(tab.dataset.mode));
   }
   el("archive-form").addEventListener("submit", doArchiveJob);
+  el("archive-cancel").addEventListener("click", () => cancelJob("archive"));
   setArchiveMode("compress");
 
-  // Native pick dialogs for the archive paths ("参照..." buttons). The chosen
-  // absolute path is normalized against the mount point on the backend.
-  const pickInto = async (cmd, inputId) => {
-    const picked = await invoke(cmd);
-    if (picked) el(inputId).value = picked;
+  for (const tab of document.querySelectorAll("#screen-encode .seg-btn")) {
+    tab.addEventListener("click", () => setEncodeDirection(tab.dataset.direction));
+  }
+  el("encode-form").addEventListener("submit", doEncodeJob);
+  el("encode-cancel").addEventListener("click", () => cancelJob("encode"));
+  el("encode-codec").addEventListener("change", () => {
+    updateEncodePlaceholders();
+    suggestEncodeOutput();
+  });
+  el("encode-input").addEventListener("input", suggestEncodeOutput);
+  el("encode-output").addEventListener("input", () => {
+    encodeOutputTouched = el("encode-output").value.trim() !== "";
+  });
+
+  // Native pick dialogs for path fields; the chosen absolute path is
+  // normalized against the mount point on the backend.
+  const pickInto = async (cmd, inputId, after) => {
+    try {
+      const picked = await invoke(cmd);
+      if (picked) {
+        el(inputId).value = picked;
+        if (after) after();
+      }
+    } catch (e) {
+      /* dialog dismissed or unavailable */
+    }
   };
+  el("hash-path-browse").addEventListener("click", () => pickInto("browse_file", "hash-path"));
   el("archive-paths-browse").addEventListener("click", () => pickInto("browse_folder", "archive-paths"));
   el("archive-output-browse").addEventListener("click", () => pickInto("browse_save", "archive-output"));
   el("archive-input-browse").addEventListener("click", () => pickInto("browse_file", "archive-input"));
   el("archive-outdir-browse").addEventListener("click", () => pickInto("browse_folder", "archive-outdir"));
+  el("encode-input-browse").addEventListener("click", () =>
+    pickInto("browse_file", "encode-input", suggestEncodeOutput)
+  );
+  el("encode-output-browse").addEventListener("click", () =>
+    pickInto("browse_save", "encode-output", () => {
+      encodeOutputTouched = true;
+    })
+  );
 
-  applyMountStatus(await invoke("mount_status"));
+  await step(async () => applyMountStatus(await invoke("mount_status")), "stepMount");
 
-  await listen("mount-changed", (e) => applyMountStatus(e.payload));
-  await listen("open-archive-panel", () => {
-    if (currentStatus && nvcompOk) {
-      updateArchivePlaceholders();
-      showScreen("archive");
-    }
-  });
-  await listen("open-hash-panel", () => {
-    if (currentStatus) showScreen("hash");
-  });
+  await step(() => listen("mount-changed", (e) => applyMountStatus(e.payload)), "stepEvents");
+  await step(
+    () =>
+      listen("open-archive-panel", () => {
+        if (currentStatus && nvcompOk) {
+          updateArchivePlaceholders();
+          showScreen("archive");
+        }
+      }),
+    "stepEvents"
+  );
+  await step(
+    () =>
+      listen("open-hash-panel", () => {
+        if (currentStatus) showScreen("hash");
+      }),
+    "stepEvents"
+  );
+  await step(
+    () =>
+      listen("open-encode-panel", () => {
+        if (currentStatus) {
+          updateEncodePlaceholders();
+          suggestEncodeOutput();
+          showScreen("encode");
+        }
+      }),
+    "stepEvents"
+  );
 
   setInterval(pollStats, 1500);
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  boot().catch((e) => {
+    console.error("boot failed", e);
+    setText("setup-status", t("bootFail", e), "error");
+  });
 });

@@ -1,274 +1,203 @@
-:root {
-  --bg: #ffffff;
-  --field-bg: #f5f5f6;
-  --border: #dcdce0;
-  --text: #1a1a1e;
-  --muted: #75757e;
-  --accent: #3266d6;
-  --accent-text: #ffffff;
-  --accent-hover: #2a56ba;
-  --danger: #c23c34;
-  --danger-text: #ffffff;
-  --danger-hover: #a5322b;
-  --good: #1f8a5f;
-}
+/* VRAMDISK GUI — Windows 11 Fluent dark.
+ *
+ * Deliberately plain: system fonts, flat panels, and the stock Win11 dark
+ * palette so the app reads as a native utility. The only colored elements are
+ * the accent (Win11 dark accent blue) on the primary action / focus underline
+ * / capacity bar, and the standard error red. */
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #1c1d20;
-    --field-bg: #26272b;
-    --border: #38393e;
-    --text: #ececee;
-    --muted: #9a9aa2;
-    --accent: #4d7ef0;
-    --accent-text: #ffffff;
-    --accent-hover: #6491f2;
-    --danger: #e0554c;
-    --danger-text: #1c1d20;
-    --danger-hover: #e8756d;
-    --good: #3fbf87;
-  }
+:root {
+  --bg: #202020;            /* window */
+  --control: #2d2d2d;       /* buttons, fields */
+  --control-hover: #323232;
+  --control-press: #272727;
+  --border: #3a3a3a;
+  --divider: #313131;
+  --text: #ffffff;
+  --text-2: #9d9d9d;        /* labels, secondary */
+  --text-disabled: #6b6b6b;
+  --accent: #4cc2ff;        /* Win11 dark accent */
+  --accent-hover: #47b1e8;
+  --accent-press: #3f9fd1;
+  --error: #ff99a4;         /* Win11 dark error text */
+  --bar-warn: #e81123;      /* near-full capacity, as in Explorer */
+  --ok: #6ccb5f;
 }
 
 * {
+  margin: 0;
+  padding: 0;
   box-sizing: border-box;
-}
-
-/* The `hidden` attribute must always win over any element's own `display`
-   rule (e.g. `.field { display: flex }`) — author rules otherwise beat the
-   UA stylesheet's [hidden]{display:none} regardless of specificity. */
-[hidden] {
-  display: none !important;
 }
 
 html,
 body {
-  margin: 0;
   height: 100%;
 }
 
 body {
-  font-family: "Segoe UI", system-ui, sans-serif;
-  font-size: 13px;
   background: var(--bg);
   color: var(--text);
-  -webkit-user-select: none;
-  user-select: none;
-}
-
-.app {
-  padding: 16px;
+  font-family: "Segoe UI Variable Text", "Segoe UI", "Yu Gothic UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
+}
+
+/* --- top bar ---------------------------------------------------------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px 8px;
+  flex: none;
+}
+
+.app-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.lang-select {
+  width: auto;
+  font-size: 12px;
+  padding: 3px 26px 3px 8px;
+}
+
+/* --- layout ----------------------------------------------------------- */
+
+.app {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 16px 16px;
 }
 
 .screen {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.title {
-  margin: 0 0 2px;
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
-  color: var(--muted);
-}
-
-form {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+  max-width: 560px;
 }
 
 .field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  margin-bottom: 14px;
 }
 
-.field.grow {
-  flex: 1;
-}
-
-label {
+.field > label {
+  display: block;
   font-size: 12px;
-  color: var(--muted);
-}
-
-.hint {
-  font-size: 11px;
-  color: var(--muted);
-  font-weight: 400;
-}
-
-.hint.error {
-  color: var(--danger);
-}
-
-select,
-input[type="text"],
-input[type="number"] {
-  appearance: none;
-  background: var(--field-bg);
-  border: 1px solid var(--border);
-  color: var(--text);
-  border-radius: 6px;
-  padding: 7px 9px;
-  font-size: 13px;
-  font-family: inherit;
-  outline: none;
-  width: 100%;
-}
-
-select:focus,
-input:focus {
-  border-color: var(--accent);
-}
-
-/* Native appearance is stripped above (appearance:none), which also removes
-   the dropdown arrow. Re-add a chevron so selects read as selectable. The
-   stroke colour is baked into the SVG (currentColor can't reach a
-   background-image), so light/dark get their own copy. */
-select {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2375757e' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 9px center;
-  padding-right: 28px;
-}
-
-@media (prefers-color-scheme: dark) {
-  select {
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239a9aa2' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-  }
+  color: var(--text-2);
+  margin-bottom: 5px;
 }
 
 .row {
   display: flex;
   gap: 8px;
-  align-items: flex-end;
-}
-
-/* A little extra breathing room between the mount-destination input, the
-   size row, the option checkboxes, and the mount button. */
-.size-field,
-.check-row,
-#mount-btn {
-  margin-top: 9px;
-}
-
-/* Size row: label + input + unit on one centered line. */
-.size-row {
-  justify-content: center;
   align-items: center;
 }
 
-#size-label {
-  flex: none;
+.grow {
+  flex: 1;
 }
 
-#size-error {
-  text-align: center;
+.size-row input {
+  width: 110px;
 }
 
-#size-value {
-  width: 90px;
-  flex: none;
-}
-
-#size-unit {
+.size-row select {
   width: auto;
-  flex: none;
 }
 
-#mount-folder-field .row {
-  align-items: center;
+.hint {
+  font-size: 12px;
+  color: var(--text-2);
 }
 
-#mount-folder-field input {
-  flex: 1;
-  min-width: 0;
+.hint.error {
+  color: var(--error);
+  margin-top: 4px;
 }
 
-#mount-folder-field .btn {
-  flex: none;
-  padding: 7px 12px;
-  font-size: 12.5px;
+#compress-hint {
+  margin-top: 6px;
 }
 
-/* input + "参照..." button rows (archive panel) */
-.row.with-browse {
-  align-items: center;
-}
+/* --- controls --------------------------------------------------------- */
 
-.row.with-browse > input[type="text"] {
-  flex: 1;
-  min-width: 0;
-}
-
-.row.with-browse > .btn {
-  flex: none;
-  padding: 7px 12px;
-  font-size: 12.5px;
-}
-
-.check-row {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 8px 18px;
-}
-
-.check {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
+select,
+input[type="text"],
+input[type="number"] {
+  width: 100%;
+  font: inherit;
   color: var(--text);
-  cursor: default;
+  background: var(--control);
+  border: 1px solid var(--border);
+  border-bottom-color: #565656; /* Win11 text-field bottom edge */
+  border-radius: 4px;
+  padding: 5px 10px;
+  outline: none;
 }
 
-.check-inline {
-  padding-bottom: 7px;
+select {
+  appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path d='M1 1l4 4 4-4' fill='none' stroke='%239d9d9d' stroke-width='1.4'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
 }
 
-input[type="checkbox"] {
-  accent-color: var(--accent);
-  width: 14px;
-  height: 14px;
-  margin: 0;
+select:hover,
+input[type="text"]:hover,
+input[type="number"]:hover {
+  background-color: var(--control-hover);
+}
+
+input[type="text"]:focus,
+input[type="number"]:focus {
+  background-color: #1f1f1f;
+  border-bottom: 2px solid var(--accent);
+  padding-bottom: 4px;
+}
+
+select:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 1px;
+}
+
+select option {
+  background: var(--control);
+  color: var(--text);
 }
 
 .btn {
-  appearance: none;
-  border: 1px solid var(--border);
-  background: var(--field-bg);
+  font: inherit;
   color: var(--text);
-  border-radius: 6px;
-  padding: 8px 14px;
-  font-size: 13px;
-  font-weight: 600;
+  background: var(--control);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 14px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .btn:hover {
-  border-color: var(--muted);
+  background: var(--control-hover);
+}
+
+.btn:active {
+  background: var(--control-press);
 }
 
 .btn:disabled {
-  opacity: 0.5;
+  color: var(--text-disabled);
   cursor: default;
-}
-
-.btn-block {
-  width: 100%;
+  background: var(--control);
 }
 
 .btn-primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: var(--accent-text);
+  color: #000000;
+  font-weight: 600;
 }
 
 .btn-primary:hover {
@@ -276,201 +205,314 @@ input[type="checkbox"] {
   border-color: var(--accent-hover);
 }
 
-.btn-danger {
-  background: var(--bg);
-  border-color: var(--danger);
-  color: var(--danger);
+.btn-primary:active {
+  background: var(--accent-press);
+  border-color: var(--accent-press);
 }
 
-.btn-danger:hover {
-  background: var(--danger);
-  color: var(--danger-text);
+.btn-primary:disabled {
+  background: #434343;
+  border-color: #434343;
+  color: var(--text-disabled);
+  font-weight: 400;
 }
 
-.btn-ghost {
-  background: transparent;
+.btn-block {
+  display: block;
+  width: 100%;
+  padding: 7px 14px;
+  margin-top: 4px;
 }
 
-.status-text {
-  font-size: 12px;
-  color: var(--muted);
-  min-height: 14px;
+button:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 1px;
 }
 
-.status-text.error {
-  color: var(--danger);
+input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
 }
 
-.status-text.ok {
-  color: var(--good);
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text);
+  cursor: pointer;
 }
 
-/* Mounted screen */
+.check-col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.check-inline {
+  white-space: nowrap;
+  padding-bottom: 6px;
+}
+
+/* --- pivot tabs (mode switches) --------------------------------------- */
+
+.seg {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.seg-btn {
+  font: inherit;
+  background: none;
+  border: none;
+  color: var(--text-2);
+  padding: 4px 2px 7px;
+  cursor: pointer;
+  position: relative;
+}
+
+.seg-btn:hover {
+  color: var(--text);
+}
+
+.seg-btn.active {
+  color: var(--text);
+}
+
+.seg-btn.active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+/* --- mounted screen ---------------------------------------------------- */
+
 .mounted-head {
   display: flex;
   align-items: baseline;
-  gap: 10px;
-  min-width: 0;
+  gap: 12px;
+  margin: 4px 0 12px;
 }
 
 .drive-letter {
-  font-size: 26px;
-  font-weight: 700;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
+  font-size: 28px;
+  font-weight: 600;
 }
 
 .drive-letter.long {
-  font-size: 14px;
-  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 15px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mounted-sub {
   font-size: 12px;
-  color: var(--muted);
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.bar {
+.usage-bar {
   height: 6px;
-  border-radius: 999px;
-  background: var(--field-bg);
-  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--control);
+  border: 1px solid var(--divider);
   overflow: hidden;
 }
 
-.bar > i {
-  display: block;
+.usage-fill {
   height: 100%;
-  width: 0%;
+  width: 0;
   background: var(--accent);
+  transition: width 0.4s ease;
+}
+
+.usage-fill.warn {
+  background: var(--bar-warn);
 }
 
 .usage-text {
   display: flex;
   justify-content: space-between;
-  font-size: 11px;
-  color: var(--muted);
-  margin-top: -6px;
+  font-size: 12px;
+  color: var(--text-2);
+  margin: 6px 0 12px;
 }
 
-.stat-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
+.stat-list {
+  margin-bottom: 16px;
 }
 
-.stat {
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--divider);
+  font-size: 13px;
+}
+
+.stat-row .k {
+  color: var(--text-2);
+}
+
+/* --- tool list --------------------------------------------------------- */
+
+.tool-col {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  background: var(--field-bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 7px 9px;
+  gap: 6px;
 }
 
-.stat .k {
-  font-size: 10.5px;
-  color: var(--muted);
-}
-
-.stat .v {
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.tool-row {
+.tool-btn {
+  font: inherit;
   display: flex;
-  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  background: var(--control);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 9px 12px;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
 }
 
-.tool-row .btn {
-  flex: 1;
+.tool-btn:hover {
+  background: var(--control-hover);
+}
+
+.tool-btn:disabled {
+  color: var(--text-disabled);
+  cursor: default;
+  background: var(--control);
+}
+
+.tool-btn:disabled .tool-desc {
+  color: var(--text-disabled);
+}
+
+.tool-desc {
   font-size: 12px;
-  padding: 8px 6px;
-  line-height: 1.3;
+  color: var(--text-2);
 }
 
-/* Panels (hash / archive) */
+/* --- tool panels -------------------------------------------------------- */
+
 .panel-head {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
+  margin-bottom: 12px;
 }
 
 .panel-head h2 {
-  margin: 0;
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 600;
 }
 
 .btn-back {
-  appearance: none;
-  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  background: none;
   border: none;
-  color: var(--muted);
-  font-size: 12px;
+  color: var(--text-2);
   cursor: pointer;
-  padding: 2px 0;
+  padding: 2px 4px;
 }
 
 .btn-back:hover {
   color: var(--text);
 }
 
-.tabs {
+/* --- job status / results ---------------------------------------------- */
+
+.status-text {
+  font-size: 12px;
+  color: var(--text-2);
+  margin-top: 8px;
+  min-height: 1em;
+  word-break: break-word;
+}
+
+.status-text.error {
+  color: var(--error);
+}
+
+.status-text.ok {
+  color: var(--ok);
+}
+
+.job-row {
   display: flex;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  overflow: hidden;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
 }
 
-.tab {
+.job-row .status-text {
+  margin-top: 0;
   flex: 1;
-  appearance: none;
-  border: none;
-  background: var(--bg);
-  color: var(--muted);
-  padding: 7px 0;
-  font-size: 12.5px;
-  cursor: pointer;
 }
 
-.tab + .tab {
-  border-left: 1px solid var(--border);
+.spinner {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--divider);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
 }
 
-.tab.active {
-  background: var(--accent);
-  color: var(--accent-text);
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2.5s;
+  }
+  .usage-fill {
+    transition: none;
+  }
 }
 
 .kv-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  margin-top: 12px;
 }
 
 .kv-row {
   display: flex;
-  gap: 10px;
   justify-content: space-between;
-  background: var(--field-bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px 9px;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--divider);
   font-size: 12px;
 }
 
-.kv-row .kv-key {
-  color: var(--muted);
-  flex: none;
+.kv-key {
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.kv-row .kv-val {
+.kv-val {
+  font-family: Consolas, "Courier New", monospace;
+  word-break: break-all;
   text-align: right;
-  overflow-wrap: anywhere;
-  font-family: "Cascadia Code", Consolas, monospace;
 }

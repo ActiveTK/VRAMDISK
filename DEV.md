@@ -18,6 +18,7 @@ VRAMDISK が提供する主要機能は次の通り。
 - 任意のチャンク重複排除。
 - 任意のチャンク圧縮。
 - GPU 上でのハッシュ計算。
+- GPU 上でのファイルの Base64 / hex エンコード・デコード。
 - マウント済みファイルシステム内に公開される `$VRAMDISK` 仮想 API。
 - 共通 Rust エンジンを利用する CLI と Tauri GUI。
 
@@ -123,7 +124,7 @@ lib.rs
   gpu_hash.rs     GPU FNV-1a hash kernel wrapper
   api_kernel.rs   仮想 API 用 CUDA kernel
   internal_api.rs $VRAMDISK 仮想 API
-  engine.rs       byte-range I/O、sparse、dedup、compression
+  engine.rs       byte-range I/O、sparse、dedup、compression、encode jobs
   fs.rs           WinFsp filesystem 実装
 
 src-tauri/
@@ -461,15 +462,24 @@ descriptor 例:
 - `sha256`
 - `fnv1a64`
 
-hash は CUDA API kernel の init/update/final 段で処理する。ファイル本文は host に
-戻さず、最終 digest だけを返す。
+hash は file ごとに GPU/CPU を自動選択する。小さい file で、全 placement が
+raw/sparse/LZ4 の場合は CUDA API kernel の init/update/final 段で処理する。
+巨大 file、または CPU zstd fallback chunk を含む file は CPU streaming path を使い、
+`StorageEngine::read` で 32 MiB window ごとに materialize して RustCrypto hash へ
+逐次投入する。
+
+初回 hash 時（または API kernel 初期化時）には、約 1 MiB の VRAM scratch を
+single-thread SHA-256 で 1 回測り、per-thread throughput から次の 2 値を導出する。
+
+- GPU hash launch budget: `throughput x 0.10 s` を `[4 MiB, 512 MiB]` に clamp。
+- CPU routing threshold: `throughput x 0.25 s` を `[1 MiB, 128 MiB]` に clamp。
 
 raw チャンクは VRAM address descriptor として kernel に渡す。LZ4 compressed
 チャンクは nvCOMP で device scratch に D2D 解凍し、その scratch address を hash
 kernel に渡す。スパース穴は GPU kernel 内でゼロ列として合成する。
 
-CPU zstd fallback で格納された compressed chunk は GPU-only 契約を満たせないため、
-暗黙に host fallback せず unsupported として扱う。
+CPU zstd fallback で格納された compressed chunk は GPU kernel へは渡さず、暗黙
+エラーではなく CPU hash path に振り替える。
 
 #### Archive jobs
 
@@ -504,9 +514,11 @@ CPU zstd fallback で格納された compressed chunk は GPU-only 契約を満�
 - `zip`
 
 archive jobs では、対応できる範囲でファイル本文を GPU 上に保持する。CPU は
-descriptor、archive header、path metadata を扱う。対象は通常 raw/sparse placement
-のファイルであり、対応外の compressed placement、対応外の path 形式、一時 VRAM
-不足は明示エラーにする。
+descriptor、archive header、path metadata を扱う。source file と input archive は
+raw / sparse / compressed placement を受け付ける。LZ4 placement は nvCOMP で
+device scratch へ展開し、CPU zstd fallback placement は CPU で解凍して H2D
+アップロードする。対応外の path 形式や、一時 raw 展開ぶんの VRAM が足りない場合は
+原因と対処が分かる明示エラーにする。
 
 format ごとの処理方針は次の通り。
 
@@ -514,6 +526,36 @@ format ごとの処理方針は次の通り。
 - `tar.lz4`: CPU で LZ4 frame header を構築し、payload block を nvCOMP LZ4 で処理する。
 - `tar.gz`: gzip multi-member layout と nvCOMP Deflate payload を使う。
 - `zip`: ZIP Deflate method 8、GPU CRC32、ZIP64 record、VRAMDISK 専用 chunk-size table を使う。
+
+archive job が失敗またはキャンセルされた場合、書きかけの出力 archive と
+`\.__vramdisk_*` staging temp file は自動的に除去される。展開途中の出力
+ファイルは診断用に残る。
+
+#### Encode jobs
+
+GPU 上で Base64 / hex のエンコード・デコードを行う。descriptor 例:
+
+```json
+{
+  "op": "encode",
+  "codec": "base64",
+  "direction": "encode",
+  "input": "\a.bin",
+  "output": "\a.b64"
+}
+```
+
+- `codec`: `base64` | `hex`。`direction`: `encode` | `decode`。
+- 固定サイズの staging パス（既定 48 MiB、空き VRAM に応じて縮小）単位で、
+  入力 slice を連続 raw staging に materialize → GPU kernel で変換 →
+  出力ファイルへ device-to-device で scatter する。ファイル全長の連続
+  VRAM 確保は不要で、raw / sparse / compressed のどの placement も入力にできる。
+- Base64 は 3 byte → 4 文字（`=` padding、行折り返しなし）。decode は
+  単一行の標準 Base64 のみ受け付け、末尾の ASCII 空白（改行等）は無視する。
+  `=` を含む最終グループだけ CPU で処理する。
+- hex は小文字で出力し、decode は大文字小文字両方を受け付ける。
+- 不正な入力文字は kernel の status flag 経由で明示エラーになる。
+- 失敗・キャンセル時は書きかけの出力ファイルと staging temp を除去する。
 
 ---
 
@@ -584,6 +626,18 @@ frontend は Tauri が直接読み込む静的 HTML/CSS/JS である。別途 No
 - mounted status / stats。
 - hash job。
 - archive compress / extract。
+- encode（Base64 / hex）。
+
+window はリサイズ可能（既定 404x580、最小 380x460）。
+
+### UI 言語
+
+UI は日本語 / 英語の二言語対応で、右上のセレクタで切り替えられる。
+
+- 既定はシステムの表示言語からの自動判定（`sys-locale`、ja 以外は en）。
+- 明示的な選択は `HKCU\Software\VRAMDISK` の `UiLanguage`（`ja` / `en`）へ保存され、次回以降はそれが優先される。
+- 切り替えは window 内の全ラベル、tray menu、native dialog（unmount 確認・マウント完了通知など）へ即時反映される。
+- frontend の文字列は `ui/app.js` の `I18N` 辞書、backend（tray / dialog）の文字列は `src-tauri/src/main.rs` の `tr()` にある。
 
 ### Tauri commands
 
@@ -596,9 +650,20 @@ frontend は Tauri が直接読み込む静的 HTML/CSS/JS である。別途 No
 | `unmount` | active mount を撤去する。 |
 | `mount_status` | active mount status または `null` を返す。 |
 | `stats` | `\$VRAMDISK\stats.json` を読み取る。 |
-| `hash_job` | 仮想 hash job を投入し結果を返す。 |
-| `archive_compress_job` | archive compression job を投入する。 |
-| `archive_extract_job` | archive extraction job を投入する。 |
+| `hash_job` | hash job を投入し job id を返す。 |
+| `archive_compress_job` | archive compression job を投入し job id を返す。 |
+| `archive_extract_job` | archive extraction job を投入し job id を返す。 |
+| `encode_job` | Base64/hex encode job を投入し job id を返す。 |
+| `job_status` | 指定 job の `status.json` を返す。 |
+| `job_result` | 指定 job の `result.json` を返す。 |
+| `job_cancel` | 指定 job のキャンセルを要求する。 |
+| `get_ui_language` | 現在の UI 言語（`ja` / `en`）を返す。 |
+| `set_ui_language` | UI 言語を registry へ保存し、tray menu を再構築する。 |
+
+job 系 command は同期ブロックしない。frontend は job id を受け取って
+`job_status` をポーリングし、実行中は経過秒数と中止ボタンを表示、terminal に
+なったら `job_result` を読む。これにより数十 GB 級のジョブも UI を塞がず、
+GUI から安全にキャンセルできる。
 
 hash / archive の path 入力は active mount point 相対に正規化する。mount point 外の
 絶対 path は拒否する。
@@ -614,6 +679,13 @@ WinFsp callback は FFI 境界をまたぐため、panic がプロセスや moun
 - offset と length の加算は checked arithmetic で行う。
 - `\a` から `\a\b` のような自己サブツリー rename を拒否する。
 - mutex poison は `into_inner` で復帰し、後続 callback の連鎖 panic を避ける。
+- job worker は executor の panic を catch して job を failed にする。
+- 未投入（`Receiving`）の job に対する `wait` はブロックせず status を返す。
+- zip / gzip / tar / LZ4 frame の parse は全ての short read を長さ検証する。
+- rename で置換された宛先 file の placement は engine 経由で解放される
+  （lookup 層だけで rename すると VRAM が leak する）。
+- 大文字小文字のみの rename は表示名を更新する（case-preserving）。
+- job registry は上限到達時に最古の terminal job を evict する。
 - unsupported な block clone path は安全に失敗させる。
 - `$VRAMDISK` は通常の filesystem mutation API からは read-only として扱う。
 
@@ -624,9 +696,18 @@ Windows / WinFsp 構成では NVIDIA GPUDirect Storage / cuFile は利用しな�
 ## 15. 公開仕様上の制約
 
 - ストレージは揮発性であり、アンマウントまたはプロセス終了で内容は失われる。
+- dedup の同一判定は 2 段階 FNV-1a 64-bit hash による（内容の byte 比較は
+  行わない）。偶発衝突の確率は実用上無視できるが、暗号学的強度はないため、
+  意図的に衝突を作れる敵対的入力に対しては誤共有（データ化け）が理論上
+  可能である。信頼できないデータを扱う場合は dedup を無効にすること。
 - GUI 管理下では同時に 1 つのマウントのみをサポートする。
 - GPU 圧縮には互換性のある nvCOMP DLL が必要である。
-- CPU fallback で格納されたデータは、一部の GPU-only 内部 API では対象外になる。
+- hash API は large file と zstd fallback chunk を自動で CPU へ振り分ける。
+  archive jobs は raw / sparse / compressed placement を透過処理するが、compressed
+  source を raw に展開する一時 VRAM が不足すると明示エラーになる。
+- `$VRAMDISK` の jobs / hash API はファイル単位の DACL を確認しない（volume の
+  既定 SD は Everyone フルアクセス）。複数ユーザーが同時ログオンする環境で
+  機微データを扱う用途は想定していない。
 - directory mount point は WinFsp が mount lifetime を所有し、unmount 時に削除される。
 - block clone は OS / WinFsp から source handle path を復元できる環境でのみ有効に働く。
 - GUI には合成ベンチマーク起動ビューを提供しない。

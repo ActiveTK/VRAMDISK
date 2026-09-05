@@ -12,8 +12,12 @@
 //! and result arrays cross the bus (8 bytes each way per chunk), never the
 //! chunk bodies.
 //!
-//! The kernel is launched on the same stream the VRAM writes use, so it is
-//! ordered after any prior writes without a whole-device synchronize.
+//! The kernel is launched on `Vram`'s default stream. That alone only orders it
+//! after the small writes, which run on that same stream; writes of 1 MiB or
+//! more are issued on separate non-blocking transfer streams and are *not*
+//! ordered by it. Those are safe because `Vram::write_at` host-synchronizes the
+//! transfer streams before returning, so the bytes are already in VRAM by the
+//! time a launch can be enqueued.
 
 use std::ffi::{c_void, CString};
 use std::sync::Arc;
@@ -131,7 +135,15 @@ impl GpuHasher {
     /// byte offset of chunk `i` within the VRAM buffer; `out[i]` receives its
     /// hash. `out.len()` must equal `offsets.len()`.
     pub fn hash_chunks(&mut self, vram_base: u64, offsets: &[u64], out: &mut [u64]) -> Result<()> {
-        debug_assert_eq!(offsets.len(), out.len());
+        // A real check, not a debug assert: a mismatch would otherwise reach
+        // the D2H memcpy below with the wrong length in a release build.
+        if offsets.len() != out.len() {
+            anyhow::bail!(
+                "hash_chunks length mismatch: {} offsets vs {} outputs",
+                offsets.len(),
+                out.len()
+            );
+        }
         let n = offsets.len();
         if n == 0 {
             return Ok(());

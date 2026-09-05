@@ -148,6 +148,9 @@ type FnGenericDecompress = unsafe extern "C" fn(
 /// bytes live; this wrapper only owns one batch of scratch and never pulls file
 /// payload bytes through host memory.
 pub struct NvcompBatchedCodec {
+    /// Owns the loaded nvCOMP DLL. The raw `f_*` pointers below point into it,
+    /// so they must never be called after this struct drops — which holds
+    /// because every call goes through `&self`/`&mut self`.
     #[allow(dead_code)]
     lib: Library,
     ctx: Arc<CudaContext>,
@@ -260,6 +263,11 @@ impl NvcompBatchedCodec {
         let out_ptrs: Vec<u64> = (0..BATCH)
             .map(|i| (a_d_out + i * max_comp) as u64)
             .collect();
+        // Placeholder output capacities. They deliberately do *not* match the
+        // `max_comp` stride of `d_out`: nothing reads them as written here.
+        // `compress_device` does not pass `s_out_cap` at all, and
+        // `decompress_device` overwrites slots `0..n` with the caller's real
+        // capacities before every launch.
         let out_caps: Vec<u64> = vec![cs as u64; BATCH];
         stream.memcpy_htod(&out_ptrs, &mut arr_out)?;
         stream.memcpy_htod(&out_caps, &mut s_out_cap)?;
@@ -428,6 +436,41 @@ impl NvcompBatchedCodec {
         }
     }
 
+    /// Grow the nvCOMP temp scratch so a decompress launch of `n` chunks whose
+    /// largest output is `max_out` bytes (`total_out` across the batch) fits.
+    ///
+    /// Deliberately *not* `reserve_for`: that sizes the compress path, which
+    /// also reallocates `d_out` (a `max_comp`-per-slot buffer that would be
+    /// enormous at decompressed sizes) and rewrites `arr_out` with its internal
+    /// slot pointers — clobbering the caller-supplied output pointers the
+    /// decompress path relies on.
+    fn reserve_decompress_temp(
+        &mut self,
+        max_out: usize,
+        n: usize,
+        total_out: usize,
+    ) -> Result<()> {
+        // `max_input` is the chunk size the current temp buffer was sized for.
+        if max_out <= self.max_input {
+            return Ok(());
+        }
+        let dopts = self.codec.decompress_opts();
+        let mut dtemp = 0usize;
+        let f_decomp_temp = self.load_decomp_temp_symbol()?;
+        check(
+            unsafe { f_decomp_temp(n.max(1), max_out, dopts, &mut dtemp, total_out.max(1)) },
+            "GenericDecompressGetTempSize(decompress)",
+        )?;
+        if dtemp <= self.temp_bytes {
+            return Ok(());
+        }
+        self.d_temp = self.stream.alloc_zeros::<u8>(dtemp.max(1))?;
+        self.stream.synchronize()?;
+        self.temp_bytes = dtemp.max(1);
+        self.a_d_temp = addr_of(&self.d_temp, &self.stream);
+        Ok(())
+    }
+
     pub fn decompress_device(
         &mut self,
         input_ptrs: &[u64],
@@ -452,6 +495,13 @@ impl NvcompBatchedCodec {
         }
         self.ctx.bind_to_thread()?;
         let n = input_ptrs.len();
+        // The temp buffer is sized at load() for BATCH × CHUNK_SIZE chunks, but
+        // callers decompress single blobs of tens or hundreds of megabytes
+        // (large archive entries). Grow it first, or nvCOMP scribbles past the
+        // end of `d_temp` into unrelated device memory.
+        let max_out = output_caps.iter().copied().max().unwrap_or(0) as usize;
+        let total_out = output_caps.iter().sum::<u64>() as usize;
+        self.reserve_decompress_temp(max_out, n, total_out)?;
         {
             let mut view = self.arr_in.slice_mut(0..n);
             self.stream.memcpy_htod(input_ptrs, &mut view)?;
@@ -469,8 +519,6 @@ impl NvcompBatchedCodec {
             self.stream.memcpy_htod(output_caps, &mut view)?;
         }
         self.stream.synchronize()?;
-        let max_out = output_caps.iter().copied().max().unwrap_or(0) as usize;
-        let total_out = output_caps.iter().sum::<u64>() as usize;
         let status = unsafe {
             (self.f_decompress)(
                 self.a_arr_in as *const *const c_void,
@@ -486,7 +534,6 @@ impl NvcompBatchedCodec {
                 self.stream.cu_stream() as *mut c_void,
             )
         };
-        let _ = (max_out, total_out);
         check(status, "GenericDecompressAsync(launch)")?;
         self.stream.synchronize()?;
         self.check_statuses(n, "decompress")?;
@@ -639,6 +686,9 @@ type FnDecompress = unsafe extern "C" fn(
 
 /// Loaded nvCOMP LZ4 codec with persistent device scratch for one batch.
 pub struct Lz4Codec {
+    /// Owns the loaded nvCOMP DLL. The raw `f_compress`/`f_decompress` pointers
+    /// point into it, so they must never be called after this struct drops —
+    /// which holds because every call goes through `&mut self`.
     #[allow(dead_code)]
     lib: Library,
     ctx: Arc<CudaContext>,
@@ -679,14 +729,16 @@ pub struct Lz4Codec {
 /// Root nvCOMP installs under on Windows, across releases.
 const NVCOMP_INSTALL_ROOT: &str = r"C:\Program Files\NVIDIA nvCOMP";
 
-/// Batched-API DLL base names nvCOMP has shipped under across major versions
-/// (newest first; the trailing major-version suffix has moved 3 -> 4 -> 5).
-const NVCOMP_DLL_NAMES: &[&str] = &[
-    "nvcomp64_5.dll",
-    "nvcomp64_4.dll",
-    "nvcomp64_3.dll",
-    "nvcomp64.dll",
-];
+/// Batched-API DLL base names worth loading (newest first).
+///
+/// Deliberately limited to the 5.x-era names: every FFI signature in this file
+/// matches nvCOMP 5.x (64-byte options structs, 11-argument `CompressAsync`).
+/// nvCOMP 3.x/4.x export same-named entry points with the older ABI, so calling
+/// them through these declarations would corrupt the stack. The `Async`-suffixed
+/// size-query symbols happen to be 5.x-only, but we don't rely on that: the
+/// unversioned `nvcomp64.dll` is only kept because that is what a 5.x install
+/// can also be named.
+const NVCOMP_DLL_NAMES: &[&str] = &["nvcomp64_5.dll", "nvcomp64.dll"];
 
 /// `v*` version directories directly under [`NVCOMP_INSTALL_ROOT`], newest
 /// first (plain lexicographic descending is good enough for `v5.2`-style
@@ -893,12 +945,15 @@ impl Lz4Codec {
     /// Compress one full 64 KiB chunk. Returns `Some(bytes)` if the result is
     /// strictly smaller than the input, else `None` (store uncompressed).
     pub fn compress(&mut self, src: &[u8]) -> Result<Option<Vec<u8>>> {
-        assert_eq!(
-            src.len(),
-            CHUNK_SIZE as usize,
-            "compress expects a full chunk"
-        );
-        Ok(self.compress_batch(src)?.pop().unwrap())
+        if src.len() != CHUNK_SIZE as usize {
+            bail!(
+                "compress expects a full {CHUNK_SIZE}-byte chunk, got {}",
+                src.len()
+            );
+        }
+        self.compress_batch(src)?
+            .pop()
+            .context("nvCOMP compress returned no result for a single chunk")
     }
 
     /// Compress a contiguous run of full 64 KiB chunks (`data.len()` must be a
@@ -1035,7 +1090,10 @@ impl Lz4Codec {
 
     /// Decompress `comp` back into a full 64 KiB chunk.
     pub fn decompress(&mut self, comp: &[u8], out_len: usize) -> Result<Vec<u8>> {
-        let mut full = self.decompress_batch(&[comp])?.pop().unwrap();
+        let mut full = self
+            .decompress_batch(&[comp])?
+            .pop()
+            .context("nvCOMP decompress returned no result for a single blob")?;
         full.truncate(out_len);
         Ok(full)
     }
@@ -1065,6 +1123,11 @@ impl Lz4Codec {
                     b.len(),
                     self.max_comp
                 );
+            }
+            // An empty blob cannot be a valid LZ4 frame, and enqueueing a
+            // zero-length memcpy for it would just hide the bad input.
+            if b.is_empty() {
+                bail!("compressed blob {i} is empty");
             }
             let start = i * self.max_comp;
             let mut view = self.d_out.slice_mut(start..start + b.len());
@@ -1102,6 +1165,10 @@ impl Lz4Codec {
                 statuses[bad]
             );
         }
+        // Every blob must expand back to a full chunk. A short result would
+        // leave the tail of the scratch holding the previous call's plaintext,
+        // which we would then hand back as if it were this chunk's data.
+        self.check_decompressed_sizes(m, cs as u64, "decompress")?;
 
         // One D2H of the whole decompressed region, then split per chunk.
         let mut whole = vec![0u8; m * cs];
@@ -1181,6 +1248,7 @@ impl Lz4Codec {
                     statuses[bad]
                 );
             }
+            self.check_decompressed_sizes(m, cs as u64, "decompress(arena)")?;
 
             let mut whole = vec![0u8; m * cs];
             {
@@ -1257,6 +1325,9 @@ impl Lz4Codec {
                     statuses[bad]
                 );
             }
+            // Every arena blob is a compressed *full* chunk, so anything short
+            // means the requested slice would be read out of stale scratch.
+            self.check_decompressed_sizes(m, cs as u64, "decompress(slices)")?;
 
             for (i, &(_, _, in_off, take)) in group.iter().enumerate() {
                 let mut piece = vec![0u8; take];
@@ -1333,6 +1404,27 @@ impl Lz4Codec {
             bail!(
                 "nvCOMP decompress chunk {bad} reported status {}",
                 statuses[bad]
+            );
+        }
+        // The caller reads whole chunks straight out of the `d_in` slots, so a
+        // short result would silently expose the previous call's plaintext.
+        self.check_decompressed_sizes(m, CHUNK_SIZE, "decompress(dev)")?;
+        Ok(())
+    }
+
+    /// Verify nvCOMP actually produced `expect` bytes for each of the `m`
+    /// chunks it just decompressed into `d_in`.
+    ///
+    /// A per-chunk status of 0 only says the codec did not fault; it does not
+    /// say the frame expanded to a whole chunk. Without this check a short
+    /// result leaves the tail of the slot holding whatever the *previous* call
+    /// decompressed there, and that stale plaintext is returned as file data.
+    fn check_decompressed_sizes(&self, m: usize, expect: u64, op: &str) -> Result<()> {
+        let sizes = self.read_u64(&self.s_result, m)?;
+        if let Some(bad) = sizes.iter().position(|&sz| sz != expect) {
+            bail!(
+                "nvCOMP {op} chunk {bad} produced {} bytes, expected {expect}",
+                sizes[bad]
             );
         }
         Ok(())

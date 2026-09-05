@@ -6,7 +6,32 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::manager::{GpuDto, Manager, MountConfig, MountStatus};
-use crate::CliSeed;
+use crate::{CliSeed, UiLang};
+
+/// Current UI language ("ja" or "en"), resolved at startup from the registry
+/// or the Windows display language (see `main::detect_language`).
+#[tauri::command]
+pub fn get_ui_language(lang: State<UiLang>) -> String {
+    lang.0.lock().unwrap().clone()
+}
+
+/// Persist the user's language choice to HKCU\Software\VRAMDISK and rebuild
+/// the tray menu so it switches language immediately.
+#[tauri::command]
+pub fn set_ui_language(
+    language: String,
+    app: AppHandle,
+    lang: State<UiLang>,
+    manager: State<Manager>,
+) -> Result<(), String> {
+    if language != "ja" && language != "en" {
+        return Err(format!("unsupported language: {language}"));
+    }
+    crate::persist_language(&language)?;
+    *lang.0.lock().unwrap() = language;
+    crate::refresh_tray_menu(&app, manager.status().is_some());
+    Ok(())
+}
 
 #[tauri::command]
 pub fn list_gpus(manager: State<Manager>) -> Vec<GpuDto> {
@@ -129,15 +154,17 @@ pub fn unmount(app: AppHandle, manager: State<Manager>) -> Result<(), String> {
     Ok(())
 }
 
-/// Run a GPU batch-hash job over paths on the mounted volume via its
-/// `$VRAMDISK\jobs` API, and return the parsed `result.json`.
+/// Submit a GPU batch-hash job over paths on the mounted volume via its
+/// `$VRAMDISK\jobs` API. Returns the job id immediately; the frontend polls
+/// `job_status` and reads `job_result` when the job turns terminal, so a long
+/// hash never blocks an invoke round-trip and stays cancellable.
 #[tauri::command]
 pub fn hash_job(
     paths: Vec<String>,
     algorithm: String,
     recursive: bool,
     manager: State<Manager>,
-) -> Result<serde_json::Value, String> {
+) -> Result<String, String> {
     if paths.is_empty() {
         return Err("no paths given".to_string());
     }
@@ -154,7 +181,63 @@ pub fn hash_job(
         "paths": norm,
         "recursive": recursive,
     });
-    submit_job(&mount_point, descriptor).map_err(|e| e.to_string())
+    submit_job_async(&mount_point, descriptor).map_err(|e| e.to_string())
+}
+
+/// Poll a submitted job's `status.json`. Returns the parsed document
+/// (`state`, `terminal`, ...).
+#[tauri::command]
+pub fn job_status(job_id: String, manager: State<Manager>) -> Result<serde_json::Value, String> {
+    let mount_point = manager
+        .mount_point()
+        .ok_or_else(|| "nothing is mounted".to_string())?;
+    validate_job_id(&job_id)?;
+    let path = format!("{mount_point}\\$VRAMDISK\\jobs\\{job_id}\\status.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))
+}
+
+/// Read a terminal job's `result.json`.
+#[tauri::command]
+pub fn job_result(job_id: String, manager: State<Manager>) -> Result<serde_json::Value, String> {
+    let mount_point = manager
+        .mount_point()
+        .ok_or_else(|| "nothing is mounted".to_string())?;
+    validate_job_id(&job_id)?;
+    let path = format!("{mount_point}\\$VRAMDISK\\jobs\\{job_id}\\result.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))
+}
+
+/// Request cancellation of a running job (reading the virtual `cancel` file
+/// performs the cancellation).
+#[tauri::command]
+pub fn job_cancel(job_id: String, manager: State<Manager>) -> Result<(), String> {
+    let mount_point = manager
+        .mount_point()
+        .ok_or_else(|| "nothing is mounted".to_string())?;
+    validate_job_id(&job_id)?;
+    let path = format!("{mount_point}\\$VRAMDISK\\jobs\\{job_id}\\cancel");
+    std::fs::read(&path)
+        .map(|_| ())
+        .map_err(|e| format!("cancel {path}: {e}"))
+}
+
+/// Reject anything that could escape `$VRAMDISK\jobs\<id>` before the id is
+/// spliced into a filesystem path. Mirrors the volume-side job-id rules.
+fn validate_job_id(id: &str) -> Result<(), String> {
+    let ok = !id.is_empty()
+        && id.len() <= 128
+        && id != "."
+        && id != ".."
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("invalid job id: {id}"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,14 +254,15 @@ pub struct ArchiveExtractRequest {
     pub output_dir: String,
 }
 
-/// GPU archive compression (`tar.zst` / `tar.lz4` / `tar.gz` / `zip`) over
-/// paths on the mounted volume, via `$VRAMDISK\jobs`. Always recursive: a
-/// non-recursive compress isn't a meaningful option for this tool.
+/// Submit a GPU archive compression job (`tar.zst` / `tar.lz4` / `tar.gz` /
+/// `zip`) over paths on the mounted volume, via `$VRAMDISK\jobs`. Always
+/// recursive: a non-recursive compress isn't a meaningful option for this
+/// tool. Returns the job id (see `hash_job` for the poll/cancel flow).
 #[tauri::command]
 pub fn archive_compress_job(
     req: ArchiveCompressRequest,
     manager: State<Manager>,
-) -> Result<serde_json::Value, String> {
+) -> Result<String, String> {
     if req.paths.is_empty() {
         return Err("no paths given".to_string());
     }
@@ -198,15 +282,16 @@ pub fn archive_compress_job(
         "output": output,
         "recursive": true,
     });
-    submit_job(&mount_point, descriptor).map_err(|e| e.to_string())
+    submit_job_async(&mount_point, descriptor).map_err(|e| e.to_string())
 }
 
-/// GPU archive extraction over an archive file on the mounted volume.
+/// Submit a GPU archive extraction job over an archive file on the mounted
+/// volume. Returns the job id (see `hash_job` for the poll/cancel flow).
 #[tauri::command]
 pub fn archive_extract_job(
     req: ArchiveExtractRequest,
     manager: State<Manager>,
-) -> Result<serde_json::Value, String> {
+) -> Result<String, String> {
     let mount_point = manager
         .mount_point()
         .ok_or_else(|| "nothing is mounted".to_string())?;
@@ -218,7 +303,39 @@ pub fn archive_extract_job(
         "archive": archive,
         "output_dir": output_dir,
     });
-    submit_job(&mount_point, descriptor).map_err(|e| e.to_string())
+    submit_job_async(&mount_point, descriptor).map_err(|e| e.to_string())
+}
+
+/// Submit a GPU encode/decode job (Base64 / hex) over one file on the mounted
+/// volume. Returns the job id (see `hash_job` for the poll/cancel flow).
+#[tauri::command]
+pub fn encode_job(
+    req: EncodeRequest,
+    manager: State<Manager>,
+) -> Result<String, String> {
+    let mount_point = manager
+        .mount_point()
+        .ok_or_else(|| "nothing is mounted".to_string())?;
+    let input = normalize_path(&mount_point, &req.input)?;
+    let output = normalize_path(&mount_point, &req.output)?;
+    let descriptor = serde_json::json!({
+        "op": "encode",
+        "codec": req.codec,
+        "direction": req.direction,
+        "input": input,
+        "output": output,
+    });
+    submit_job_async(&mount_point, descriptor).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EncodeRequest {
+    /// "base64" or "hex".
+    pub codec: String,
+    /// "encode" or "decode".
+    pub direction: String,
+    pub input: String,
+    pub output: String,
 }
 
 /// Normalize a user-entered path to a drive-relative "\..." form.
@@ -261,15 +378,13 @@ fn normalize_path(mount_point: &str, p: &str) -> Result<String, String> {
     })
 }
 
-/// Submit a job descriptor to the volume's `$VRAMDISK\jobs` API and block
-/// until it reaches a terminal state, then return the parsed result document.
-/// Shared by hash and archive jobs; both are simple submit-then-poll flows.
-fn submit_job(
-    mount_point: &str,
-    descriptor: serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
+/// Submit a job descriptor to the volume's `$VRAMDISK\jobs` API and return
+/// the generated job id immediately. The frontend drives the rest through
+/// `job_status` / `job_result` / `job_cancel`, so an hours-long archive job
+/// neither blocks an invoke round-trip nor becomes uncancellable.
+fn submit_job_async(mount_point: &str, descriptor: serde_json::Value) -> anyhow::Result<String> {
     use std::io::Write;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     let job_id = format!(
         "gui{}",
@@ -279,7 +394,8 @@ fn submit_job(
             .as_nanos()
     );
 
-    // Submit: CREATE_NEW the pending descriptor, write, close.
+    // Submit: CREATE_NEW the pending descriptor, write, close (closing the
+    // handle is what queues the job).
     let pending = format!("{mount_point}\\$VRAMDISK\\jobs\\pending\\{job_id}.json");
     {
         let mut f = std::fs::OpenOptions::new()
@@ -289,29 +405,7 @@ fn submit_job(
             .map_err(|e| anyhow::anyhow!("submit {pending}: {e}"))?;
         f.write_all(descriptor.to_string().as_bytes())?;
     }
-
-    // Poll status.json until terminal, then read result.json.
-    let status_path = format!("{mount_point}\\$VRAMDISK\\jobs\\{job_id}\\status.json");
-    let result_path = format!("{mount_point}\\$VRAMDISK\\jobs\\{job_id}\\result.json");
-    let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
-        if let Ok(text) = std::fs::read_to_string(&status_path) {
-            if let Ok(status) = serde_json::from_str::<serde_json::Value>(&text) {
-                if status["terminal"].as_bool().unwrap_or(false) {
-                    break;
-                }
-            }
-        }
-        if Instant::now() > deadline {
-            anyhow::bail!("job timed out");
-        }
-        std::thread::sleep(Duration::from_millis(80));
-    }
-
-    let text = std::fs::read_to_string(&result_path)
-        .map_err(|e| anyhow::anyhow!("read {result_path}: {e}"))?;
-    let value: serde_json::Value = serde_json::from_str(&text)?;
-    Ok(value)
+    Ok(job_id)
 }
 
 #[cfg(test)]

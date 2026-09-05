@@ -5,7 +5,7 @@ mod commands;
 mod manager;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -19,10 +19,66 @@ use manager::Manager;
 /// frontend falls back entirely to its saved `localStorage` config.
 pub(crate) struct CliSeed(pub Option<vramdisk::cli::SeedOverrides>);
 
-/// Shown once, when the user closes the window while a mount may be live.
-const CLOSE_HINT: &str = "VRAMDISKはタスクトレイからアンマウントできます";
+/// UI language ("ja" or "en"). Chosen from, in order: the value persisted
+/// under HKCU\Software\VRAMDISK, else the Windows display language. The
+/// frontend reads/writes it via the `get_ui_language` / `set_ui_language`
+/// commands; the tray menu and native dialogs read it through this state.
+pub(crate) struct UiLang(pub Mutex<String>);
 
-const UNMOUNT_WARNING: &str = "本当にアンマウントしますか？\nドライブ上のデータは全て失われます。";
+const LANG_REG_PATH: &str = r"Software\VRAMDISK";
+const LANG_REG_VALUE: &str = "UiLanguage";
+
+fn stored_language() -> Option<String> {
+    let key = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey(LANG_REG_PATH)
+        .ok()?;
+    let v: String = key.get_value(LANG_REG_VALUE).ok()?;
+    matches!(v.as_str(), "ja" | "en").then_some(v)
+}
+
+fn detect_language() -> String {
+    stored_language().unwrap_or_else(|| {
+        let sys = sys_locale::get_locale().unwrap_or_default();
+        if sys.to_ascii_lowercase().starts_with("ja") {
+            "ja"
+        } else {
+            "en"
+        }
+        .to_string()
+    })
+}
+
+pub(crate) fn persist_language(lang: &str) -> Result<(), String> {
+    let (key, _) = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .create_subkey(LANG_REG_PATH)
+        .map_err(|e| e.to_string())?;
+    key.set_value(LANG_REG_VALUE, &lang).map_err(|e| e.to_string())
+}
+
+fn app_language(app: &AppHandle) -> String {
+    app.try_state::<UiLang>()
+        .map(|s| s.0.lock().unwrap().clone())
+        .unwrap_or_else(|| "ja".to_string())
+}
+
+/// All backend-rendered strings (tray menu, native dialogs) in both languages.
+fn tr(lang: &str, key: &str) -> &'static str {
+    let ja = lang == "ja";
+    match key {
+        "show" => if ja { "ウィンドウを開く" } else { "Open window" },
+        "unmount" => if ja { "アンマウント" } else { "Unmount" },
+        "hash" => if ja { "ファイルのハッシュ計算" } else { "Hash files" },
+        "archive" => if ja { "ファイルの圧縮・展開" } else { "Compress / extract files" },
+        "encode" => if ja { "ファイルのエンコード（Base64 / hex）" } else { "Encode files (Base64 / hex)" },
+        "quit" => if ja { "終了" } else { "Exit" },
+        "close_hint" => if ja { "VRAMDISKはタスクトレイからアンマウントできます" } else { "VRAMDISK stays available in the system tray." },
+        "unmount_warning" => if ja { "本当にアンマウントしますか？\nドライブ上のデータは全て失われます。" } else { "Unmount now?\nAll data on the drive will be lost." },
+        "continue" => if ja { "続行" } else { "Continue" },
+        "cancel" => if ja { "キャンセル" } else { "Cancel" },
+        "mounted_msg" => if ja { "マウントしました。\nタスクトレイから操作できます。" } else { "Mounted.\nUse the tray icon to manage the drive." },
+        _ => "",
+    }
+}
 
 /// Emitted to the main window whenever the mount state changes (mount,
 /// unmount, whether triggered from the UI or the tray), carrying the current
@@ -35,6 +91,9 @@ const EVENT_OPEN_ARCHIVE_PANEL: &str = "open-archive-panel";
 
 /// Emitted when the user asks (via tray) to open the GPU hash panel.
 const EVENT_OPEN_HASH_PANEL: &str = "open-hash-panel";
+
+/// Emitted when the user asks (via tray) to open the GPU encode panel.
+const EVENT_OPEN_ENCODE_PANEL: &str = "open-encode-panel";
 
 fn show_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
@@ -53,13 +112,14 @@ fn quit(app: &AppHandle) {
 
 fn confirm_unmount(app: &AppHandle, on_confirm: impl FnOnce(AppHandle) + Send + 'static) {
     let app = app.clone();
+    let lang = app_language(&app);
     app.dialog()
-        .message(UNMOUNT_WARNING)
+        .message(tr(&lang, "unmount_warning"))
         .kind(MessageDialogKind::Warning)
         .title("VRAMDISK")
         .buttons(MessageDialogButtons::OkCancelCustom(
-            "続行".into(),
-            "キャンセル".into(),
+            tr(&lang, "continue").into(),
+            tr(&lang, "cancel").into(),
         ))
         .show(move |confirmed| {
             if confirmed {
@@ -68,22 +128,29 @@ fn confirm_unmount(app: &AppHandle, on_confirm: impl FnOnce(AppHandle) + Send + 
         });
 }
 
-/// Build the tray menu, enabling "アンマウント" / "ファイルのハッシュ計算" /
-/// "ファイルをGPU上で圧縮" only while a disk is actually mounted.
-fn build_tray_menu<R: Runtime>(app: &AppHandle<R>, mounted: bool) -> tauri::Result<Menu<R>> {
-    let show_item = MenuItemBuilder::with_id("show", "ウィンドウを開く").build(app)?;
-    let unmount_item = MenuItemBuilder::with_id("unmount", "アンマウント")
+/// Build the tray menu in the given language, enabling the unmount / GPU tool
+/// items only while a disk is actually mounted.
+fn build_tray_menu<R: Runtime>(
+    app: &AppHandle<R>,
+    mounted: bool,
+    lang: &str,
+) -> tauri::Result<Menu<R>> {
+    let show_item = MenuItemBuilder::with_id("show", tr(lang, "show")).build(app)?;
+    let unmount_item = MenuItemBuilder::with_id("unmount", tr(lang, "unmount"))
         .enabled(mounted)
         .build(app)?;
-    let hash_item = MenuItemBuilder::with_id("hash", "ファイルのハッシュ計算")
+    let hash_item = MenuItemBuilder::with_id("hash", tr(lang, "hash"))
         .enabled(mounted)
         .build(app)?;
-    let archive_item = MenuItemBuilder::with_id("archive", "ファイル圧縮（nvCOMP）")
+    let archive_item = MenuItemBuilder::with_id("archive", tr(lang, "archive"))
         .enabled(mounted && vramdisk::nvcomp::nvcomp_available())
         .build(app)?;
-    let quit_item = MenuItemBuilder::with_id("quit", "終了").build(app)?;
+    let encode_item = MenuItemBuilder::with_id("encode", tr(lang, "encode"))
+        .enabled(mounted)
+        .build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", tr(lang, "quit")).build(app)?;
     MenuBuilder::new(app)
-        .items(&[&show_item, &unmount_item, &hash_item, &archive_item])
+        .items(&[&show_item, &unmount_item, &hash_item, &archive_item, &encode_item])
         .separator()
         .item(&quit_item)
         .build()
@@ -94,12 +161,19 @@ fn build_tray_menu<R: Runtime>(app: &AppHandle<R>, mounted: bool) -> tauri::Resu
 /// triggered from the UI or the tray.
 pub(crate) fn on_mount_state_changed(app: &AppHandle, manager: &Manager) {
     let status = manager.status();
+    refresh_tray_menu(app, status.is_some());
+    let _ = app.emit(EVENT_MOUNT_CHANGED, status);
+}
+
+/// Rebuild the tray menu for the current language and the given mount state.
+/// Also called by `set_ui_language` when the user switches languages.
+pub(crate) fn refresh_tray_menu(app: &AppHandle, mounted: bool) {
+    let lang = app_language(app);
     if let Some(tray) = app.tray_by_id("vramdisk-tray") {
-        if let Ok(menu) = build_tray_menu(app, status.is_some()) {
+        if let Ok(menu) = build_tray_menu(app, mounted, &lang) {
             let _ = tray.set_menu(Some(menu));
         }
     }
-    let _ = app.emit(EVENT_MOUNT_CHANGED, status);
 }
 
 /// After a successful mount: hide the main window (the tray keeps it
@@ -110,8 +184,9 @@ pub(crate) fn after_mount_success(app: &AppHandle, mount_point: &str) {
         let _ = win.hide();
     }
     let path = format!("{mount_point}\\");
+    let lang = app_language(app);
     app.dialog()
-        .message("マウントしました。\nタスクトレイから操作できます。")
+        .message(tr(&lang, "mounted_msg"))
         .kind(MessageDialogKind::Info)
         .title("VRAMDISK")
         .show(move |_| {
@@ -164,7 +239,10 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(manager)
         .manage(cli_seed)
+        .manage(UiLang(Mutex::new(detect_language())))
         .invoke_handler(tauri::generate_handler![
+            commands::get_ui_language,
+            commands::set_ui_language,
             commands::list_gpus,
             commands::list_free_drives,
             commands::browse_folder,
@@ -179,10 +257,15 @@ fn main() {
             commands::hash_job,
             commands::archive_compress_job,
             commands::archive_extract_job,
+            commands::encode_job,
+            commands::job_status,
+            commands::job_result,
+            commands::job_cancel,
         ])
         .setup(|app| {
             // --- System tray (starts unmounted: a fresh process owns no mount yet) ---
-            let menu = build_tray_menu(app.handle(), false)?;
+            let lang = app_language(app.handle());
+            let menu = build_tray_menu(app.handle(), false, &lang)?;
 
             TrayIconBuilder::with_id("vramdisk-tray")
                 .icon(app.default_window_icon().unwrap().clone())
@@ -206,6 +289,10 @@ fn main() {
                     "archive" => {
                         show_main_window(app);
                         let _ = app.emit(EVENT_OPEN_ARCHIVE_PANEL, ());
+                    }
+                    "encode" => {
+                        show_main_window(app);
+                        let _ = app.emit(EVENT_OPEN_ENCODE_PANEL, ());
                     }
                     "quit" => {
                         let mounted = app
@@ -253,9 +340,10 @@ fn main() {
                             let _ = win.hide();
                         }
                         if !hinted.swap(true, Ordering::SeqCst) {
+                            let lang = app_language(&handle);
                             handle
                                 .dialog()
-                                .message(CLOSE_HINT)
+                                .message(tr(&lang, "close_hint"))
                                 .kind(MessageDialogKind::Info)
                                 .title("VRAMDISK")
                                 .show(|_| {});
