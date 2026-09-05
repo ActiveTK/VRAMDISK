@@ -142,7 +142,32 @@ $runTag = Get-Date -Format 'HHmmss'
 function JobId($name) { "e2e-$runTag-$name" }
 
 Write-Host "Mounting $root via $Exe (size $Size) ..." -ForegroundColor Cyan
-$proc = Start-Process -FilePath $Exe -ArgumentList @('cli', '--mount', "$root", '--size', $Size) -PassThru -WindowStyle Hidden
+# Start the mount with stdin redirected so it can be stopped *gracefully*.
+# `Stop-Process -Force` is TerminateProcess: no cleanup runs, and a terminated
+# WinFsp host can leave its volume device behind -- the drive letter then
+# answers no I/O and cannot be reused until the machine reboots.
+function Start-Mount([string]$exe, [string[]]$mountArgs) {
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    foreach ($a in $mountArgs) { [void]$psi.ArgumentList.Add($a) }
+    $psi.RedirectStandardInput = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    [Diagnostics.Process]::Start($psi)
+}
+
+# Ask the mount to unmount (the CLI stops on Enter), and only fall back to a
+# hard kill if it will not go.
+function Stop-Mount($proc) {
+    if ($null -eq $proc -or $proc.HasExited) { return }
+    try { $proc.StandardInput.WriteLine(); $proc.StandardInput.Flush() } catch { }
+    if (-not $proc.WaitForExit(20000)) {
+        Write-Host "  mount did not stop on request; forcing" -ForegroundColor Yellow
+        try { $proc.Kill() } catch { }
+    }
+}
+
+$proc = Start-Mount $Exe @('cli', '--mount', "$root", '--size', $Size)
 
 try {
     # Wait for the volume to appear.
@@ -544,7 +569,7 @@ finally {
     # Nothing is written outside the mount, so unmounting is the whole cleanup:
     # every temp file this script made lives on the volume being torn down.
     Write-Host "`nUnmounting (stop pid $($proc.Id)) ..." -ForegroundColor Cyan
-    if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+    Stop-Mount $proc
     Start-Sleep -Milliseconds 800
     $largeBytes = $null
     [GC]::Collect()

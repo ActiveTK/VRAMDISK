@@ -192,7 +192,31 @@ Write-Host "Measuring RAM disk at $RamDisk ..." -ForegroundColor Cyan
 $ram = Measure-Target $RamDisk "RAM disk"
 
 Write-Host "Mounting VRAMDISK ($Size) at $Drive ..." -ForegroundColor Cyan
-$proc = Start-Process -FilePath $Exe -ArgumentList @('cli', '--mount', $Drive, '--size', $Size) -PassThru -WindowStyle Hidden
+# Start the mount with stdin redirected so it can be stopped *gracefully*.
+# `Stop-Process -Force` is TerminateProcess: no cleanup runs, and a terminated
+# WinFsp host can leave its volume device behind -- the drive letter then
+# answers no I/O and cannot be reused until the machine reboots.
+function Start-Mount([string]$exe, [string[]]$mountArgs) {
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    foreach ($a in $mountArgs) { [void]$psi.ArgumentList.Add($a) }
+    $psi.RedirectStandardInput = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    [Diagnostics.Process]::Start($psi)
+}
+
+# Ask the mount to unmount (the CLI stops on Enter), and only fall back to a
+# hard kill if it will not go.
+function Stop-Mount($proc) {
+    if ($null -eq $proc -or $proc.HasExited) { return }
+    try { $proc.StandardInput.WriteLine(); $proc.StandardInput.Flush() } catch { }
+    if (-not $proc.WaitForExit(20000)) {
+        Write-Host "  mount did not stop on request; forcing" -ForegroundColor Yellow
+        try { $proc.Kill() } catch { }
+    }
+}
+$proc = Start-Mount $Exe @('cli', '--mount', $Drive, '--size', $Size)
 try {
     $ready = $false
     for ($i = 0; $i -lt 120; $i++) {
@@ -204,7 +228,7 @@ try {
     Write-Host "Measuring VRAMDISK at $Drive ..." -ForegroundColor Cyan
     $vram = Measure-Target "$Drive\" "VRAMDISK"
 } finally {
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Stop-Mount $proc
 }
 
 Write-Host "`n=== Sequential throughput (best of 3, $([math]::Round($FileBytes/1GB,1)) GiB file) ===" -ForegroundColor Cyan

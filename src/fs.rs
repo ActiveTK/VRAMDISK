@@ -2480,25 +2480,61 @@ pub fn mount(engine: StorageEngine, mount: &str, label: &str) -> anyhow::Result<
 }
 
 /// Mount the engine as a WinFsp volume and block until the user unmounts.
+/// Set when the user asks the CLI mount to stop, from either the console
+/// control handler or the stdin watcher.
+static CLI_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// Set once the volume is actually down, so the control handler can wait for
+/// the unmount instead of letting Windows kill us mid-teardown.
+static CLI_UNMOUNTED: AtomicBool = AtomicBool::new(false);
+
+/// Console control handler: Ctrl-C, Ctrl-Break, console close, logoff, shutdown.
+///
+/// Returning from this callback lets Windows terminate the process, and a
+/// terminated WinFsp host can leave its volume device behind -- the drive
+/// letter then answers no I/O and cannot be reused until reboot. So it asks the
+/// main thread to unmount and waits (bounded) for that to finish.
+unsafe extern "system" fn cli_ctrl_handler(_ctrl_type: u32) -> windows::core::BOOL {
+    CLI_SHUTDOWN.store(true, Ordering::Release);
+    for _ in 0..200 {
+        if CLI_UNMOUNTED.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    windows::core::BOOL(1)
+}
+
 pub fn run(engine: StorageEngine, mount_point: &str, label: &str) -> anyhow::Result<()> {
     let mounted = mount(engine, mount_point, label)?;
-    println!("\nMounted at {mount_point}. Press Enter (or Ctrl-C / kill the process) to unmount.");
+    println!(
+        "
+Mounted at {mount_point}. Press Enter (or Ctrl-C) to unmount."
+    );
 
-    // Wait for the user to press Enter. A bare EOF (e.g. launched with no
-    // attached console) is ignored so the mount stays up until the process is
-    // killed; WinFsp tears the volume down on process exit either way.
-    use std::io::BufRead;
-    let mut line = String::new();
-    if let Ok(0) = std::io::stdin().lock().read_line(&mut line) {
-        // EOF (no console attached): park forever and rely on Ctrl-C, a kill,
-        // or the tray "unmount" to stop us. Returning here instead would tear
-        // the volume down the instant a detached process started.
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
+    // Best effort: without it a Ctrl-C still unmounts on most paths, but the
+    // console-close and shutdown cases would not.
+    unsafe {
+        let _ =
+            windows::Win32::System::Console::SetConsoleCtrlHandler(Some(cli_ctrl_handler), true);
+    }
+
+    // Enter on stdin also stops us. A bare EOF (launched with no console) is
+    // ignored so the mount stays up until a signal arrives -- returning there
+    // would tear the volume down the instant a detached process started.
+    std::thread::spawn(|| {
+        use std::io::BufRead;
+        let mut line = String::new();
+        if !matches!(std::io::stdin().lock().read_line(&mut line), Ok(0)) {
+            CLI_SHUTDOWN.store(true, Ordering::Release);
         }
+    });
+
+    while !CLI_SHUTDOWN.load(Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     mounted.unmount();
+    CLI_UNMOUNTED.store(true, Ordering::Release);
     println!("Unmounted.");
     Ok(())
 }
