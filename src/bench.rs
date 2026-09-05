@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
+use crate::api_kernel::ApiKernel;
 use crate::cli::format_size;
 use crate::cuda::Vram;
 use crate::engine::StorageEngine;
@@ -56,6 +57,7 @@ pub fn run(device: usize, vram_size: u64) -> Result<()> {
     bench_engine_compress(device)?;
     bench_compression(device)?;
     bench_hash(device)?;
+    bench_search(device)?;
 
     println!("Benchmark complete.");
     Ok(())
@@ -916,6 +918,144 @@ fn bench_compression(device: usize) -> Result<()> {
 }
 
 // ─── [4] GPU FNV-1a hash (dedup path) ────────────────────────────────────────
+
+/// Full-text search: the GPU against an optimized CPU scan of the same bytes.
+///
+/// The CPU side is not a strawman -- it is the same first-byte-filter loop a
+/// good grep uses, over data already in host RAM, with no I/O in the timed
+/// region. That is the fairest stand-in for "grep on a RAM disk", which is what
+/// VRAMDISK is really competing with.
+fn bench_search(device: usize) -> Result<()> {
+    const MIB: u64 = 1024 * 1024;
+    let payload = 512 * MIB;
+
+    println!(
+        "[5] Full-Text Search  ({} payload, avg of {RUNS} runs)",
+        format_size(payload)
+    );
+
+    let vram_size = payload + CHUNK_SIZE;
+    let mut vram = Vram::new(device, vram_size)?;
+    let base = vram.buf_device_ptr();
+    let mut kernel = ApiKernel::new(&vram)?;
+
+    // Log-like text with a rare marker and a frequent word, so both the
+    // needle-in-a-haystack and the many-hits cases are covered.
+    let unit =
+        b"2026-09-06T00:00:00Z INFO  request path=/api/v1/items status=200 dur=12ms" as &[u8];
+    let mut host = Vec::with_capacity(payload as usize);
+    while (host.len() as u64) < payload {
+        let take = ((payload - host.len() as u64) as usize).min(unit.len());
+        host.extend_from_slice(&unit[..take]);
+    }
+    let marker = b"XXRAREMARKERXX";
+    let at = host.len() - 4096;
+    host[at..at + marker.len()].copy_from_slice(marker);
+    vram.write_at(0, &host)?;
+
+    println!("    Pattern              CPU scan       GPU scan    Speedup   Matches");
+    println!("    {}", "-".repeat(66));
+    for (label, needle) in [
+        ("rare (14 B)", &marker[..]),
+        ("common (10 B)", b"status=200" as &[u8]),
+        ("short (3 B)", b"api" as &[u8]),
+    ] {
+        // Warm-up, and a correctness check: a benchmark that disagrees with the
+        // reference is measuring the wrong thing.
+        let want = cpu_search_count(&host, needle);
+        let first = kernel.search(base, payload, needle, false, 0)?;
+        anyhow::ensure!(
+            first.total == want,
+            "GPU search found {} matches for {label}, CPU found {want}",
+            first.total
+        );
+
+        let mut cpu = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let t = Instant::now();
+            let n = cpu_search_count(&host, needle);
+            std::hint::black_box(n);
+            cpu.push(t.elapsed());
+        }
+        let mut gpu = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let t = Instant::now();
+            kernel.search(base, payload, needle, false, 0)?;
+            gpu.push(t.elapsed());
+        }
+        let (c, g) = (avg(&cpu), avg(&gpu));
+        println!(
+            "    {label:<16} {:>12} {:>14} {:>9.1}x {:>9}",
+            throughput(payload, c),
+            throughput(payload, g),
+            c.as_secs_f64() / g.as_secs_f64(),
+            want
+        );
+    }
+    // End to end through the engine: the job path the GUI actually uses, which
+    // adds a device-to-device staging copy per window on top of the scan above.
+    // Reported separately rather than instead, because the two answer different
+    // questions -- what the kernel can do, and what a user gets.
+    {
+        let vram = Vram::new(device, payload + 8 * CHUNK_SIZE)?;
+        let mut engine = StorageEngine::new(vram, false, false)?;
+        engine.table_mut().create_file("\\bench", 0).unwrap();
+        engine
+            .write("\\bench", 0, &host)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let paths = vec!["\\bench".to_string()];
+        let needle = b"status=200" as &[u8];
+        engine
+            .search_files_gpu_cancellable(&paths, needle, false, 1, |_, _| false)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mut t_all = Vec::with_capacity(RUNS);
+        let mut found = 0u64;
+        for _ in 0..RUNS {
+            let t = Instant::now();
+            let stats = engine
+                .search_files_gpu_cancellable(&paths, needle, false, 1, |_, _| false)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            t_all.push(t.elapsed());
+            found = stats.total_matches;
+        }
+        println!(
+            "    {:<16} {:>12} {:>14} {:>10} {:>9}",
+            "end to end",
+            "-",
+            throughput(payload, avg(&t_all)),
+            "",
+            found
+        );
+    }
+
+    println!();
+    Ok(())
+}
+
+/// First-byte filter then compare -- what a vectorized CPU matcher reduces to,
+/// and the baseline the GPU has to beat.
+fn cpu_search_count(hay: &[u8], needle: &[u8]) -> u64 {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    let (first, last) = (needle[0], needle[needle.len() - 1]);
+    let mut count = 0u64;
+    let mut i = 0usize;
+    let end = hay.len() - needle.len();
+    while i <= end {
+        match hay[i..=end].iter().position(|&b| b == first) {
+            None => break,
+            Some(off) => {
+                i += off;
+                if hay[i + needle.len() - 1] == last && &hay[i..i + needle.len()] == needle {
+                    count += 1;
+                }
+                i += 1;
+            }
+        }
+    }
+    count
+}
 
 fn bench_hash(device: usize) -> Result<()> {
     const CHUNKS: usize = 256;

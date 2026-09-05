@@ -3923,9 +3923,21 @@ impl StorageEngine {
             let src_pos = src_offset + done;
             let src_lc = (src_pos / CHUNK_SIZE) as usize;
             let src_in = src_pos % CHUNK_SIZE;
-            let take = (len - done).min(CHUNK_SIZE - src_in);
+            let mut take = (len - done).min(CHUNK_SIZE - src_in);
             let src_ptr = match self.coord(src_path, src_lc) {
                 Some(Placement::Raw { chunk }) => {
+                    // Physically adjacent chunks become one transfer. Copying a
+                    // chunk at a time meant 64 KiB per device memcpy *and* a
+                    // stream sync per chunk inside `write_device_bytes`, which
+                    // is what made staging a large file cost hundreds of
+                    // milliseconds instead of a few.
+                    take = self.raw_run_bytes(
+                        src_path,
+                        src_pos,
+                        take as usize,
+                        (len - done) as usize,
+                        chunk,
+                    ) as u64;
                     self.vram_base + chunk as u64 * CHUNK_SIZE + src_in
                 }
                 Some(Placement::Compressed {
@@ -4168,8 +4180,13 @@ impl StorageEngine {
             let pos = offset + done;
             let lc = (pos / CHUNK_SIZE) as usize;
             let in_off = pos % CHUNK_SIZE;
-            let take = (len - done).min(CHUNK_SIZE - in_off);
+            let mut take = (len - done).min(CHUNK_SIZE - in_off);
             let chunk = self.ensure_raw_output_chunk(path, lc)?;
+            // Extend across destination chunks that are already allocated and
+            // physically adjacent -- the usual case for a freshly allocated
+            // contiguous output file, which turns 8192 device memcpys into one.
+            take =
+                self.raw_run_bytes(path, pos, take as usize, (len - done) as usize, chunk) as u64;
             cuda(self.vram.copy_dev_into(
                 chunk as u64 * CHUNK_SIZE + in_off,
                 src_ptr + done,
@@ -5796,6 +5813,114 @@ impl StorageEngine {
         })
     }
 
+    /// Every physically contiguous raw run backing `[0, size)` of `path`, or
+    /// `None` when any of it is compressed or a sparse hole.
+    ///
+    /// `None` sends the caller to the staging path, which handles those
+    /// uniformly. Holes are excluded rather than skipped because a needle of
+    /// all-zero bytes really can match inside one, and getting that subtly
+    /// wrong is worse than materializing the file.
+    fn raw_runs(&self, path: &str, size: u64) -> Option<Vec<(u64, u64, u64)>> {
+        if size == 0 {
+            return Some(Vec::new());
+        }
+        let mut runs: Vec<(u64, u64, u64)> = Vec::new();
+        let mut pos = 0u64;
+        while pos < size {
+            let lc = (pos / CHUNK_SIZE) as usize;
+            let take = (size - pos).min(CHUNK_SIZE);
+            let chunk = match self.coord(path, lc)? {
+                Placement::Raw { chunk } => chunk,
+                Placement::Compressed { .. } => return None,
+            };
+            let ptr = self.vram_base + chunk as u64 * CHUNK_SIZE;
+            match runs.last_mut() {
+                Some((_, last_ptr, last_len)) if *last_ptr + *last_len == ptr => {
+                    *last_len += take;
+                }
+                _ => runs.push((pos, ptr, take)),
+            }
+            pos += take;
+        }
+        Some(runs)
+    }
+
+    /// Scan `runs` in place, stitching each run boundary on the host.
+    ///
+    /// A run's kernel launch finds every match starting at or before
+    /// `run.end - needle.len()`. The few candidate starts left over -- the last
+    /// `needle.len() - 1` positions of a run -- span into the next run, which is
+    /// somewhere else in VRAM entirely. Those are at most a few hundred bytes,
+    /// so they are read back and matched on the host rather than staged.
+    fn search_raw_runs<F>(
+        &mut self,
+        path: &str,
+        runs: &[(u64, u64, u64)],
+        plan: &SearchPlan<'_>,
+        done: &mut u64,
+        progress: &mut F,
+    ) -> EResult<(u64, Vec<u64>, bool)>
+    where
+        F: FnMut(u64, u64) -> bool,
+    {
+        let SearchPlan {
+            needle,
+            ignore_case,
+            max_offsets_per_file: max_offsets,
+            total_bytes,
+            ..
+        } = *plan;
+        let overlap = needle.len() as u64 - 1;
+        let mut matches = 0u64;
+        let mut offsets: Vec<u64> = Vec::new();
+        let mut truncated = false;
+        let push = |off: u64, offsets: &mut Vec<u64>, truncated: &mut bool| {
+            if offsets.len() < max_offsets {
+                offsets.push(off);
+            } else {
+                *truncated = true;
+            }
+        };
+
+        for (i, &(file_off, ptr, len)) in runs.iter().enumerate() {
+            if progress(*done, total_bytes) {
+                return cancelled();
+            }
+            if len >= needle.len() as u64 {
+                let launch = {
+                    let kernel = self.api_kernel()?;
+                    cuda(kernel.search(ptr, len, needle, ignore_case, file_off))?
+                };
+                matches = matches.saturating_add(launch.total);
+                for off in launch.offsets {
+                    push(off, &mut offsets, &mut truncated);
+                }
+            }
+            *done = done.saturating_add(len);
+
+            // Candidates straddling the seam into the next run.
+            if overlap > 0 && i + 1 < runs.len() {
+                let seam_start = (file_off + len).saturating_sub(overlap);
+                let seam_len = (overlap * 2).min(runs[i + 1].0 + runs[i + 1].2 - seam_start);
+                let bytes = self.read(path, seam_start, seam_len as usize)?;
+                for (at, w) in bytes.windows(needle.len()).enumerate() {
+                    let hit = if ignore_case {
+                        w.iter().zip(needle).all(|(a, b)| a.eq_ignore_ascii_case(b))
+                    } else {
+                        w == needle
+                    };
+                    // Only starts the run's own launch could not reach.
+                    if hit && (at as u64) < overlap {
+                        matches += 1;
+                        push(seam_start + at as u64, &mut offsets, &mut truncated);
+                    }
+                }
+            }
+        }
+        truncated = truncated || (offsets.len() as u64) < matches;
+        Ok((matches, offsets, truncated))
+    }
+
     fn search_inner<F>(
         &mut self,
         paths: &[String],
@@ -5822,6 +5947,27 @@ impl StorageEngine {
         let mut done = 0u64;
 
         for (path, &size) in paths.iter().zip(sizes.iter()) {
+            // Fast path: a file whose data is entirely raw can be scanned where
+            // it already lies in VRAM. Staging it into a contiguous window
+            // first costs a full device-to-device copy of the file, which
+            // dominates the scan itself by an order of magnitude.
+            if let Some(runs) = self.raw_runs(path, size) {
+                let (file_matches, offsets, truncated) =
+                    self.search_raw_runs(path, &runs, plan, &mut done, progress)?;
+                if file_matches > 0 {
+                    files_matched += 1;
+                    total_matches = total_matches.saturating_add(file_matches);
+                    let mut offsets = offsets;
+                    offsets.sort_unstable();
+                    hits.push(SearchHit {
+                        path: path.clone(),
+                        matches: file_matches,
+                        offsets,
+                        truncated,
+                    });
+                }
+                continue;
+            }
             let mut pos = 0u64;
             let mut file_matches = 0u64;
             let mut offsets: Vec<u64> = Vec::new();
@@ -9421,5 +9567,61 @@ mod tests {
             }),
             Err(EngineError::Cancelled)
         ));
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn search_stitches_matches_across_physical_run_boundaries() {
+        // The in-place fast path scans each physically contiguous run with its
+        // own launch, so a match straddling two runs is found only by the host
+        // stitch. Fragment a file on purpose and put a needle on every seam.
+        let mut e = engine(32, false);
+        e.table_mut().create_file("\\a.bin", 0).unwrap();
+        e.table_mut().create_file("\\b.bin", 0).unwrap();
+        // Interleaved appends push the two files' chunks apart from each other.
+        let block = vec![b'.'; CHUNK_SIZE as usize];
+        for i in 0..24u64 {
+            e.write("\\a.bin", i * CHUNK_SIZE, &block).unwrap();
+            e.write("\\b.bin", i * CHUNK_SIZE, &block).unwrap();
+        }
+        let size = e.file_size("\\a.bin").unwrap();
+        let runs = e.raw_runs("\\a.bin", size).expect("all raw");
+        assert!(
+            runs.len() > 1,
+            "test needs a fragmented file, got {} run(s)",
+            runs.len()
+        );
+
+        let needle = b"SEAM";
+        for w in runs.windows(2) {
+            let end = w[0].0 + w[0].2;
+            e.write("\\a.bin", end - 2, needle).unwrap();
+        }
+        // One match wholly inside a run, as a control.
+        e.write("\\a.bin", 100, needle).unwrap();
+
+        let data = e.read("\\a.bin", 0, size as usize).unwrap();
+        let want = search_reference(&data, needle, false);
+        assert_eq!(
+            want.len(),
+            runs.len(),
+            "fixture should place one per seam + 1"
+        );
+
+        let stats = e
+            .search_files_gpu_cancellable(
+                &["\\a.bin".to_string()],
+                needle,
+                false,
+                usize::MAX,
+                |_, _| false,
+            )
+            .unwrap();
+        assert_eq!(
+            stats.total_matches,
+            want.len() as u64,
+            "seam matches counted once"
+        );
+        assert_eq!(stats.hits[0].offsets, want, "seam match offsets");
     }
 }
