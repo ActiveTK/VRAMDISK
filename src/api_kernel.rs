@@ -812,6 +812,7 @@ impl ApiKernel {
         needle: &[u8],
         fold_case: bool,
         base_offset: u64,
+        want_offsets: usize,
     ) -> Result<SearchLaunch> {
         anyhow::ensure!(!needle.is_empty(), "search pattern must not be empty");
         anyhow::ensure!(
@@ -873,7 +874,11 @@ impl ApiKernel {
         let mut count = [0u64; 1];
         self.stream.memcpy_dtoh(&self.hit_count_d, &mut count)?;
         let total = count[0];
-        let kept = (total.min(SEARCH_HIT_CAP as u64)) as usize;
+        // Only copy back what the caller will actually keep. A pattern with
+        // millions of hits fills the whole buffer every launch, and copying and
+        // sorting 64 Ki offsets that are about to be discarded costs more than
+        // the scan itself.
+        let kept = total.min(SEARCH_HIT_CAP as u64).min(want_offsets as u64) as usize;
         let mut offsets = vec![0u64; kept];
         if kept > 0 {
             let view = self.hits_d.slice(0..kept);

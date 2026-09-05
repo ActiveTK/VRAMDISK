@@ -5783,13 +5783,10 @@ impl StorageEngine {
             .search_window_bytes
             .min((free_bytes / 2) / CHUNK_SIZE * CHUNK_SIZE)
             .max(CHUNK_SIZE);
+        // The staging window is allocated lazily: a volume of ordinary raw
+        // files never needs it, and reserving 64 MiB (and freeing it again) on
+        // every search cost an order of magnitude more than the scan itself.
         let staging = format!("\\.__vramdisk_search_tmp_{}", crate::lookup::now_filetime());
-        self.create_or_truncate_file(&staging)?;
-        self.allocate_raw_file(&staging, window)
-            .map_err(|err| match err {
-                EngineError::NoSpace => archive_vram_exhausted("stage a search window"),
-                other => other,
-            })?;
         let plan = SearchPlan {
             needle,
             ignore_case,
@@ -5889,7 +5886,7 @@ impl StorageEngine {
             if len >= needle.len() as u64 {
                 let launch = {
                     let kernel = self.api_kernel()?;
-                    cuda(kernel.search(ptr, len, needle, ignore_case, file_off))?
+                    cuda(kernel.search(ptr, len, needle, ignore_case, file_off, max_offsets))?
                 };
                 matches = matches.saturating_add(launch.total);
                 for off in launch.offsets {
@@ -5921,6 +5918,18 @@ impl StorageEngine {
         Ok((matches, offsets, truncated))
     }
 
+    /// Allocate the contiguous scratch window a staged scan needs, returning
+    /// its device address. Only reached by files the in-place path cannot serve.
+    fn open_search_staging(&mut self, staging: &str, window: u64) -> EResult<u64> {
+        self.create_or_truncate_file(staging)?;
+        self.allocate_raw_file(staging, window)
+            .map_err(|err| match err {
+                EngineError::NoSpace => archive_vram_exhausted("stage a search window"),
+                other => other,
+            })?;
+        self.contiguous_file_ptr(staging, window)
+    }
+
     fn search_inner<F>(
         &mut self,
         paths: &[String],
@@ -5939,7 +5948,7 @@ impl StorageEngine {
             window,
             total_bytes,
         } = *plan;
-        let base = self.contiguous_file_ptr(staging, window)?;
+        let mut staged_base: Option<u64> = None;
         let overlap = needle.len() as u64 - 1;
         let mut hits = Vec::new();
         let mut files_matched = 0u64;
@@ -5981,10 +5990,18 @@ impl StorageEngine {
                     done = done.saturating_add(take);
                     break;
                 }
+                let base = match staged_base {
+                    Some(base) => base,
+                    None => {
+                        let base = self.open_search_staging(staging, window)?;
+                        staged_base = Some(base);
+                        base
+                    }
+                };
                 self.copy_file_payload_raw(path, pos, staging, 0, take)?;
                 let launch = {
                     let kernel = self.api_kernel()?;
-                    cuda(kernel.search(base, take, needle, ignore_case, pos))?
+                    cuda(kernel.search(base, take, needle, ignore_case, pos, max_offsets_per_file))?
                 };
                 file_matches = file_matches.saturating_add(launch.total);
                 for off in launch.offsets {

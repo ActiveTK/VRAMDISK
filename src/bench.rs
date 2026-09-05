@@ -963,7 +963,7 @@ fn bench_search(device: usize) -> Result<()> {
         // Warm-up, and a correctness check: a benchmark that disagrees with the
         // reference is measuring the wrong thing.
         let want = cpu_search_count(&host, needle);
-        let first = kernel.search(base, payload, needle, false, 0)?;
+        let first = kernel.search(base, payload, needle, false, 0, 1)?;
         anyhow::ensure!(
             first.total == want,
             "GPU search found {} matches for {label}, CPU found {want}",
@@ -980,7 +980,7 @@ fn bench_search(device: usize) -> Result<()> {
         let mut gpu = Vec::with_capacity(RUNS);
         for _ in 0..RUNS {
             let t = Instant::now();
-            kernel.search(base, payload, needle, false, 0)?;
+            kernel.search(base, payload, needle, false, 0, 1)?;
             gpu.push(t.elapsed());
         }
         let (c, g) = (avg(&cpu), avg(&gpu));
