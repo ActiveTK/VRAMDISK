@@ -52,7 +52,7 @@ https://developer.nvidia.com/nvcomp-downloads?target_os=Windows&target_arch=x86_
 
 https://aka.ms/vc14/vc_redist.x64.exe
 
-### 「Cloud not find the WebView2 Runtime」と表示された場合
+### 「Could not find the WebView2 Runtime」と表示された場合
 
 以下から、WebView2ランタイムを導入してください。Evergreen Standalone Installerで大丈夫です。
 
