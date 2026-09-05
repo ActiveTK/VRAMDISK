@@ -21,7 +21,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::thread::{self, JoinHandle};
 
 use anyhow::Context as _;
@@ -155,7 +155,11 @@ pub struct VramDiskFs {
     jobs: Arc<JobRegistry>,
     job_worker: JobWorkerHandle,
     label: String,
-    default_security_descriptor: Mutex<Vec<u8>>,
+    /// Built once from [`default_security_sddl`] and never changed, so it is
+    /// handed out by reference. It used to sit behind a `Mutex` and be cloned
+    /// on every call -- an allocation and a copy on the security-check path,
+    /// which runs for every path resolution.
+    default_security_descriptor: OnceLock<Vec<u8>>,
     /// Weak refs to the path `Arc` of every currently-open handle.
     /// Used by `rename` to propagate directory renames to all descendants.
     /// Dead refs are pruned lazily on each `open`/`create` call.
@@ -164,8 +168,13 @@ pub struct VramDiskFs {
 
 impl VramDiskFs {
     pub fn new(engine: StorageEngine, label: impl Into<String>) -> Self {
-        let default_security_descriptor =
-            security_descriptor_from_sddl(default_security_sddl()).unwrap_or_default();
+        // Built eagerly so a malformed SDDL surfaces at mount rather than on
+        // the first security check. An empty result is left uncached so the
+        // accessor retries and can report the error properly.
+        let default_security_descriptor = OnceLock::new();
+        if let Ok(sd) = security_descriptor_from_sddl(default_security_sddl()) {
+            let _ = default_security_descriptor.set(sd);
+        }
         let engine = Arc::new(RwLock::new(engine));
         let jobs = Arc::new(JobRegistry::default());
         let job_worker = JobWorkerHandle::spawn(engine.clone(), jobs.clone());
@@ -174,7 +183,7 @@ impl VramDiskFs {
             jobs,
             job_worker,
             label: label.into(),
-            default_security_descriptor: Mutex::new(default_security_descriptor),
+            default_security_descriptor,
             open_paths: Mutex::new(Vec::new()),
         }
     }
@@ -222,15 +231,14 @@ impl VramDiskFs {
         self.open_paths.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn default_security_descriptor(&self) -> winfsp::Result<Vec<u8>> {
-        let mut cached = self
-            .default_security_descriptor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if cached.is_empty() {
-            *cached = security_descriptor_from_sddl(default_security_sddl())?;
+    fn default_security_descriptor(&self) -> winfsp::Result<&[u8]> {
+        if let Some(sd) = self.default_security_descriptor.get() {
+            return Ok(sd);
         }
-        Ok(cached.clone())
+        // Built outside `get_or_init` so a failure propagates instead of being
+        // swallowed into a poisoned/empty cache.
+        let built = security_descriptor_from_sddl(default_security_sddl())?;
+        Ok(self.default_security_descriptor.get_or_init(|| built))
     }
 
     /// Allocate a normalized path `Arc`, register a `Weak` ref in
@@ -238,7 +246,15 @@ impl VramDiskFs {
     fn register_path(&self, normalized: String) -> Arc<Mutex<String>> {
         let arc = Arc::new(Mutex::new(normalized));
         let mut slots = self.open_paths();
-        slots.retain(|w| w.upgrade().is_some()); // prune closed handles
+        // Pruning walks the whole vector, and this runs on every open, so
+        // sweeping unconditionally made an open cost O(number of live handles)
+        // -- quadratic across a workload that opens many files at once, like a
+        // build tree. Sweep only when the vector is about to grow instead:
+        // that is amortized O(1) per open, and the sweep is what keeps it from
+        // growing at all while handles are being closed.
+        if slots.len() == slots.capacity() {
+            slots.retain(|w| w.strong_count() > 0);
+        }
         slots.push(Arc::downgrade(&arc));
         arc
     }
@@ -474,11 +490,14 @@ fn fill_internal_file_info(entry: &InternalEntry, content_len: Option<u64>, info
     info.ea_size = 0;
 }
 
-fn node_security_descriptor(fs: &VramDiskFs, node: &Node) -> winfsp::Result<Vec<u8>> {
+/// The security descriptor to report for `node`, borrowed from either the node
+/// itself or the shared default. Deliberately not cloned: this runs on every
+/// path resolution.
+fn node_security_descriptor<'a>(fs: &'a VramDiskFs, node: &'a Node) -> winfsp::Result<&'a [u8]> {
     if node.security_descriptor.is_empty() {
         fs.default_security_descriptor()
     } else {
-        Ok(node.security_descriptor.clone())
+        Ok(&node.security_descriptor)
     }
 }
 
@@ -678,6 +697,7 @@ fn execute_job_descriptor(
         }
         "archive.extract" | "extract.archive" => execute_archive_extract_job(id, &v, jobs, engine),
         "encode" | "encode.file" => execute_encode_job(id, &v, jobs, engine),
+        "search" | "search.content" | "grep" => execute_search_job(id, &v, jobs, engine),
         _ => Err(JobExecutionError::Failed(
             "no GPU executor registered for requested operation".to_string(),
         )),
@@ -820,6 +840,140 @@ fn execute_archive_extract_job(
     })
     .to_string()
         + "\r\n")
+}
+
+/// Default number of match offsets reported per file. Counts are always exact;
+/// this only bounds how many positions come back, so one pathological file
+/// cannot produce a megabyte of JSON.
+const SEARCH_DEFAULT_MAX_OFFSETS: usize = 64;
+
+fn execute_search_job(
+    id: &str,
+    descriptor: &serde_json::Value,
+    jobs: &JobRegistry,
+    engine: &Arc<RwLock<StorageEngine>>,
+) -> Result<String, JobExecutionError> {
+    // The pattern is either text or, for binary needles, hex.
+    let (needle, pattern_text) = match (
+        descriptor.get("pattern").and_then(|v| v.as_str()),
+        descriptor.get("pattern_hex").and_then(|v| v.as_str()),
+    ) {
+        (Some(p), _) => (p.as_bytes().to_vec(), p.to_string()),
+        (None, Some(h)) => {
+            let bytes = decode_hex_pattern(h)
+                .ok_or_else(|| JobExecutionError::Failed("pattern_hex is not valid hex".into()))?;
+            (bytes, format!("hex:{h}"))
+        }
+        (None, None) => {
+            return Err(JobExecutionError::Failed(
+                "search job requires pattern or pattern_hex".to_string(),
+            ))
+        }
+    };
+    let ignore_case = descriptor
+        .get("ignore_case")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let recursive = descriptor
+        .get("recursive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let max_offsets = descriptor
+        .get("max_offsets")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(SEARCH_DEFAULT_MAX_OFFSETS);
+
+    // Unlike the other job families, an omitted path means "the whole
+    // volume": searching everything is the common case, and making the
+    // caller spell the root would be ceremony.
+    let roots =
+        descriptor_paths(descriptor, "path", "paths").unwrap_or_else(|_| vec!["\\".to_string()]);
+    let mut targets = BTreeSet::new();
+    {
+        let engine = read_shared_engine(engine);
+        for root in roots {
+            check_job_cancelled(id, jobs)?;
+            collect_hash_targets(&engine, &root, recursive, &mut targets)
+                .map_err(JobExecutionError::Failed)?;
+        }
+    }
+    let paths: Vec<String> = targets.into_iter().collect();
+    if paths.is_empty() {
+        return Err(JobExecutionError::Failed(
+            "search resolved no files".to_string(),
+        ));
+    }
+
+    let stats = {
+        let mut engine = lock_shared_engine(engine);
+        engine
+            .search_files_gpu_cancellable(
+                &paths,
+                &needle,
+                ignore_case,
+                max_offsets,
+                job_progress_sink(jobs, id),
+            )
+            .map_err(|e| map_job_engine_error("GPU search failed", e))?
+    };
+
+    let files: Vec<serde_json::Value> = stats
+        .hits
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "path": h.path,
+                "matches": h.matches,
+                "offsets": h.offsets,
+                "offsets_truncated": h.truncated,
+            })
+        })
+        .collect();
+    let throughput = if stats.elapsed_ms == 0 {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(
+            (stats.bytes_scanned as f64 / 1048576.0) / (stats.elapsed_ms as f64 / 1000.0)
+        )
+    };
+    Ok(serde_json::json!({
+        "id": id,
+        "state": JobState::Succeeded.as_str(),
+        "ok": true,
+        "op": "search",
+        "pattern": pattern_text,
+        "pattern_bytes": stats.pattern_len,
+        "ignore_case": stats.ignore_case,
+        "files_scanned": stats.files_scanned,
+        "files_matched": stats.files_matched,
+        "bytes_scanned": stats.bytes_scanned,
+        "total_matches": stats.total_matches,
+        "files": files,
+        "elapsed_ms": stats.elapsed_ms,
+        "throughput_mib_s": throughput,
+        "error": null,
+    })
+    .to_string()
+        + "
+")
+}
+
+/// Parse an even-length hex string into bytes, for searching binary needles
+/// that cannot be spelled in a JSON string.
+fn decode_hex_pattern(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    if text.is_empty() || text.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
 }
 
 fn execute_encode_job(
@@ -1318,7 +1472,7 @@ impl FileSystemContext for VramDiskFs {
         let engine = self.engine_shared();
         if let Some(entry) = internal_api::resolve(&path, &engine) {
             let sd = self.default_security_descriptor()?;
-            let copied = write_security_descriptor(&sd, security_descriptor)?;
+            let copied = write_security_descriptor(sd, security_descriptor)?;
             return Ok(FileSecurity {
                 reparse: false,
                 sz_security_descriptor: copied.size,
@@ -1331,7 +1485,7 @@ impl FileSystemContext for VramDiskFs {
         }
         let node = engine.get(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
         let sd = node_security_descriptor(self, node)?;
-        let copied = write_security_descriptor(&sd, security_descriptor)?;
+        let copied = write_security_descriptor(sd, security_descriptor)?;
         Ok(FileSecurity {
             reparse: false,
             sz_security_descriptor: copied.size,
@@ -1443,9 +1597,11 @@ impl FileSystemContext for VramDiskFs {
             engine.table_mut().create_file(&raw_path, file_attributes)
         }
         .map_err(map_lookup_err)?;
+        // The node owns its descriptor, so this is the one place the default
+        // genuinely has to be copied.
         node.security_descriptor = match _security_descriptor {
             Some(sd) => security_descriptor_from_void_slice(sd),
-            None => self.default_security_descriptor()?,
+            None => self.default_security_descriptor()?.to_vec(),
         };
         fill_file_info(node, file_info.as_mut());
         drop(engine);
@@ -1487,13 +1643,13 @@ impl FileSystemContext for VramDiskFs {
     ) -> winfsp::Result<u64> {
         if context.internal.is_some() {
             let sd = self.default_security_descriptor()?;
-            return Ok(write_security_descriptor(&sd, security_descriptor)?.size);
+            return Ok(write_security_descriptor(sd, security_descriptor)?.size);
         }
         let engine = self.engine_shared();
         let path = context.path();
         let node = engine.get(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
         let sd = node_security_descriptor(self, node)?;
-        Ok(write_security_descriptor(&sd, security_descriptor)?.size)
+        Ok(write_security_descriptor(sd, security_descriptor)?.size)
     }
 
     fn set_security(
@@ -1512,7 +1668,7 @@ impl FileSystemContext for VramDiskFs {
             node_security_descriptor(self, node)?
         };
         let updated = apply_security_descriptor_modification(
-            &current,
+            current,
             security_information,
             modification_descriptor,
         )?;
@@ -2267,6 +2423,20 @@ impl Drop for MountedVramDisk {
     }
 }
 
+/// How long WinFsp may serve cached metadata before asking us again, in ms.
+///
+/// Every miss is a full user-mode round trip (measured at ~14 us on this
+/// stack), and a `GetFileAttributesEx` on a cold path costs several of them.
+/// `FileInfoTimeout` alone was already set; the sibling timeouts were left at
+/// 0, meaning "never cache", so directory listings, volume queries and above
+/// all the per-open security checks paid that round trip every single time.
+///
+/// The cost of caching is staleness: an ACL or size change made through some
+/// other handle can take up to this long to be observed. One second is what
+/// the file-info cache already accepted, and it is the value WinFsp's own
+/// samples use.
+const METADATA_CACHE_MS: u32 = 1000;
+
 fn volume_params() -> VolumeParams {
     let mut vp = VolumeParams::new();
     vp.sector_size(512)
@@ -2274,7 +2444,11 @@ fn volume_params() -> VolumeParams {
         .max_component_length(255)
         .volume_creation_time(crate::lookup::now_filetime())
         .volume_serial_number(0x5652_414D) // "VRAM"
-        .file_info_timeout(1000)
+        .file_info_timeout(METADATA_CACHE_MS)
+        .dir_info_timeout(METADATA_CACHE_MS)
+        .volume_info_timeout(METADATA_CACHE_MS)
+        .security_timeout(METADATA_CACHE_MS)
+        .stream_info_timeout(METADATA_CACHE_MS)
         .case_sensitive_search(false)
         .case_preserved_names(true)
         .unicode_on_disk(true)

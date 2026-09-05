@@ -93,6 +93,7 @@ pub(crate) fn tr(lang: &str, key: &'static str) -> &'static str {
         "unmount" => if ja { "アンマウント" } else { "Unmount" },
         "hash" => if ja { "ファイルのハッシュ計算" } else { "Hash files" },
         "archive" => if ja { "ファイルの圧縮・展開" } else { "Compress / extract files" },
+        "search" => if ja { "ファイルの全文検索" } else { "Search file contents" },
         "encode" => if ja { "ファイルのエンコード（Base64 / hex）" } else { "Encode files (Base64 / hex)" },
         "quit" => if ja { "終了" } else { "Exit" },
         "close_hint" => if ja { "VRAMDISKはタスクトレイからアンマウントできます" } else { "VRAMDISK stays available in the system tray." },
@@ -196,6 +197,9 @@ const EVENT_OPEN_HASH_PANEL: &str = "open-hash-panel";
 
 /// Emitted when the user asks (via tray) to open the GPU encode panel.
 const EVENT_OPEN_ENCODE_PANEL: &str = "open-encode-panel";
+
+/// Emitted when the user asks (via tray) to open the GPU search panel.
+const EVENT_OPEN_SEARCH_PANEL: &str = "open-search-panel";
 
 /// Emitted when the tray asks the window to run the teardown prompt. The
 /// payload is the intent — "unmount" or "quit" — because the two differ only
@@ -314,12 +318,22 @@ fn build_tray_menu<R: Runtime>(
     let archive_item = MenuItemBuilder::with_id("archive", tr(lang, "archive"))
         .enabled(mounted && vramdisk::nvcomp::nvcomp_available())
         .build(app)?;
+    let search_item = MenuItemBuilder::with_id("search", tr(lang, "search"))
+        .enabled(mounted)
+        .build(app)?;
     let encode_item = MenuItemBuilder::with_id("encode", tr(lang, "encode"))
         .enabled(mounted)
         .build(app)?;
     let quit_item = MenuItemBuilder::with_id("quit", tr(lang, "quit")).build(app)?;
     MenuBuilder::new(app)
-        .items(&[&show_item, &unmount_item, &hash_item, &archive_item, &encode_item])
+        .items(&[
+            &show_item,
+            &unmount_item,
+            &hash_item,
+            &archive_item,
+            &search_item,
+            &encode_item,
+        ])
         .separator()
         .item(&quit_item)
         .build()
@@ -430,6 +444,7 @@ fn main() {
             commands::archive_compress_job,
             commands::archive_extract_job,
             commands::encode_job,
+            commands::search_job,
             commands::job_status,
             commands::job_result,
             commands::job_cancel,
@@ -454,6 +469,10 @@ fn main() {
                     "archive" => {
                         show_main_window(app);
                         let _ = app.emit(EVENT_OPEN_ARCHIVE_PANEL, ());
+                    }
+                    "search" => {
+                        show_main_window(app);
+                        let _ = app.emit(EVENT_OPEN_SEARCH_PANEL, ());
                     }
                     "encode" => {
                         show_main_window(app);

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use crate::api_kernel::{ApiKernel, HashAlgorithm, HashSegment};
+use crate::api_kernel::{ApiKernel, HashAlgorithm, HashSegment, SEARCH_MAX_PATTERN};
 use crate::arena::CompressedAllocator;
 use crate::chunk::{ChunkAllocator, ChunkId};
 use crate::cuda::Vram;
@@ -27,6 +27,56 @@ use sha1::Sha1;
 use sha2::Sha256;
 
 const ZIP_DEFLATE_CHUNK: u64 = 1024 * 1024;
+
+/// Compressed chunks pulled back to the host at a time for the end-bit walk.
+///
+/// The GPU compresses [`crate::nvcomp::BATCH`] chunks per launch, but the walk
+/// runs on the CPU and so needs those chunks in host memory. Working through a
+/// launch in groups bounds that transient buffer — a group of incompressible
+/// chunks is a group's worth of megabytes — while still handing every core
+/// several chunks per [`walk_deflate_blobs`] call.
+const ZIP_DEFLATE_WALK_GROUP: usize = 64;
+
+/// Extra-field id of VRAMDISK's private per-chunk compressed-size table.
+///
+/// Purely an extraction accelerator: it lets `archive.extract` hand every
+/// chunk of a member to nvCOMP as its own decompression job instead of walking
+/// one serial stream. Other tools ignore it, as APPNOTE requires of extra
+/// fields they do not recognise.
+const ZIP_CHUNK_TABLE_TAG: u16 = 0x4754;
+
+/// Extra-field id of the *old* chunk table, from before members were spliced
+/// into a single valid DEFLATE stream.
+///
+/// Still read, never written. The chunks it describes are byte-concatenated
+/// with only bit 0 of each one's first byte cleared, so they have to be closed
+/// differently — see [`StorageEngine::extract_zip_deflate_chunks`]. Archives
+/// carrying this tag are exactly the ones Windows could not open; VRAMDISK
+/// keeps reading them so nothing already written becomes unreadable.
+const ZIP_CHUNK_TABLE_TAG_LEGACY: u16 = 0x4753;
+
+/// Payload bytes handed to one CRC-32 lane, i.e. to one CUDA thread.
+///
+/// `vramdisk_crc32_many` runs a scalar, byte-at-a-time table CRC per thread,
+/// so aggregate throughput is purely a function of how many lanes are in
+/// flight; the lane size only decides how much serial work each thread does.
+/// One logical chunk keeps a lane to exactly one [`HashSegment`] for a raw or
+/// sparse file — no descriptor amplification — while still being large enough
+/// that the per-lane launch bookkeeping disappears next to the scan itself.
+const CRC32_LANE_BYTES: u64 = CHUNK_SIZE;
+
+/// Payload bytes covered by one `crc32_many` launch.
+///
+/// This is the CRC analogue of [`StorageEngine::gpu_hash_launch_budget`], but
+/// it is a constant rather than a calibrated value because the two are bounded
+/// by different things. The hash budget bounds how long a *single* thread runs,
+/// since a single-stream digest cannot be split; here the range is already cut
+/// into [`CRC32_LANE_BYTES`] lanes, so wall time per launch is one lane's worth
+/// of work no matter how large this is, and what it actually bounds is the
+/// descriptor and per-lane host bookkeeping of one launch. 512 MiB is 8192
+/// lanes: enough to saturate the device, small enough that the segment and
+/// state scratch stay well under a megabyte.
+const CRC32_LAUNCH_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Minimum number of non-zero bytes in a 64 KiB chunk before compression is
 /// attempted. Below this the payload is so sparse that the per-call overhead
@@ -44,20 +94,42 @@ const ENTROPY_SKIP_THRESHOLD: f64 = 7.2;
 const ENTROPY_WINDOWS: usize = 8;
 pub(crate) const CPU_HASH_WINDOW_BYTES: usize = 32 * 1024 * 1024;
 
-/// GPU hash routing derives both knobs from one measured single-thread SHA-256
-/// throughput on device memory:
-///   - launch budget targets ~100 ms per kernel to stay well below Windows TDR
-///   - CPU routing threshold targets ~250 ms, above which a single stream is
-///     better left to SHA-NI/AVX2 on CPU
+/// GPU hash routing is calibrated by hashing one small VRAM sample *both ways*
+/// and comparing what comes back:
+///   - launch budget targets ~100 ms of GPU work per kernel, to stay well
+///     below the Windows TDR timeout (a driver reset loses the mounted disk)
+///   - the CPU routing threshold is where the GPU stops being the faster place
+///     to put a single file
 ///
-/// Hard clamps keep behavior stable on unusually slow/fast devices.
+/// # Why both sides have to be measured
+///
+/// `vramdisk_hash_update` runs on exactly one CUDA thread, because MD5, SHA-1,
+/// SHA-256 and FNV-1a are each a strictly sequential chain over the message:
+/// block *n*'s state feeds block *n+1*, so one stream admits no parallelism to
+/// spread over the device. A single GPU thread walking that chain reaches
+/// roughly 30–60 MB/s, while the CPU path — device-to-host in windows, then
+/// RustCrypto with SHA-NI/AVX2 — runs at 0.6–1.6 GB/s. Where the GPU wins is
+/// the *batched* path, which gives one thread to each of many files and so
+/// scales with file count, not with file size.
+///
+/// The routing threshold therefore has to answer "is this file small enough to
+/// be worth batching", and the earlier one-sided rule — GPU throughput times a
+/// fixed 0.25 s, then clamped to at most 128 MiB — could not, because it never
+/// looked at what the CPU would have done. On a machine that measures 33 MB/s
+/// on the GPU against 1.6 GB/s on the CPU it derived an 8.2 MB threshold and
+/// sent every file below that to the ~30x slower path, while the 128 MiB clamp
+/// blamed for keeping big files off the GPU never came anywhere near binding.
+/// Comparing the two measurements instead removes the clamp entirely: where
+/// the GPU digest really is faster (a slow CPU, or an algorithm x86 has no
+/// instructions for) files of any size route to the GPU with no ceiling, and
+/// where it is not, only files small enough to leave room in a batch for other
+/// files go there at all.
 const GPU_HASH_CALIBRATION_BYTES: u64 = 1_048_576; // 1 MiB
 const GPU_HASH_LAUNCH_TARGET_SECS: f64 = 0.10;
 const GPU_HASH_ROUTE_TARGET_SECS: f64 = 0.25;
 const GPU_HASH_LAUNCH_BUDGET_MIN_BYTES: u64 = 4 * 1024 * 1024;
 const GPU_HASH_LAUNCH_BUDGET_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const GPU_HASH_ROUTE_THRESHOLD_MIN_BYTES: u64 = 1_048_576; // 1 MiB
-const GPU_HASH_ROUTE_THRESHOLD_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 
@@ -66,6 +138,10 @@ pub struct GpuHashCalibration {
     pub sample_bytes: u64,
     pub sample_elapsed_secs: f64,
     pub throughput_bytes_per_sec: f64,
+    /// What the same sample cost on the CPU route (materialize to host, then
+    /// RustCrypto), measured so routing can compare rather than guess.
+    pub cpu_sample_elapsed_secs: f64,
+    pub cpu_throughput_bytes_per_sec: f64,
     pub launch_budget_bytes: u64,
     pub cpu_route_threshold_bytes: u64,
 }
@@ -78,27 +154,45 @@ fn clamp_gpu_hash_launch_budget(budget: u64) -> u64 {
 }
 
 fn clamp_hash_cpu_route_threshold(threshold: u64) -> u64 {
-    threshold.clamp(
-        GPU_HASH_ROUTE_THRESHOLD_MIN_BYTES,
-        GPU_HASH_ROUTE_THRESHOLD_MAX_BYTES,
-    )
+    threshold.max(GPU_HASH_ROUTE_THRESHOLD_MIN_BYTES)
 }
 
+/// Turn the two measured throughputs into the launch budget and the routing
+/// threshold. Split out from the measurement so the policy can be unit tested
+/// without a GPU.
 fn calibration_from_throughput(
     sample_bytes: u64,
     sample_elapsed_secs: f64,
     throughput_bytes_per_sec: f64,
+    cpu_sample_elapsed_secs: f64,
+    cpu_throughput_bytes_per_sec: f64,
 ) -> GpuHashCalibration {
     let launch_budget_bytes = clamp_gpu_hash_launch_budget(
         (throughput_bytes_per_sec * GPU_HASH_LAUNCH_TARGET_SECS) as u64,
     );
-    let cpu_route_threshold_bytes = clamp_hash_cpu_route_threshold(
-        (throughput_bytes_per_sec * GPU_HASH_ROUTE_TARGET_SECS) as u64,
-    );
+    // Per byte, the GPU is at least as fast as the CPU: there is nothing to
+    // trade off, so no size is too large for the GPU and files of every size
+    // route there. `hash_file_gpu_cancellable` already streams a file as a
+    // sequence of launch-budget passes, so an unbounded threshold does not put
+    // an unbounded amount of work in any one kernel.
+    let cpu_route_threshold_bytes = if throughput_bytes_per_sec >= cpu_throughput_bytes_per_sec {
+        u64::MAX
+    } else {
+        // The GPU only pays off through batching, so admit a file only while
+        // it is small enough to share a launch with others: never more than
+        // one launch budget, and never more than the 0.25 s of single-thread
+        // GPU work that bounds how long one batch can stall its neighbours.
+        clamp_hash_cpu_route_threshold(
+            ((throughput_bytes_per_sec * GPU_HASH_ROUTE_TARGET_SECS) as u64)
+                .min(launch_budget_bytes),
+        )
+    };
     GpuHashCalibration {
         sample_bytes,
         sample_elapsed_secs,
         throughput_bytes_per_sec,
+        cpu_sample_elapsed_secs,
+        cpu_throughput_bytes_per_sec,
         launch_budget_bytes,
         cpu_route_threshold_bytes,
     }
@@ -467,10 +561,31 @@ struct ArchiveMaterializedSegments {
     temp_chunks: Vec<ChunkId>,
 }
 
+/// One `crc32_many` launch, described lane by lane.
+///
+/// `segments[i]` is what lane `i` reads and `lengths[i]` how many payload
+/// bytes that adds up to. The lengths are kept alongside because folding the
+/// per-lane checksums back into one needs each lane's length, and it is not
+/// recoverable from the segment list once sparse holes and materialized
+/// compressed chunks are in it.
+#[derive(Default)]
+struct Crc32Lanes {
+    segments: Vec<Vec<HashSegment>>,
+    lengths: Vec<u64>,
+}
+
 /// Upper bound for one encode staging pass (input side). Big enough to
 /// amortise launches, small enough to fit comfortably next to the user's
 /// data. Must be a multiple of 12 (lcm of all transcoding group sizes).
 const ENCODE_STAGE_BYTES: u64 = 48 * 1024 * 1024;
+
+/// Window the search kernel scans per launch.
+///
+/// Files are stored as 64 KiB chunks that need not be adjacent and may be
+/// compressed, so a scan materializes a contiguous raw window first. Bigger
+/// windows amortize the launch and the staging setup; this is capped again at
+/// run time against free space, since the window is real VRAM.
+const SEARCH_STAGE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Transcoding codec for GPU encode/decode jobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,6 +633,47 @@ impl EncodeDirection {
             Self::Decode => "decode",
         }
     }
+}
+
+/// Everything one search pass needs beyond the file list.
+///
+/// Grouped rather than passed positionally because the scan loop already takes
+/// the engine, the paths, their sizes and a progress callback; six more loose
+/// arguments is where a transposed pair stops being a compile error.
+struct SearchPlan<'a> {
+    needle: &'a [u8],
+    ignore_case: bool,
+    max_offsets_per_file: usize,
+    /// Contiguous raw scratch file each window is materialized into.
+    staging: &'a str,
+    /// Size of that scratch file, and so of one scan window.
+    window: u64,
+    /// Total bytes across every file, for progress reporting.
+    total_bytes: u64,
+}
+
+/// One file that matched a search, and where.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub path: String,
+    /// Every match in the file, even if `offsets` holds fewer.
+    pub matches: u64,
+    /// Ascending byte offsets, truncated to the caller's limit.
+    pub offsets: Vec<u64>,
+    /// Set when `offsets` is a subset of the matches found.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchJobStats {
+    pub pattern_len: usize,
+    pub ignore_case: bool,
+    pub files_scanned: u64,
+    pub bytes_scanned: u64,
+    pub files_matched: u64,
+    pub total_matches: u64,
+    pub hits: Vec<SearchHit>,
+    pub elapsed_ms: u128,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -779,6 +935,14 @@ pub struct StorageEngine {
     gpu_hash_launch_budget_override: bool,
     hash_cpu_route_threshold_override: bool,
     gpu_hash_calibration: Option<GpuHashCalibration>,
+    /// Payload covered by one parallel CRC-32 launch; see
+    /// [`CRC32_LAUNCH_BYTES`]. Held as a field only so tests can shrink it and
+    /// exercise the multi-launch fold without staging a half-gigabyte file.
+    crc32_launch_bytes: u64,
+    /// Bytes materialized and scanned per search launch. A field only so tests
+    /// can shrink it and exercise the window seam without writing a file
+    /// larger than [`SEARCH_STAGE_BYTES`].
+    search_window_bytes: u64,
     trace: TraceCounters,
 }
 
@@ -809,7 +973,7 @@ impl StorageEngine {
         } else {
             None
         };
-        Ok(StorageEngine {
+        let engine = StorageEngine {
             vram,
             alloc: ChunkAllocator::new(total),
             table: LookupTable::new(),
@@ -832,8 +996,12 @@ impl StorageEngine {
             gpu_hash_launch_budget_override: false,
             hash_cpu_route_threshold_override: false,
             gpu_hash_calibration: None,
+            crc32_launch_bytes: CRC32_LAUNCH_BYTES,
+            search_window_bytes: SEARCH_STAGE_BYTES,
             trace: TraceCounters::default(),
-        })
+        };
+        engine.warm_gpu_api();
+        Ok(engine)
     }
 
     pub fn table(&self) -> &LookupTable {
@@ -942,6 +1110,22 @@ impl StorageEngine {
     pub fn set_hash_cpu_route_threshold(&mut self, threshold: u64) {
         self.hash_cpu_route_threshold = clamp_hash_cpu_route_threshold(threshold);
         self.hash_cpu_route_threshold_override = true;
+    }
+
+    /// Override how much payload one parallel CRC-32 launch covers.
+    ///
+    /// The default ([`CRC32_LAUNCH_BYTES`]) is deliberately larger than any
+    /// realistic test fixture, so this exists to let a test drive the
+    /// multi-launch fold — where per-launch lane checksums have to be
+    /// concatenated across launches, not just within one — on a small file.
+    pub fn set_crc32_launch_bytes(&mut self, bytes: u64) {
+        self.crc32_launch_bytes = bytes.max(CRC32_LANE_BYTES);
+    }
+
+    /// Shrink the search window. Rounded up to a whole chunk, because the
+    /// window is a contiguous raw scratch file.
+    pub fn set_search_window_bytes(&mut self, bytes: u64) {
+        self.search_window_bytes = bytes.max(CHUNK_SIZE).div_ceil(CHUNK_SIZE) * CHUNK_SIZE;
     }
 
     /// Whether dedup confirms a hash hit by comparing bytes. See
@@ -1482,16 +1666,56 @@ impl StorageEngine {
         cuda(self.api_kernel()?.update(segments))
     }
 
+    /// Start compiling the API kernels so the first job does not have to wait
+    /// for NVRTC.
+    ///
+    /// Building the first [`ApiKernel`] in a process compiles the CUDA source
+    /// with NVRTC, which takes about 5.5 s on a desktop; everything after that
+    /// — loading the module, taking the calibration samples — is a couple of
+    /// hundred milliseconds. Before this, that 5.5 s landed on whichever hash,
+    /// archive or encode job happened to be first, which simply looked like a
+    /// hung job.
+    ///
+    /// It runs on its own thread rather than inline in [`StorageEngine::new`]
+    /// because doing it inline moved the stall rather than removing it: the
+    /// drive letter did not appear for 5.4 s (measured 0.2 s before, 5.6 s
+    /// after), and a mount that takes six seconds to show up is a worse
+    /// symptom than a first job that takes six seconds to finish. NVRTC needs
+    /// no CUDA context, so a plain detached thread is enough; the compiled PTX
+    /// is process-global, and a job that arrives before the thread finishes
+    /// simply waits for it rather than compiling a second copy.
+    fn warm_gpu_api(&self) {
+        thread::spawn(crate::api_kernel::precompile);
+    }
+
     fn ensure_hash_calibration(&mut self) -> EResult<()> {
         if self.gpu_hash_calibration.is_some() {
             return Ok(());
         }
-        let calibration = {
-            let vram_base = self.vram_base;
-            let vram_size = self.vram.size();
+        let vram_base = self.vram_base;
+        let vram_size = self.vram.size();
+        let sample_bytes = GPU_HASH_CALIBRATION_BYTES.min(vram_size).max(1);
+        let gpu_elapsed = {
             let kernel = self.api_kernel()?;
-            Self::measure_gpu_hash_calibration(kernel, vram_base, vram_size)?
+            Self::measure_gpu_hash_calibration(kernel, vram_base, sample_bytes)?
         };
+        // Time the CPU route over the same bytes, through the same
+        // materialize-then-digest path a CPU-routed file would take, so the
+        // comparison in `calibration_from_throughput` is like for like.
+        let mut host = vec![0u8; sample_bytes as usize];
+        let started = Instant::now();
+        cuda(self.vram.read_at(0, &mut host))?;
+        let mut hasher = Sha256::new();
+        hasher.update(&host);
+        let _ = hasher.finalize();
+        let cpu_elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
+        let calibration = calibration_from_throughput(
+            sample_bytes,
+            gpu_elapsed,
+            sample_bytes as f64 / gpu_elapsed,
+            cpu_elapsed,
+            sample_bytes as f64 / cpu_elapsed,
+        );
         if !self.gpu_hash_launch_budget_override {
             self.gpu_hash_launch_budget = calibration.launch_budget_bytes;
         }
@@ -1502,12 +1726,14 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Time a single-thread GPU SHA-256 over `sample_bytes` of device memory at
+    /// `vram_base`, returning the elapsed seconds. Launch overhead is inside
+    /// the measurement on purpose: routing pays it too.
     fn measure_gpu_hash_calibration(
         kernel: &mut ApiKernel,
         vram_base: u64,
-        vram_size: u64,
-    ) -> EResult<GpuHashCalibration> {
-        let sample_bytes = GPU_HASH_CALIBRATION_BYTES.min(vram_size).max(1);
+        sample_bytes: u64,
+    ) -> EResult<f64> {
         let started = Instant::now();
         cuda(kernel.begin(HashAlgorithm::Sha256))?;
         cuda(kernel.update(&[HashSegment {
@@ -1516,13 +1742,7 @@ impl StorageEngine {
             kind: 0,
         }]))?;
         let _ = cuda(kernel.finish(HashAlgorithm::Sha256))?;
-        let elapsed = started.elapsed().as_secs_f64().max(f64::EPSILON);
-        let throughput = sample_bytes as f64 / elapsed;
-        Ok(calibration_from_throughput(
-            sample_bytes,
-            elapsed,
-            throughput,
-        ))
+        Ok(started.elapsed().as_secs_f64().max(f64::EPSILON))
     }
 
     fn file_has_only_raw_sparse(&self, path: &str) -> EResult<bool> {
@@ -1533,6 +1753,31 @@ impl StorageEngine {
         Ok(node
             .coords
             .iter()
+            .all(|placement| matches!(placement, None | Some(Placement::Raw { .. }))))
+    }
+
+    /// Whether `[offset, offset + len)` is backed only by raw chunks and
+    /// sparse holes, so a GPU pass over it needs no materialization scratch.
+    ///
+    /// Scoped to the range rather than the whole file because the gzip reader
+    /// verifies a 512 MiB output one 64 KiB member at a time: a whole-file scan
+    /// there would be quadratic in the file size, while this is proportional to
+    /// the range actually being read.
+    fn range_has_only_raw_sparse(&self, path: &str, offset: u64, len: u64) -> EResult<bool> {
+        let node = self.table.get(path).ok_or(LookupError::NotFound)?;
+        if node.is_dir {
+            return Err(EngineError::NotAFile);
+        }
+        if len == 0 {
+            return Ok(true);
+        }
+        let first = (offset / CHUNK_SIZE) as usize;
+        let last = ((offset + len - 1) / CHUNK_SIZE) as usize;
+        Ok(node
+            .coords
+            .iter()
+            .take(last + 1)
+            .skip(first)
             .all(|placement| matches!(placement, None | Some(Placement::Raw { .. }))))
     }
 
@@ -4061,41 +4306,50 @@ impl StorageEngine {
             let local_offset = out_pos;
             let name_bytes = name.as_bytes();
             let zip_chunks = zip_deflate_chunk_count(*size);
-            let extra = zip_local_extra(*size, &vec![0; zip_chunks]);
-            let mut hdr = Vec::with_capacity(30 + name_bytes.len());
-            push_u32(&mut hdr, 0x0403_4b50);
-            push_u16(&mut hdr, 45);
-            push_u16(&mut hdr, 0);
-            push_u16(&mut hdr, 8);
-            push_u16(&mut hdr, 0);
-            push_u16(&mut hdr, 0);
-            push_u32(&mut hdr, *crc);
-            push_u32(&mut hdr, u32::MAX);
-            push_u32(&mut hdr, u32::MAX);
-            push_u16(
-                &mut hdr,
-                u16_checked(name_bytes.len(), "zip file name length")?,
-            );
-            push_u16(
-                &mut hdr,
-                u16_checked(extra.len(), "zip64 local extra length")?,
-            );
-            hdr.extend_from_slice(name_bytes);
-            hdr.extend_from_slice(&extra);
+            let hdr = zip_local_header(
+                8,
+                *crc,
+                name_bytes,
+                &zip_local_extra(*size, 0, &vec![0; zip_chunks]),
+            )?;
             self.write_raw_internal(output, out_pos, &hdr)?;
             out_pos += hdr.len() as u64;
-            let (comp_size, chunk_sizes) =
-                self.write_zip_deflate_payload(path, *size, output, out_pos, &mut deflate)?;
-            patch_zip64_local_sizes(
-                self,
-                output,
-                local_offset + 30 + name_bytes.len() as u64,
-                *size,
-                comp_size,
-                &chunk_sizes,
-            )?;
+            let mut method = 8u16;
+            let comp_size =
+                match self.write_zip_deflate_payload(path, *size, output, out_pos, &mut deflate)? {
+                    Some((comp_size, chunk_sizes)) => {
+                        patch_zip64_local_sizes(
+                            self,
+                            output,
+                            local_offset + 30 + name_bytes.len() as u64,
+                            *size,
+                            comp_size,
+                            &chunk_sizes,
+                        )?;
+                        comp_size
+                    }
+                    None => {
+                        // The member's DEFLATE chunks could not be spliced into one
+                        // conformant stream, so rewrite it from the local header
+                        // down as a stored (method 0) member. Always readable,
+                        // never compressed — see `write_zip_deflate_payload`.
+                        method = 0;
+                        let hdr = zip_local_header(
+                            0,
+                            *crc,
+                            name_bytes,
+                            &zip_local_extra(*size, *size, &[]),
+                        )?;
+                        out_pos = local_offset;
+                        self.write_raw_internal(output, out_pos, &hdr)?;
+                        out_pos += hdr.len() as u64;
+                        self.copy_file_payload_raw(path, 0, output, out_pos, *size)?;
+                        *size
+                    }
+                };
             out_pos += comp_size;
             central.push(ZipCentralEntry {
+                method,
                 crc: *crc,
                 size: *size,
                 comp_size,
@@ -4113,7 +4367,7 @@ impl StorageEngine {
             push_u16(&mut hdr, 45);
             push_u16(&mut hdr, 45);
             push_u16(&mut hdr, 0);
-            push_u16(&mut hdr, 8);
+            push_u16(&mut hdr, entry.method);
             push_u16(&mut hdr, 0);
             push_u16(&mut hdr, 0);
             push_u32(&mut hdr, entry.crc);
@@ -4266,12 +4520,12 @@ impl StorageEngine {
             match method {
                 0 => self.copy_file_payload_raw(archive, data_pos, &out_path, 0, uncomp_size)?,
                 8 => {
-                    if let Some(chunk_sizes) = zip_deflate_chunks_from_extra(&extra)? {
+                    if let Some(table) = zip_deflate_chunks_from_extra(&extra)? {
                         self.extract_zip_deflate_chunks(
                             &mut deflate_codec,
                             archive,
                             data_pos,
-                            &chunk_sizes,
+                            &table,
                             &out_path,
                             uncomp_size,
                         )?;
@@ -4320,68 +4574,249 @@ impl StorageEngine {
         })
     }
 
+    /// Deflate one ZIP member, splicing nvCOMP's per-chunk streams into a
+    /// single standards-conformant DEFLATE stream.
+    ///
+    /// The member is cut into [`ZIP_DEFLATE_CHUNK`] pieces because that is the
+    /// only axis nvCOMP's Deflate parallelises over: measured on this machine,
+    /// 256 MiB compresses in 0.163 s as 256 × 1 MiB chunks and in 46.7 s as one
+    /// chunk, so "just compress the member as one stream" is a 280× regression
+    /// and not an option.
+    ///
+    /// Joining those pieces is the delicate part. Each is a complete DEFLATE
+    /// stream ending at an arbitrary *bit*, and the old code cleared the
+    /// `BFINAL` flag and concatenated at byte boundaries — which left the
+    /// encoder's zero padding sitting between two blocks, where a decoder reads
+    /// it as the header of a stored block and then swallows the next chunk's
+    /// first bytes as that block's LEN/NLEN. VRAMDISK's own extractor never
+    /// noticed (it decompresses chunk by chunk from the private table below),
+    /// but Explorer and .NET's `ZipArchive` both refused any member over
+    /// 1 MiB.
+    ///
+    /// So instead: [`DeflateWalker`] finds each chunk's exact end bit, the last
+    /// block's `BFINAL` is cleared wherever it actually lives, and an empty
+    /// stored block ([`zip_deflate_joiner`]) is spliced on to carry the stream
+    /// back to a byte boundary before the next chunk starts. The member's final
+    /// chunk keeps nvCOMP's own `BFINAL` and is written untouched — which is
+    /// also why a member of one chunk or less costs nothing extra.
+    ///
+    /// Returns `None` when a chunk's stream could not be walked or did not
+    /// account for exactly the bytes it was compressed from; the caller then
+    /// stores the member instead of risking a corrupt one.
     fn write_zip_deflate_payload(
         &mut self,
         src_path: &str,
         len: u64,
         dst_path: &str,
-        mut out_pos: u64,
+        out_pos: u64,
         codec: &mut NvcompBatchedCodec,
-    ) -> EResult<(u64, Vec<u64>)> {
+    ) -> EResult<Option<(u64, Vec<u64>)>> {
         if len == 0 {
-            self.write_raw_internal(dst_path, out_pos, &[1, 0, 0, 255, 255])?;
-            return Ok((5, vec![5]));
+            self.write_raw_internal(dst_path, out_pos, &ZIP_DEFLATE_TERMINATOR)?;
+            return Ok(Some((5, vec![5])));
         }
         let tmp = format!("\\.__vramdisk_zip_src_{}", crate::lookup::now_filetime());
         self.create_or_truncate_file(&tmp)?;
-        self.allocate_raw_file(&tmp, len)?;
-        self.copy_file_payload_raw(src_path, 0, &tmp, 0, len)?;
-        let base = self.contiguous_file_ptr(&tmp, len)?;
+        let spliced = self.write_zip_deflate_chunks(&tmp, src_path, len, dst_path, out_pos, codec);
+        let _ = self.remove(&tmp);
+        spliced
+    }
+
+    /// The chunk loop behind [`StorageEngine::write_zip_deflate_payload`], split
+    /// out so the staging file is removed on every exit path.
+    fn write_zip_deflate_chunks(
+        &mut self,
+        tmp: &str,
+        src_path: &str,
+        len: u64,
+        dst_path: &str,
+        mut out_pos: u64,
+        codec: &mut NvcompBatchedCodec,
+    ) -> EResult<Option<(u64, Vec<u64>)>> {
+        self.allocate_raw_file(tmp, len)?;
+        self.copy_file_payload_raw(src_path, 0, tmp, 0, len)?;
+        let base = self.contiguous_file_ptr(tmp, len)?;
         let total_chunks = len.div_ceil(ZIP_DEFLATE_CHUNK);
         let mut chunk_idx = 0u64;
         let mut written = 0u64;
         let mut chunk_comp_sizes = Vec::with_capacity(total_chunks as usize);
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
         while chunk_idx < total_chunks {
             let n = ((total_chunks - chunk_idx).min(crate::nvcomp::BATCH as u64)) as usize;
             let mut ptrs = Vec::with_capacity(n);
             let mut sizes = Vec::with_capacity(n);
             for i in 0..n {
                 let off = (chunk_idx + i as u64) * ZIP_DEFLATE_CHUNK;
-                let take = (len - off).min(ZIP_DEFLATE_CHUNK);
                 ptrs.push(base + off);
-                sizes.push(take);
+                sizes.push((len - off).min(ZIP_DEFLATE_CHUNK));
             }
             let comp_sizes = cuda(codec.compress_device(&ptrs, &sizes))?;
-            for (i, comp_size) in comp_sizes.into_iter().enumerate() {
-                let is_last = chunk_idx + i as u64 + 1 == total_chunks;
-                self.write_device_bytes(
-                    dst_path,
-                    out_pos,
-                    codec.compressed_slot_ptr(i),
-                    comp_size,
-                )?;
-                if !is_last {
-                    self.clear_zip_deflate_bfinal(dst_path, out_pos)?;
+            // The compressed blobs live in codec scratch that the next launch
+            // overwrites, so this batch is walked and written out before the
+            // loop comes back around.
+            let mut slot = 0usize;
+            while slot < n {
+                let group = (n - slot).min(ZIP_DEFLATE_WALK_GROUP);
+                blobs.clear();
+                for j in 0..group {
+                    let i = slot + j;
+                    if chunk_idx + i as u64 + 1 == total_chunks {
+                        // Nothing is spliced onto the member's last chunk, so
+                        // it needs no end bit and no host round trip.
+                        blobs.push(Vec::new());
+                        continue;
+                    }
+                    let mut blob = vec![0u8; comp_sizes[i] as usize];
+                    cuda(codec.copy_compressed_slot_to_host(i, &mut blob))?;
+                    blobs.push(blob);
                 }
-                out_pos += comp_size;
-                written += comp_size;
-                chunk_comp_sizes.push(comp_size);
+                let walks = walk_deflate_blobs(&blobs);
+                for j in 0..group {
+                    let i = slot + j;
+                    let comp_size = comp_sizes[i];
+                    if blobs[j].is_empty() {
+                        self.write_device_bytes(
+                            dst_path,
+                            out_pos,
+                            codec.compressed_slot_ptr(i),
+                            comp_size,
+                        )?;
+                        out_pos += comp_size;
+                        written += comp_size;
+                        chunk_comp_sizes.push(comp_size);
+                        continue;
+                    }
+                    let off = (chunk_idx + i as u64) * ZIP_DEFLATE_CHUNK;
+                    let Some(walk) = walks[j] else {
+                        return Ok(None);
+                    };
+                    if walk.out_len != (len - off).min(ZIP_DEFLATE_CHUNK)
+                        || walk.end_bit == 0
+                        || walk.end_bit > comp_size * 8
+                    {
+                        return Ok(None);
+                    }
+                    let used = walk.end_bit.div_ceil(8);
+                    self.write_device_bytes(dst_path, out_pos, codec.compressed_slot_ptr(i), used)?;
+                    // Open the stream up (clear the last block's BFINAL) and
+                    // clear anything the encoder left past the end bit, so the
+                    // joiner's all-zero block header lands on clean padding.
+                    let blob = &mut blobs[j];
+                    let bfinal_byte = (walk.final_bfinal_bit / 8) as usize;
+                    blob[bfinal_byte] &= !(1u8 << (walk.final_bfinal_bit % 8));
+                    let last = used as usize - 1;
+                    let rem = (walk.end_bit % 8) as u32;
+                    if rem != 0 {
+                        blob[last] &= ((1u16 << rem) - 1) as u8;
+                    }
+                    let joiner = zip_deflate_joiner(walk.end_bit);
+                    // The rewritten tail byte and the joiner are adjacent, so
+                    // they go out as one write; only the BFINAL byte (byte 0 of
+                    // a single-block chunk) needs a second.
+                    let mut tail = Vec::with_capacity(1 + joiner.len());
+                    tail.push(blob[last]);
+                    tail.extend_from_slice(joiner);
+                    if bfinal_byte != last {
+                        self.write_raw_internal(
+                            dst_path,
+                            out_pos + bfinal_byte as u64,
+                            &blob[bfinal_byte..bfinal_byte + 1],
+                        )?;
+                    } else {
+                        tail[0] = blob[last];
+                    }
+                    self.write_raw_internal(dst_path, out_pos + last as u64, &tail)?;
+                    let total = used + joiner.len() as u64;
+                    out_pos += total;
+                    written += total;
+                    chunk_comp_sizes.push(total);
+                }
+                slot += group;
             }
             chunk_idx += n as u64;
         }
-        let _ = self.remove(&tmp);
-        Ok((written, chunk_comp_sizes))
+        Ok(Some((written, chunk_comp_sizes)))
     }
 
-    fn clear_zip_deflate_bfinal(&mut self, path: &str, offset: u64) -> EResult<()> {
-        let mut b = self.read(path, offset, 1)?;
-        if b.len() != 1 {
+    /// Inflate a member from the private per-chunk table, one nvCOMP launch per
+    /// chunk straight into the output file's VRAM.
+    ///
+    /// [`ZipChunkTable::spliced`] distinguishes the two on-disk shapes the
+    /// table can describe. A spliced chunk is one written by the current
+    /// [`StorageEngine::write_zip_deflate_payload`]: its last block's `BFINAL`
+    /// was cleared and an empty stored block appended, which leaves it
+    /// byte-aligned, so appending [`ZIP_DEFLATE_TERMINATOR`] closes it no
+    /// matter how many blocks it holds. A legacy chunk was written by the code
+    /// that produced the broken archives — it ends on a bit boundary and had
+    /// only bit 0 of byte 0 cleared, so setting that bit back is both the only
+    /// thing that can close it and the only thing that ever did.
+    fn extract_zip_deflate_chunks(
+        &mut self,
+        codec: &mut NvcompBatchedCodec,
+        src_path: &str,
+        src_offset: u64,
+        table: &ZipChunkTable,
+        dst_path: &str,
+        out_len: u64,
+    ) -> EResult<()> {
+        if out_len == 0 {
+            self.set_size(dst_path, 0)?;
+            return Ok(());
+        }
+        self.allocate_raw_file(dst_path, out_len)?;
+        let dst_base = self.contiguous_file_ptr(dst_path, out_len)?;
+        let mut comp_pos = src_offset;
+        let mut out_pos = 0u64;
+        for (i, &comp_len) in table.sizes.iter().enumerate() {
+            let take = (out_len - out_pos).min(ZIP_DEFLATE_CHUNK);
+            let is_last = i + 1 == table.sizes.len();
+            // A spliced chunk that is not the member's last one is still an
+            // open stream and needs the terminator; the last one already ends
+            // in its own final block.
+            let terminate = table.spliced && !is_last;
+            let staged = comp_len
+                + if terminate {
+                    ZIP_DEFLATE_TERMINATOR.len() as u64
+                } else {
+                    0
+                };
+            let tmp = format!(
+                "\\.__vramdisk_zip_deflate_src_{}",
+                crate::lookup::now_filetime()
+            );
+            self.create_or_truncate_file(&tmp)?;
+            self.allocate_raw_file(&tmp, staged)?;
+            self.copy_file_payload_raw(src_path, comp_pos, &tmp, 0, comp_len)?;
+            if terminate {
+                self.write_raw_internal(&tmp, comp_len, &ZIP_DEFLATE_TERMINATOR)?;
+            } else if !table.spliced {
+                self.set_zip_deflate_bfinal(&tmp, 0)?;
+            }
+            let src_ptr = self.contiguous_file_ptr(&tmp, staged)?;
+            let produced = cuda(codec.decompress_device(
+                &[src_ptr],
+                &[staged],
+                &[dst_base + out_pos],
+                &[take],
+            ))?;
+            let _ = self.remove(&tmp);
+            if produced.first().copied() != Some(take) {
+                return Err(EngineError::InvalidInput(format!(
+                    "ZIP Deflate chunk {i} produced {:?} bytes, expected {take}",
+                    produced.first()
+                )));
+            }
+            comp_pos += comp_len;
+            out_pos += take;
+            if out_pos == out_len {
+                break;
+            }
+        }
+        if out_pos != out_len {
             return Err(EngineError::InvalidInput(
-                "truncated deflate payload".into(),
+                "ZIP Deflate chunk table ended early".into(),
             ));
         }
-        b[0] &= !1;
-        self.write_raw_internal(path, offset, &b)?;
         Ok(())
     }
 
@@ -4394,50 +4829,6 @@ impl StorageEngine {
         }
         b[0] |= 1;
         self.write_raw_internal(path, offset, &b)?;
-        Ok(())
-    }
-
-    fn extract_zip_deflate_chunks(
-        &mut self,
-        codec: &mut NvcompBatchedCodec,
-        src_path: &str,
-        src_offset: u64,
-        chunk_comp_sizes: &[u64],
-        dst_path: &str,
-        out_len: u64,
-    ) -> EResult<()> {
-        if out_len == 0 {
-            self.set_size(dst_path, 0)?;
-            return Ok(());
-        }
-        self.allocate_raw_file(dst_path, out_len)?;
-        let dst_base = self.contiguous_file_ptr(dst_path, out_len)?;
-        let mut comp_pos = src_offset;
-        let mut out_pos = 0u64;
-        for &comp_len in chunk_comp_sizes {
-            let take = (out_len - out_pos).min(ZIP_DEFLATE_CHUNK);
-            let tmp = format!(
-                "\\.__vramdisk_zip_deflate_src_{}",
-                crate::lookup::now_filetime()
-            );
-            self.create_or_truncate_file(&tmp)?;
-            self.allocate_raw_file(&tmp, comp_len)?;
-            self.copy_file_payload_raw(src_path, comp_pos, &tmp, 0, comp_len)?;
-            self.set_zip_deflate_bfinal(&tmp, 0)?;
-            let src_ptr = self.contiguous_file_ptr(&tmp, comp_len)?;
-            cuda(codec.decompress_device(&[src_ptr], &[comp_len], &[dst_base + out_pos], &[take]))?;
-            let _ = self.remove(&tmp);
-            comp_pos += comp_len;
-            out_pos += take;
-            if out_pos == out_len {
-                break;
-            }
-        }
-        if out_pos != out_len {
-            return Err(EngineError::InvalidInput(
-                "ZIP Deflate chunk table ended early".into(),
-            ));
-        }
         Ok(())
     }
 
@@ -4455,7 +4846,26 @@ impl StorageEngine {
         self.crc32_range_gpu_cancellable(path, offset, len, &mut |_, _| false)
     }
 
-    /// CRC32 over `[offset, offset + len)`, in GPU-launch-budget sized passes.
+    /// CRC32 over `[offset, offset + len)`, computed as many parallel lanes.
+    ///
+    /// # Why lanes rather than one running state
+    ///
+    /// `vramdisk_crc32_many` gives one *thread* to each entry of the batch it
+    /// is handed, because that batch is normally a set of independent files.
+    /// Feeding it a single entry therefore checksums the whole range on a
+    /// single CUDA thread, and a lone GPU thread walking a byte-at-a-time
+    /// table CRC runs at roughly 5 MB/s — three orders of magnitude below what
+    /// the device can do and around 300x slower than the same loop on a CPU
+    /// core. That is what made the ZIP writer (one CRC pass per member) and
+    /// the gzip reader (one verification pass per member) dominate their jobs:
+    /// a 256 MiB ZIP member spent 7.98 s in this function against 0.16 s in
+    /// the Deflate pass that followed it.
+    ///
+    /// CRC-32 is a linear function over GF(2), so the range can be cut into
+    /// independent lanes that are checksummed concurrently and then folded
+    /// back together with [`crc32_combine_with`] — the exact same value as a
+    /// serial scan, bit for bit, which matters because these checksums go into
+    /// ZIP local headers and gzip trailers that other tools verify.
     ///
     /// `progress` follows the contract documented on
     /// [`StorageEngine::hash_file_gpu_cancellable`], counting bytes of the
@@ -4472,29 +4882,81 @@ impl StorageEngine {
         F: FnMut(u64, u64) -> bool,
     {
         self.ensure_hash_calibration()?;
-        cuda(self.api_kernel()?.begin_crc32_many(1))?;
+        // A launch over raw and sparse placements reads VRAM in place and so
+        // costs nothing but descriptors, but a compressed placement is first
+        // decompressed into a temp chunk that has to stay allocated until the
+        // launch has read it. Sizing a compressed launch by lane count would
+        // ask for one temp chunk per 64 KiB of the whole launch — half a
+        // gigabyte of scratch for the default — so those fall back to the hash
+        // launch budget, which is what bounded this scratch before lanes
+        // existed. 64 lanes is still 64x the parallelism of a single thread.
+        let launch_bytes = if self.range_has_only_raw_sparse(path, offset, len)? {
+            self.crc32_launch_bytes
+        } else {
+            self.crc32_launch_bytes.min(self.gpu_hash_launch_budget)
+        };
+        // CRC-32 of the empty string, which is also the identity for the fold
+        // below: `crc32_combine_with(shift, 0, c) == c`.
+        let mut crc = 0u32;
+        // Lanes all share one length except the last of the range, so the
+        // GF(2) operator that advances a CRC across a lane is built once and
+        // reused for every fold step instead of once per lane.
+        let mut shift_cache: Option<(u64, [u32; 32])> = None;
         let mut done = 0u64;
         while done < len {
             if progress(done, len) {
                 return cancelled();
             }
-            let take = (len - done).min(self.gpu_hash_launch_budget);
+            let take = (len - done).min(launch_bytes);
             // Build segments into a caller-owned struct, then release its temp
             // chunks whether or not the build or the kernel update succeeded.
             let mut materialized = ArchiveMaterializedSegments::default();
-            let built = self.archive_crc32_segments(path, offset + done, take, &mut materialized);
-            let update = built.and_then(|_| {
-                cuda(
-                    self.api_kernel()?
-                        .update_crc32_many(std::slice::from_ref(&materialized.segs)),
-                )
-            });
+            let mut lanes = Crc32Lanes::default();
+            let built =
+                self.build_crc32_lanes(path, offset + done, take, &mut materialized, &mut lanes);
+            let launched =
+                built.and_then(|()| cuda(self.api_kernel()?.crc32_many(&lanes.segments)));
             self.release_temp_chunks(std::mem::take(&mut materialized.temp_chunks));
-            update?;
+            let lane_crcs = launched?;
+            for (&lane_len, &lane_crc) in lanes.lengths.iter().zip(lane_crcs.iter()) {
+                let shift = match shift_cache {
+                    Some((cached_len, shift)) if cached_len == lane_len => shift,
+                    _ => {
+                        let shift = crc32_zero_shift(lane_len);
+                        shift_cache = Some((lane_len, shift));
+                        shift
+                    }
+                };
+                crc = crc32_combine_with(&shift, crc, lane_crc);
+            }
             done += take;
         }
-        let out = cuda(self.api_kernel()?.finish_crc32_many(1))?;
-        Ok(out[0])
+        Ok(crc)
+    }
+
+    /// Cut `[offset, offset + len)` into [`CRC32_LANE_BYTES`] lanes and build
+    /// one GPU segment list per lane.
+    ///
+    /// Temp chunks materialized for compressed placements accumulate in `out`
+    /// (shared by every lane) so the caller can release them once the launch
+    /// that reads them has completed, exactly as the single-lane version did.
+    fn build_crc32_lanes(
+        &mut self,
+        path: &str,
+        offset: u64,
+        len: u64,
+        out: &mut ArchiveMaterializedSegments,
+        lanes: &mut Crc32Lanes,
+    ) -> EResult<()> {
+        let mut done = 0u64;
+        while done < len {
+            let take = (len - done).min(CRC32_LANE_BYTES);
+            self.archive_crc32_segments(path, offset + done, take, out)?;
+            lanes.segments.push(std::mem::take(&mut out.segs));
+            lanes.lengths.push(take);
+            done += take;
+        }
+        Ok(())
     }
 
     fn raw_file_ptr(&self, path: &str, offset: u64) -> EResult<u64> {
@@ -5247,6 +5709,171 @@ impl StorageEngine {
         Ok((size, out_len))
     }
 
+    /// Scan every file in `paths` for the literal byte string `needle`.
+    ///
+    /// This is the operation the hardware is actually good at. The bytes are
+    /// already in VRAM, so the scan runs at device memory bandwidth and never
+    /// crosses PCIe -- unlike a CPU tool, which has to pull the whole volume
+    /// through the bus before it can look at any of it.
+    ///
+    /// A file's chunks need not be adjacent and may be compressed, so each pass
+    /// materializes a contiguous raw window first (a device-to-device copy) and
+    /// scans that. Consecutive windows step by `window - (needle.len() - 1)` so
+    /// a match straddling the seam is still found, and because the kernel's
+    /// last candidate in a window is exactly one before the next window's
+    /// first, no match is counted twice.
+    ///
+    /// `max_offsets_per_file` bounds what is *reported*; the match counts are
+    /// always exact.
+    pub fn search_files_gpu_cancellable<F>(
+        &mut self,
+        paths: &[String],
+        needle: &[u8],
+        ignore_case: bool,
+        max_offsets_per_file: usize,
+        mut progress: F,
+    ) -> EResult<SearchJobStats>
+    where
+        F: FnMut(u64, u64) -> bool,
+    {
+        let start = Instant::now();
+        if needle.is_empty() {
+            return Err(EngineError::InvalidInput(
+                "search pattern must not be empty".into(),
+            ));
+        }
+        if needle.len() > SEARCH_MAX_PATTERN {
+            return Err(EngineError::InvalidInput(format!(
+                "search pattern must be at most {SEARCH_MAX_PATTERN} bytes"
+            )));
+        }
+
+        let mut sizes = Vec::with_capacity(paths.len());
+        let mut total_bytes = 0u64;
+        for path in paths {
+            let node = self.table.get(path).ok_or(LookupError::NotFound)?;
+            if node.is_dir {
+                return Err(EngineError::NotAFile);
+            }
+            sizes.push(node.size);
+            total_bytes = total_bytes.saturating_add(node.size);
+        }
+
+        // The window is real VRAM, so never take more than half of what is
+        // free: a search must not push the volume into no-space.
+        let free_bytes = (self.alloc.free() as u64) * CHUNK_SIZE;
+        let window = self
+            .search_window_bytes
+            .min((free_bytes / 2) / CHUNK_SIZE * CHUNK_SIZE)
+            .max(CHUNK_SIZE);
+        let staging = format!("\\.__vramdisk_search_tmp_{}", crate::lookup::now_filetime());
+        self.create_or_truncate_file(&staging)?;
+        self.allocate_raw_file(&staging, window)
+            .map_err(|err| match err {
+                EngineError::NoSpace => archive_vram_exhausted("stage a search window"),
+                other => other,
+            })?;
+        let plan = SearchPlan {
+            needle,
+            ignore_case,
+            max_offsets_per_file,
+            staging: &staging,
+            window,
+            total_bytes,
+        };
+        let result = self.search_inner(paths, &sizes, &plan, &mut progress);
+        let _ = self.remove(&staging);
+        let (hits, files_matched, total_matches, bytes_scanned) = result?;
+        Ok(SearchJobStats {
+            pattern_len: needle.len(),
+            ignore_case,
+            files_scanned: paths.len() as u64,
+            bytes_scanned,
+            files_matched,
+            total_matches,
+            hits,
+            elapsed_ms: start.elapsed().as_millis(),
+        })
+    }
+
+    fn search_inner<F>(
+        &mut self,
+        paths: &[String],
+        sizes: &[u64],
+        plan: &SearchPlan<'_>,
+        progress: &mut F,
+    ) -> EResult<(Vec<SearchHit>, u64, u64, u64)>
+    where
+        F: FnMut(u64, u64) -> bool,
+    {
+        let SearchPlan {
+            needle,
+            ignore_case,
+            max_offsets_per_file,
+            staging,
+            window,
+            total_bytes,
+        } = *plan;
+        let base = self.contiguous_file_ptr(staging, window)?;
+        let overlap = needle.len() as u64 - 1;
+        let mut hits = Vec::new();
+        let mut files_matched = 0u64;
+        let mut total_matches = 0u64;
+        let mut done = 0u64;
+
+        for (path, &size) in paths.iter().zip(sizes.iter()) {
+            let mut pos = 0u64;
+            let mut file_matches = 0u64;
+            let mut offsets: Vec<u64> = Vec::new();
+            let mut truncated = false;
+            while pos < size {
+                if progress(done, total_bytes) {
+                    return cancelled();
+                }
+                let take = (size - pos).min(window);
+                if take < needle.len() as u64 {
+                    done = done.saturating_add(take);
+                    break;
+                }
+                self.copy_file_payload_raw(path, pos, staging, 0, take)?;
+                let launch = {
+                    let kernel = self.api_kernel()?;
+                    cuda(kernel.search(base, take, needle, ignore_case, pos))?
+                };
+                file_matches = file_matches.saturating_add(launch.total);
+                for off in launch.offsets {
+                    if offsets.len() < max_offsets_per_file {
+                        offsets.push(off);
+                    } else {
+                        truncated = true;
+                        break;
+                    }
+                }
+                let last_window = pos + take >= size;
+                let step = if last_window { take } else { take - overlap };
+                done = done.saturating_add(step);
+                if last_window {
+                    break;
+                }
+                pos += step;
+            }
+            if file_matches > 0 {
+                files_matched += 1;
+                total_matches = total_matches.saturating_add(file_matches);
+                truncated = truncated || (offsets.len() as u64) < file_matches;
+                offsets.sort_unstable();
+                hits.push(SearchHit {
+                    path: path.clone(),
+                    matches: file_matches,
+                    offsets,
+                    truncated,
+                });
+            }
+        }
+        progress(done, total_bytes);
+        Ok((hits, files_matched, total_matches, done))
+    }
+
     /// Length of `path`'s content once trailing ASCII whitespace is dropped.
     fn trim_trailing_whitespace_len(&mut self, path: &str, size: u64) -> EResult<u64> {
         let mut end = size;
@@ -5292,11 +5919,37 @@ struct PayloadSpan<'a> {
 }
 
 struct ZipCentralEntry {
+    /// Compression method actually used: 8 (Deflate), or 0 when the member had
+    /// to be stored because its chunks could not be spliced.
+    method: u16,
     crc: u32,
     size: u64,
     comp_size: u64,
     local_offset: u64,
     name: String,
+}
+
+/// Build a ZIP64 local file header. Sizes are always the `0xffffffff` escape,
+/// with the real values living in the ZIP64 extra field.
+fn zip_local_header(method: u16, crc: u32, name: &[u8], extra: &[u8]) -> EResult<Vec<u8>> {
+    let mut hdr = Vec::with_capacity(30 + name.len() + extra.len());
+    push_u32(&mut hdr, 0x0403_4b50);
+    push_u16(&mut hdr, 45);
+    push_u16(&mut hdr, 0);
+    push_u16(&mut hdr, method);
+    push_u16(&mut hdr, 0);
+    push_u16(&mut hdr, 0);
+    push_u32(&mut hdr, crc);
+    push_u32(&mut hdr, u32::MAX);
+    push_u32(&mut hdr, u32::MAX);
+    push_u16(&mut hdr, u16_checked(name.len(), "zip file name length")?);
+    push_u16(
+        &mut hdr,
+        u16_checked(extra.len(), "zip64 local extra length")?,
+    );
+    hdr.extend_from_slice(name);
+    hdr.extend_from_slice(extra);
+    Ok(hdr)
 }
 
 fn pad512(n: u64) -> u64 {
@@ -5398,16 +6051,16 @@ fn gzip_extra_comp_len(extra: &[u8]) -> EResult<u64> {
     ))
 }
 
-fn zip_local_extra(uncomp_size: u64, chunk_comp_sizes: &[u64]) -> Vec<u8> {
+fn zip_local_extra(uncomp_size: u64, comp_size: u64, chunk_comp_sizes: &[u64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(20 + 8 + chunk_comp_sizes.len() * 8);
     push_u16(&mut out, 0x0001);
     push_u16(&mut out, 16);
     push_u64(&mut out, uncomp_size);
-    push_u64(&mut out, chunk_comp_sizes.iter().sum());
+    push_u64(&mut out, comp_size);
     let mut start = 0usize;
     while start < chunk_comp_sizes.len() {
         let take = (chunk_comp_sizes.len() - start).min(8190);
-        push_u16(&mut out, 0x4753);
+        push_u16(&mut out, ZIP_CHUNK_TABLE_TAG);
         push_u16(&mut out, (8 + take * 8) as u16);
         push_u32(&mut out, start as u32);
         push_u32(&mut out, take as u32);
@@ -5464,9 +6117,21 @@ fn zip_sizes_from_local_extra(uncomp32: u32, comp32: u32, extra: &[u8]) -> EResu
     ))
 }
 
-fn zip_deflate_chunks_from_extra(extra: &[u8]) -> EResult<Option<Vec<u64>>> {
+/// A member's private per-chunk compressed-size table, and which of the two
+/// on-disk chunk shapes it describes.
+///
+/// `spliced` is false only for [`ZIP_CHUNK_TABLE_TAG_LEGACY`] archives, whose
+/// chunks are closed by setting bit 0 of their first byte rather than by
+/// appending a terminator.
+struct ZipChunkTable {
+    sizes: Vec<u64>,
+    spliced: bool,
+}
+
+fn zip_deflate_chunks_from_extra(extra: &[u8]) -> EResult<Option<ZipChunkTable>> {
     let mut pos = 0usize;
     let mut sizes = Vec::new();
+    let mut spliced = true;
     while pos + 4 <= extra.len() {
         let tag = read_u16_le(&extra[pos..pos + 2]);
         let len = read_u16_le(&extra[pos + 2..pos + 4]) as usize;
@@ -5476,7 +6141,10 @@ fn zip_deflate_chunks_from_extra(extra: &[u8]) -> EResult<Option<Vec<u64>>> {
                 "invalid ZIP extra field length".into(),
             ));
         }
-        if tag == 0x4753 {
+        if tag == ZIP_CHUNK_TABLE_TAG || tag == ZIP_CHUNK_TABLE_TAG_LEGACY {
+            if tag == ZIP_CHUNK_TABLE_TAG_LEGACY {
+                spliced = false;
+            }
             if len < 8 || (len - 8) % 8 != 0 {
                 return Err(EngineError::InvalidInput(
                     "invalid VRAMDISK ZIP chunk table".into(),
@@ -5508,7 +6176,7 @@ fn zip_deflate_chunks_from_extra(extra: &[u8]) -> EResult<Option<Vec<u64>>> {
     if sizes.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(sizes))
+        Ok(Some(ZipChunkTable { sizes, spliced }))
     }
 }
 
@@ -5520,8 +6188,8 @@ fn patch_zip64_local_sizes(
     comp_size: u64,
     chunk_comp_sizes: &[u64],
 ) -> EResult<()> {
-    let extra = zip_local_extra(uncomp_size, chunk_comp_sizes);
-    debug_assert_eq!(chunk_comp_sizes.iter().sum::<u64>(), comp_size);
+    let extra = zip_local_extra(uncomp_size, comp_size, chunk_comp_sizes);
+    debug_assert!(chunk_comp_sizes.is_empty() || chunk_comp_sizes.iter().sum::<u64>() == comp_size);
     engine.write_raw_internal(path, extra_offset, &extra)?;
     Ok(())
 }
@@ -5620,12 +6288,592 @@ fn u32_checked(v: u64, what: &str) -> EResult<u32> {
     u32::try_from(v).map_err(|_| EngineError::InvalidInput(format!("{what} exceeds u32")))
 }
 
+/// Apply a GF(2) linear operator, held as its 32 column vectors, to a CRC
+/// register.
+///
+/// A reflected CRC-32 register is a vector over GF(2), and every operation the
+/// algorithm performs on it — shifting in a bit, feeding a byte, appending a
+/// run of zeros — is linear. Such an operator is fully described by where it
+/// sends each of the 32 basis vectors, which is what `mat` holds, so applying
+/// it is XOR-ing together the columns selected by the set bits of `crc`.
+fn crc32_apply(mat: &[u32; 32], mut crc: u32) -> u32 {
+    let mut out = 0u32;
+    let mut col = 0usize;
+    while crc != 0 {
+        if crc & 1 != 0 {
+            out ^= mat[col];
+        }
+        crc >>= 1;
+        col += 1;
+    }
+    out
+}
+
+/// Compose two GF(2) operators: the result applies `b` and then `a`.
+fn crc32_compose(a: &[u32; 32], b: &[u32; 32]) -> [u32; 32] {
+    let mut out = [0u32; 32];
+    for (slot, column) in out.iter_mut().zip(b.iter()) {
+        *slot = crc32_apply(a, *column);
+    }
+    out
+}
+
+/// The operator for advancing a CRC-32 register across `len` zero bytes.
+///
+/// Built by repeated squaring over the bit-level operator, so the cost is
+/// logarithmic in `len` rather than linear — the whole point of precomputing
+/// it once per lane length instead of running zlib's `crc32_combine` per lane,
+/// which rebuilds this ladder every call and turned out to cost more than the
+/// GPU scan it was folding.
+fn crc32_zero_shift(len: u64) -> [u32; 32] {
+    // The identity operator: basis vector `n` maps to itself.
+    let mut result = [0u32; 32];
+    for (n, slot) in result.iter_mut().enumerate() {
+        *slot = 1u32 << n;
+    }
+    if len == 0 {
+        return result;
+    }
+    // `odd` starts as the operator for one zero *bit*: the low bit falls out
+    // and, when set, the polynomial is XOR-ed back in.
+    let mut odd = [0u32; 32];
+    odd[0] = 0xedb8_8320;
+    for (n, slot) in odd.iter_mut().enumerate().skip(1) {
+        *slot = 1u32 << (n - 1);
+    }
+    let mut even = crc32_compose(&odd, &odd); // two bits
+    odd = crc32_compose(&even, &even); // four bits
+    let mut len = len;
+    loop {
+        even = crc32_compose(&odd, &odd); // eight bits: one byte, then 2, 4, ...
+        if len & 1 != 0 {
+            result = crc32_compose(&even, &result);
+        }
+        len >>= 1;
+        if len == 0 {
+            break;
+        }
+        odd = crc32_compose(&even, &even);
+        if len & 1 != 0 {
+            result = crc32_compose(&odd, &result);
+        }
+        len >>= 1;
+        if len == 0 {
+            break;
+        }
+    }
+    result
+}
+
+/// Concatenate two CRC-32 values: the checksum of `a` followed by `b`, where
+/// `shift` is [`crc32_zero_shift`] for the length of `b`.
+///
+/// This is zlib's `crc32_combine` with the operator lifted out of the call, so
+/// a fold over thousands of equal-length lanes builds the ladder once. Both
+/// inputs and the result are finalized CRC values (post `^ 0xffffffff`), which
+/// is what `vramdisk_crc32_many_final` returns and what ZIP and gzip store.
+fn crc32_combine_with(shift: &[u32; 32], a: u32, b: u32) -> u32 {
+    crc32_apply(shift, a) ^ b
+}
+
 fn stored_deflate_len(len: u64) -> u64 {
     if len == 0 {
         return 5;
     }
     len + len.div_ceil(65_535) * 5
 }
+
+// ---------------------------------------------------------------------------
+// DEFLATE bitstream structure walker
+// ---------------------------------------------------------------------------
+
+/// Longest DEFLATE Huffman code, in bits (RFC 1951 §3.2.7).
+const DEFLATE_MAX_CODE_BITS: u32 = 15;
+
+/// Entries in a flat Huffman decode table: one per [`DEFLATE_MAX_CODE_BITS`]
+/// bit lookahead value.
+///
+/// A single flat table rather than zlib's two-level one because the walker only
+/// ever builds a handful of tables per megabyte of payload (nvCOMP emits one
+/// dynamic block per chunk), so the 64 KiB fill is amortised over hundreds of
+/// thousands of symbol decodes, and the decode itself becomes one load.
+const DEFLATE_TABLE_LEN: usize = 1 << DEFLATE_MAX_CODE_BITS;
+
+/// Entries in the code-length alphabet's decode table (codes are ≤ 7 bits).
+const DEFLATE_CLEN_TABLE_LEN: usize = 1 << 7;
+
+/// Order in which the 19 code-length code lengths appear in a dynamic header.
+const DEFLATE_CLEN_ORDER: [u8; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
+
+/// Match length for literal/length symbols 257..=285, before the extra bits.
+const DEFLATE_LENGTH_BASE: [u16; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
+];
+
+/// Extra bits carried by literal/length symbols 257..=285.
+const DEFLATE_LENGTH_EXTRA: [u8; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+];
+
+/// Extra bits carried by distance symbols 0..=29.
+const DEFLATE_DIST_EXTRA: [u8; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
+];
+
+/// What a walk of one DEFLATE stream found out about its shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeflateWalk {
+    /// Bit offset, counted from the stream's first bit, one past the last
+    /// block's end-of-block symbol. Everything at or after this offset inside
+    /// the final byte is the encoder's zero padding.
+    end_bit: u64,
+    /// Bit offset of the `BFINAL` flag of the stream's *last* block — the bit
+    /// that has to be cleared to make the stream continue into the next one.
+    /// Not necessarily bit 0 of byte 0: a stream may hold several blocks.
+    final_bfinal_bit: u64,
+    /// Bytes the stream expands to. Checking this against the size the chunk
+    /// was compressed from proves the whole symbol stream was decoded
+    /// correctly, which is what makes [`DeflateWalk::end_bit`] trustworthy.
+    out_len: u64,
+}
+
+/// A cursor that reads DEFLATE's LSB-first bit packing out of a byte slice.
+///
+/// Bits are pulled into a 64-bit accumulator eight bytes at a time so the hot
+/// path (peek 15, consume `n`) is a mask and two shifts. Past the end of the
+/// slice the accumulator reads as zeros, which is harmless because every
+/// consumer checks `have` before committing to a code length — a code that
+/// would need bits beyond the buffer is rejected instead of being decoded out
+/// of phantom zeros.
+struct DeflateBits<'a> {
+    data: &'a [u8],
+    /// Index of the next byte to pull into `acc`.
+    next: usize,
+    /// Bit buffer, LSB = next bit of the stream.
+    acc: u64,
+    /// Valid bits currently in `acc`.
+    have: u32,
+    /// Bits consumed so far, from the start of `data`.
+    pos: u64,
+}
+
+impl<'a> DeflateBits<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            next: 0,
+            acc: 0,
+            have: 0,
+            pos: 0,
+        }
+    }
+
+    #[inline]
+    fn refill(&mut self) {
+        while self.have <= 56 {
+            let Some(&b) = self.data.get(self.next) else {
+                break;
+            };
+            self.acc |= (b as u64) << self.have;
+            self.have += 8;
+            self.next += 1;
+        }
+    }
+
+    /// Consume the next `n` (≤ 32) bits, LSB first.
+    #[inline]
+    fn take(&mut self, n: u32) -> EResult<u32> {
+        self.refill();
+        if self.have < n {
+            return Err(deflate_error("stream ends inside a code"));
+        }
+        let v = (self.acc & ((1u64 << n) - 1)) as u32;
+        self.acc >>= n;
+        self.have -= n;
+        self.pos += u64::from(n);
+        Ok(v)
+    }
+
+    /// Consume one Huffman code and return its symbol. `table` is a flat
+    /// lookup table with a power-of-two length, indexed by that many bits of
+    /// lookahead.
+    #[inline]
+    fn decode(&mut self, table: &[u16]) -> EResult<u16> {
+        self.refill();
+        let entry = table[(self.acc & (table.len() as u64 - 1)) as usize];
+        let len = u32::from(entry & 0xf);
+        if len == 0 {
+            return Err(deflate_error("undefined Huffman code"));
+        }
+        if len > self.have {
+            return Err(deflate_error("stream ends inside a Huffman code"));
+        }
+        self.acc >>= len;
+        self.have -= len;
+        self.pos += u64::from(len);
+        Ok(entry >> 4)
+    }
+
+    /// Discard bits up to the next byte boundary (what a stored block header
+    /// does before its LEN/NLEN pair).
+    fn align(&mut self) -> EResult<()> {
+        let rem = (self.pos % 8) as u32;
+        if rem != 0 {
+            self.take(8 - rem)?;
+        }
+        Ok(())
+    }
+
+    /// Jump `n` bytes forward from the current (byte-aligned) position.
+    fn skip_bytes(&mut self, n: u64) -> EResult<()> {
+        debug_assert_eq!(self.pos % 8, 0);
+        let byte = self.pos / 8 + n;
+        if byte > self.data.len() as u64 {
+            return Err(deflate_error(
+                "stored block runs past the end of the stream",
+            ));
+        }
+        self.next = byte as usize;
+        self.acc = 0;
+        self.have = 0;
+        self.pos = byte * 8;
+        Ok(())
+    }
+}
+
+fn deflate_error(what: &str) -> EngineError {
+    EngineError::InvalidInput(format!("malformed DEFLATE stream: {what}"))
+}
+
+/// Reverse the low `len` bits of `code`.
+///
+/// Canonical Huffman codes are defined MSB-first but written to the bitstream
+/// LSB-first, so the flat lookup table has to be indexed by the reversed code.
+fn reverse_code_bits(mut code: u32, len: u32) -> u32 {
+    let mut out = 0u32;
+    for _ in 0..len {
+        out = (out << 1) | (code & 1);
+        code >>= 1;
+    }
+    out
+}
+
+/// Fill `table` (`1 << bits` entries) with a canonical Huffman code built from
+/// `lengths`, packing each entry as `symbol << 4 | code_length`.
+///
+/// Entries left at zero decode as "undefined": DEFLATE explicitly permits
+/// *incomplete* codes (a distance tree with a single one-bit code, or none at
+/// all, is legal), and those unreachable slots must be rejected rather than
+/// silently aliased onto a real symbol. Over-subscribed codes are rejected up
+/// front, since they have no canonical assignment at all.
+fn build_deflate_table(lengths: &[u8], bits: u32, table: &mut [u16]) -> EResult<()> {
+    let n = 1usize << bits;
+    table[..n].fill(0);
+    let mut count = [0u16; 16];
+    for &l in lengths {
+        if u32::from(l) > bits {
+            return Err(deflate_error(
+                "Huffman code longer than the alphabet allows",
+            ));
+        }
+        count[l as usize] += 1;
+    }
+    count[0] = 0;
+    let mut left = 1i32;
+    for &at_len in count.iter().take(bits as usize + 1).skip(1) {
+        left <<= 1;
+        left -= i32::from(at_len);
+        if left < 0 {
+            return Err(deflate_error("over-subscribed Huffman code"));
+        }
+    }
+    let mut next_code = [0u32; 16];
+    let mut code = 0u32;
+    for l in 1..=bits as usize {
+        code = (code + u32::from(count[l - 1])) << 1;
+        next_code[l] = code;
+    }
+    for (sym, &l) in lengths.iter().enumerate() {
+        if l == 0 {
+            continue;
+        }
+        let l = u32::from(l);
+        let assigned = next_code[l as usize];
+        next_code[l as usize] += 1;
+        let entry = ((sym as u16) << 4) | l as u16;
+        let step = 1usize << l;
+        let mut i = reverse_code_bits(assigned, l) as usize;
+        while i < n {
+            table[i] = entry;
+            i += step;
+        }
+    }
+    Ok(())
+}
+
+/// Walks DEFLATE streams to find where they end, reusing its decode tables.
+///
+/// # Why this exists
+///
+/// nvCOMP compresses a ZIP member as many independent 1 MiB chunks so the GPU
+/// has something to parallelise over, but a ZIP member is one DEFLATE stream.
+/// DEFLATE is a *bitstream*: a block ends at an arbitrary bit inside its last
+/// byte and the encoder zero-pads the rest of that byte. Concatenating chunks
+/// at byte boundaries therefore hands the decoder the padding as if it were the
+/// next block header, which is exactly the bug this walker was written to fix —
+/// archives that VRAMDISK could re-read (it used its own chunk table) but that
+/// Windows Explorer and .NET's `ZipArchive` could not open at all.
+///
+/// Splicing correctly needs one number per chunk that nvCOMP does not report:
+/// the bit at which the compressed stream ends. Nothing short of following the
+/// block headers *and* every Huffman code recovers it, so that is what this
+/// does — it decodes the whole symbol stream but produces no output, keeping
+/// neither a window nor the decompressed bytes.
+///
+/// # Trusting the answer
+///
+/// A wrong end bit corrupts an archive silently, so the walk is self-checking:
+/// it tracks the number of bytes the stream *would* have produced, and the
+/// caller compares that against the size the chunk was compressed from. The
+/// two can only agree if every code length along the way was right, which is
+/// what makes [`DeflateWalk::end_bit`] safe to splice on.
+struct DeflateWalker {
+    litlen: Vec<u16>,
+    dist: Vec<u16>,
+    clen: Vec<u16>,
+    /// Code lengths for the literal/length and distance alphabets, back to
+    /// back, as a dynamic header spells them out (288 + 32 at most).
+    lengths: [u8; 320],
+}
+
+impl DeflateWalker {
+    fn new() -> Self {
+        Self {
+            litlen: vec![0; DEFLATE_TABLE_LEN],
+            dist: vec![0; DEFLATE_TABLE_LEN],
+            clen: vec![0; DEFLATE_CLEN_TABLE_LEN],
+            lengths: [0; 320],
+        }
+    }
+
+    /// Walk `data` from its first bit to the end of its final block.
+    fn walk(&mut self, data: &[u8]) -> EResult<DeflateWalk> {
+        let mut bits = DeflateBits::new(data);
+        let mut out_len = 0u64;
+        // Assigned on every iteration; the stream is only left through the
+        // `BFINAL` break, so the last block's flag is what survives.
+        let mut final_bfinal_bit: u64;
+        loop {
+            final_bfinal_bit = bits.pos;
+            let bfinal = bits.take(1)?;
+            let btype = bits.take(2)?;
+            match btype {
+                0 => {
+                    bits.align()?;
+                    let len = bits.take(16)?;
+                    let nlen = bits.take(16)?;
+                    if nlen != (!len & 0xffff) {
+                        return Err(deflate_error("stored block LEN/NLEN mismatch"));
+                    }
+                    bits.skip_bytes(u64::from(len))?;
+                    out_len += u64::from(len);
+                }
+                1 => {
+                    self.set_fixed_tables()?;
+                    out_len += walk_deflate_symbols(&mut bits, &self.litlen, &self.dist)?;
+                }
+                2 => {
+                    self.read_dynamic_tables(&mut bits)?;
+                    out_len += walk_deflate_symbols(&mut bits, &self.litlen, &self.dist)?;
+                }
+                _ => return Err(deflate_error("reserved block type 3")),
+            }
+            if bfinal == 1 {
+                break;
+            }
+        }
+        Ok(DeflateWalk {
+            end_bit: bits.pos,
+            final_bfinal_bit,
+            out_len,
+        })
+    }
+
+    /// Install the fixed Huffman code of RFC 1951 §3.2.6.
+    fn set_fixed_tables(&mut self) -> EResult<()> {
+        let mut litlen = [0u8; 288];
+        for (sym, l) in litlen.iter_mut().enumerate() {
+            *l = match sym {
+                0..=143 => 8,
+                144..=255 => 9,
+                256..=279 => 7,
+                _ => 8,
+            };
+        }
+        build_deflate_table(&litlen, DEFLATE_MAX_CODE_BITS, &mut self.litlen)?;
+        build_deflate_table(&[5u8; 32], DEFLATE_MAX_CODE_BITS, &mut self.dist)
+    }
+
+    /// Read a dynamic block's header and install the codes it describes.
+    fn read_dynamic_tables(&mut self, bits: &mut DeflateBits<'_>) -> EResult<()> {
+        let hlit = bits.take(5)? as usize + 257;
+        let hdist = bits.take(5)? as usize + 1;
+        let hclen = bits.take(4)? as usize + 4;
+        if hlit > 288 || hdist > 32 {
+            return Err(deflate_error("dynamic header alphabet is too large"));
+        }
+        let mut clen_lengths = [0u8; 19];
+        for &slot in DEFLATE_CLEN_ORDER.iter().take(hclen) {
+            clen_lengths[slot as usize] = bits.take(3)? as u8;
+        }
+        build_deflate_table(&clen_lengths, 7, &mut self.clen)?;
+
+        let total = hlit + hdist;
+        // Disjoint field borrows: the code-length code is read while the
+        // alphabet it describes is written.
+        let clen = &self.clen;
+        let lengths = &mut self.lengths[..total];
+        lengths.fill(0);
+        let mut i = 0usize;
+        while i < total {
+            let sym = bits.decode(clen)?;
+            let (repeat, value) = match sym {
+                0..=15 => {
+                    lengths[i] = sym as u8;
+                    i += 1;
+                    continue;
+                }
+                16 => {
+                    if i == 0 {
+                        return Err(deflate_error("code-length repeat with nothing to repeat"));
+                    }
+                    (3 + bits.take(2)? as usize, lengths[i - 1])
+                }
+                17 => (3 + bits.take(3)? as usize, 0u8),
+                18 => (11 + bits.take(7)? as usize, 0u8),
+                _ => return Err(deflate_error("invalid code-length symbol")),
+            };
+            if i + repeat > total {
+                return Err(deflate_error("code-length repeat overruns the alphabet"));
+            }
+            lengths[i..i + repeat].fill(value);
+            i += repeat;
+        }
+        build_deflate_table(
+            &self.lengths[..hlit],
+            DEFLATE_MAX_CODE_BITS,
+            &mut self.litlen,
+        )?;
+        build_deflate_table(
+            &self.lengths[hlit..total],
+            DEFLATE_MAX_CODE_BITS,
+            &mut self.dist,
+        )
+    }
+}
+
+/// Consume one Huffman-coded block's symbols, returning the bytes it emits.
+fn walk_deflate_symbols(bits: &mut DeflateBits<'_>, litlen: &[u16], dist: &[u16]) -> EResult<u64> {
+    let mut out_len = 0u64;
+    loop {
+        let sym = bits.decode(litlen)?;
+        if sym < 256 {
+            out_len += 1;
+            continue;
+        }
+        if sym == 256 {
+            return Ok(out_len);
+        }
+        let idx = sym as usize - 257;
+        if idx >= DEFLATE_LENGTH_BASE.len() {
+            return Err(deflate_error("literal/length symbol 286 or 287"));
+        }
+        let extra = u32::from(DEFLATE_LENGTH_EXTRA[idx]);
+        let len = u64::from(DEFLATE_LENGTH_BASE[idx]) + u64::from(bits.take(extra)?);
+        let dsym = bits.decode(dist)? as usize;
+        if dsym >= DEFLATE_DIST_EXTRA.len() {
+            return Err(deflate_error("distance symbol 30 or 31"));
+        }
+        bits.take(u32::from(DEFLATE_DIST_EXTRA[dsym]))?;
+        out_len += len;
+    }
+}
+
+/// Walk a group of compressed chunks, spreading them over the CPU cores.
+///
+/// The walk is the one part of the ZIP writer that runs on the host, and it is
+/// proportional to the number of Huffman symbols in the batch, so leaving it on
+/// one core would make it — not the GPU — the writer's bottleneck. Blobs left
+/// empty by the caller (the member's final chunk, which is spliced to nothing
+/// and so needs no end bit) are skipped, and a chunk whose walk fails comes
+/// back as `None` so the caller can fall back to storing the member.
+fn walk_deflate_blobs(blobs: &[Vec<u8>]) -> Vec<Option<DeflateWalk>> {
+    let mut out: Vec<Option<DeflateWalk>> = vec![None; blobs.len()];
+    let workers = thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(blobs.len())
+        .max(1);
+    if workers == 1 {
+        let mut walker = DeflateWalker::new();
+        for (blob, slot) in blobs.iter().zip(out.iter_mut()) {
+            if !blob.is_empty() {
+                *slot = walker.walk(blob).ok();
+            }
+        }
+        return out;
+    }
+    let per = blobs.len().div_ceil(workers);
+    thread::scope(|scope| {
+        for (src, dst) in blobs.chunks(per).zip(out.chunks_mut(per)) {
+            scope.spawn(move || {
+                let mut walker = DeflateWalker::new();
+                for (blob, slot) in src.iter().zip(dst.iter_mut()) {
+                    if !blob.is_empty() {
+                        *slot = walker.walk(blob).ok();
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
+/// The bytes that turn a chunk boundary into a byte boundary.
+///
+/// `end_bit` is where the preceding chunk's stream stopped. The decoder resumes
+/// there, so what it must find is an *empty stored block*: a `BFINAL=0`,
+/// `BTYPE=00` header, then padding to the next byte boundary, then `LEN=0` and
+/// `NLEN=0xffff`. Every bit of that header is a zero and the encoder already
+/// zero-padded the tail of its last byte, so the whole joiner is four bytes of
+/// `00 00 ff ff` — *provided* the three header bits still fit in that byte.
+/// When fewer than three bits are spare (including the case where the stream
+/// happened to end exactly on a byte boundary) the header spills into a byte of
+/// its own and the joiner is five bytes instead. Getting this choice wrong by
+/// one is precisely the failure the walker exists to prevent: the decoder would
+/// read the following chunk's first bytes as a stored block's LEN/NLEN.
+fn zip_deflate_joiner(end_bit: u64) -> &'static [u8] {
+    let used = (end_bit % 8) as u32;
+    let spare = if used == 0 { 0 } else { 8 - used };
+    if spare >= 3 {
+        &[0x00, 0x00, 0xff, 0xff]
+    } else {
+        &[0x00, 0x00, 0x00, 0xff, 0xff]
+    }
+}
+
+/// The five bytes that terminate a spliced chunk when it is read back on its
+/// own: a `BFINAL=1`, `BTYPE=00`, `LEN=0` stored block.
+///
+/// A non-final chunk written by [`StorageEngine::write_zip_deflate_payload`]
+/// ends with the joiner above, which leaves the stream byte-aligned and still
+/// open, so the extractor can close it by appending a whole byte-aligned block
+/// rather than having to hunt for the `BFINAL` bit it cleared.
+const ZIP_DEFLATE_TERMINATOR: [u8; 5] = [0x01, 0x00, 0x00, 0xff, 0xff];
 
 #[cfg(test)]
 mod tests {
@@ -5902,6 +7150,583 @@ mod tests {
                 state.to_be_bytes().to_vec()
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // DEFLATE walker
+    // -----------------------------------------------------------------------
+
+    /// splitmix64, so the randomized walker tests are reproducible.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    /// Writes DEFLATE's LSB-first bit packing and keeps an exact bit count, so
+    /// a test knows the very answer [`DeflateWalker`] has to come back with.
+    struct TestBitWriter {
+        out: Vec<u8>,
+        bit: u64,
+    }
+
+    impl TestBitWriter {
+        fn new() -> Self {
+            Self {
+                out: Vec::new(),
+                bit: 0,
+            }
+        }
+
+        /// Append the low `bits` bits of `value`, least significant first.
+        fn put(&mut self, value: u32, bits: u32) {
+            for i in 0..bits {
+                if self.bit % 8 == 0 {
+                    self.out.push(0);
+                }
+                let idx = (self.bit / 8) as usize;
+                self.out[idx] |= (((value >> i) & 1) as u8) << (self.bit % 8);
+                self.bit += 1;
+            }
+        }
+
+        /// Append a Huffman code, which unlike everything else goes out most
+        /// significant bit first.
+        fn put_code(&mut self, code: u32, len: u32) {
+            for i in (0..len).rev() {
+                self.put((code >> i) & 1, 1);
+            }
+        }
+
+        fn align(&mut self) {
+            while self.bit % 8 != 0 {
+                self.put(0, 1);
+            }
+        }
+    }
+
+    /// Canonical code for every symbol, matching what [`build_deflate_table`]
+    /// expects to decode.
+    fn canonical_codes(lengths: &[u8]) -> Vec<u32> {
+        let mut count = [0u32; 16];
+        for &l in lengths {
+            if l > 0 {
+                count[l as usize] += 1;
+            }
+        }
+        let mut next = [0u32; 16];
+        let mut code = 0u32;
+        for l in 1..16 {
+            code = (code + count[l - 1]) << 1;
+            next[l] = code;
+        }
+        let mut out = vec![0u32; lengths.len()];
+        for (sym, &l) in lengths.iter().enumerate() {
+            if l > 0 {
+                out[sym] = next[l as usize];
+                next[l as usize] += 1;
+            }
+        }
+        out
+    }
+
+    /// `n` code lengths whose Kraft sum is exactly 1, i.e. a complete code.
+    ///
+    /// Built by repeatedly splitting a leaf in two, which preserves the sum by
+    /// construction and reaches every shape a real encoder could produce.
+    fn random_complete_lengths(rng: &mut TestRng, n: usize, max: u8) -> Vec<u8> {
+        assert!(n >= 1);
+        if n == 1 {
+            // The one incomplete code DEFLATE explicitly allows.
+            return vec![1];
+        }
+        let mut lengths = vec![0u8; n];
+        lengths[0] = 1;
+        lengths[1] = 1;
+        for i in 2..n {
+            let start = rng.below(i);
+            let mut j = start;
+            loop {
+                if lengths[j] < max {
+                    lengths[j] += 1;
+                    lengths[i] = lengths[j];
+                    break;
+                }
+                j = (j + 1) % i;
+                assert_ne!(j, start, "no room left under a depth limit of {max}");
+            }
+        }
+        // Shuffle, so the canonical assignment is not always in tree order.
+        for i in (1..n).rev() {
+            let j = rng.below(i + 1);
+            lengths.swap(i, j);
+        }
+        lengths
+    }
+
+    /// Scatter a complete code over `slots` symbols, leaving the rest unused
+    /// (length 0) so dynamic headers have zero runs to encode with 17/18.
+    /// `required` is a symbol that must end up with a code.
+    fn scatter_lengths(rng: &mut TestRng, slots: usize, used: usize, required: usize) -> Vec<u8> {
+        let used = used.clamp(1, slots);
+        let lengths = random_complete_lengths(rng, used, 15);
+        let mut positions: Vec<usize> = (0..slots).collect();
+        for i in (1..slots).rev() {
+            let j = rng.below(i + 1);
+            positions.swap(i, j);
+        }
+        if !positions[..used].contains(&required) {
+            positions[0] = required;
+        }
+        let mut out = vec![0u8; slots];
+        for (slot, len) in positions[..used].iter().zip(lengths) {
+            out[*slot] = len;
+        }
+        out
+    }
+
+    /// The fixed literal/length code lengths of RFC 1951 §3.2.6.
+    fn fixed_litlen_lengths() -> Vec<u8> {
+        (0..288usize)
+            .map(|sym| match sym {
+                0..=143 => 8u8,
+                144..=255 => 9,
+                256..=279 => 7,
+                _ => 8,
+            })
+            .collect()
+    }
+
+    /// Emit the symbol stream of a Huffman-coded block, ending with symbol 256.
+    /// Returns how many bytes it decodes to.
+    fn emit_symbols(
+        rng: &mut TestRng,
+        w: &mut TestBitWriter,
+        litlen: &[u8],
+        dist: &[u8],
+        count: usize,
+    ) -> u64 {
+        let lit_codes = canonical_codes(litlen);
+        let dist_codes = canonical_codes(dist);
+        let literals: Vec<usize> = (0..256).filter(|&s| litlen[s] > 0).collect();
+        let lengths: Vec<usize> = (257..litlen.len().min(286))
+            .filter(|&s| litlen[s] > 0)
+            .collect();
+        let dists: Vec<usize> = (0..dist.len().min(30)).filter(|&s| dist[s] > 0).collect();
+        let mut out_len = 0u64;
+        for _ in 0..count {
+            let want_match = !lengths.is_empty() && !dists.is_empty() && rng.below(3) == 0;
+            if !want_match {
+                if literals.is_empty() {
+                    continue;
+                }
+                let sym = literals[rng.below(literals.len())];
+                w.put_code(lit_codes[sym], u32::from(litlen[sym]));
+                out_len += 1;
+                continue;
+            }
+            let sym = lengths[rng.below(lengths.len())];
+            w.put_code(lit_codes[sym], u32::from(litlen[sym]));
+            let idx = sym - 257;
+            let extra = u32::from(DEFLATE_LENGTH_EXTRA[idx]);
+            let extra_bits = if extra == 0 {
+                0
+            } else {
+                rng.below(1 << extra) as u32
+            };
+            w.put(extra_bits, extra);
+            out_len += u64::from(DEFLATE_LENGTH_BASE[idx]) + u64::from(extra_bits);
+            let dsym = dists[rng.below(dists.len())];
+            w.put_code(dist_codes[dsym], u32::from(dist[dsym]));
+            let dextra = u32::from(DEFLATE_DIST_EXTRA[dsym]);
+            let dextra_bits = if dextra == 0 {
+                0
+            } else {
+                rng.below(1 << dextra) as u32
+            };
+            w.put(dextra_bits, dextra);
+        }
+        w.put_code(lit_codes[256], u32::from(litlen[256]));
+        out_len
+    }
+
+    /// Write a dynamic block's header, spelling the two alphabets out through
+    /// the code-length alphabet (with 16/17/18 runs where they apply).
+    fn emit_dynamic_header(rng: &mut TestRng, w: &mut TestBitWriter, litlen: &[u8], dist: &[u8]) {
+        w.put((litlen.len() - 257) as u32, 5);
+        w.put((dist.len() - 1) as u32, 5);
+        w.put(19 - 4, 4);
+        let clen_lengths = random_complete_lengths(rng, 19, 7);
+        let clen_codes = canonical_codes(&clen_lengths);
+        for &slot in DEFLATE_CLEN_ORDER.iter() {
+            w.put(u32::from(clen_lengths[slot as usize]), 3);
+        }
+        let all: Vec<u8> = litlen.iter().chain(dist.iter()).copied().collect();
+        let mut i = 0usize;
+        while i < all.len() {
+            let value = all[i];
+            let mut run = 1usize;
+            while i + run < all.len() && all[i + run] == value {
+                run += 1;
+            }
+            let emit = |w: &mut TestBitWriter, sym: usize| {
+                w.put_code(clen_codes[sym], u32::from(clen_lengths[sym]));
+            };
+            if value == 0 && run >= 11 {
+                let take = run.min(138);
+                emit(w, 18);
+                w.put((take - 11) as u32, 7);
+                i += take;
+            } else if value == 0 && run >= 3 {
+                let take = run.min(10);
+                emit(w, 17);
+                w.put((take - 3) as u32, 3);
+                i += take;
+            } else if run >= 4 {
+                emit(w, value as usize);
+                let take = (run - 1).min(6);
+                emit(w, 16);
+                w.put((take - 3) as u32, 2);
+                i += 1 + take;
+            } else {
+                emit(w, value as usize);
+                i += 1;
+            }
+        }
+    }
+
+    /// Emit one random block (header included) and return the bytes it decodes
+    /// to. `bfinal` decides whether the stream ends here.
+    fn emit_random_block(rng: &mut TestRng, w: &mut TestBitWriter, bfinal: bool) -> u64 {
+        let btype = rng.below(3) as u32;
+        w.put(u32::from(bfinal), 1);
+        w.put(btype, 2);
+        match btype {
+            0 => {
+                w.align();
+                let len = rng.below(300);
+                w.put(len as u32, 16);
+                w.put(!(len as u32) & 0xffff, 16);
+                for _ in 0..len {
+                    w.put(rng.below(256) as u32, 8);
+                }
+                len as u64
+            }
+            1 => {
+                let litlen = fixed_litlen_lengths();
+                let dist = vec![5u8; 32];
+                let count = 1 + rng.below(400);
+                emit_symbols(rng, w, &litlen, &dist, count)
+            }
+            _ => {
+                let hlit = 257 + rng.below(32);
+                let hdist = 1 + rng.below(30);
+                let lit_used = 2 + rng.below(hlit - 1);
+                let litlen = scatter_lengths(rng, hlit, lit_used, 256);
+                let dist = if hdist == 1 {
+                    vec![1u8]
+                } else {
+                    let dist_used = 1 + rng.below(hdist);
+                    scatter_lengths(rng, hdist, dist_used, 0)
+                };
+                emit_dynamic_header(rng, w, &litlen, &dist);
+                let count = 1 + rng.below(400);
+                emit_symbols(rng, w, &litlen, &dist, count)
+            }
+        }
+    }
+
+    /// One synthetic stream plus the answers the walker must reproduce.
+    struct TestStream {
+        bytes: Vec<u8>,
+        end_bit: u64,
+        final_bfinal_bit: u64,
+        out_len: u64,
+    }
+
+    fn random_stream(rng: &mut TestRng, blocks: usize) -> TestStream {
+        let mut w = TestBitWriter::new();
+        let mut out_len = 0u64;
+        let mut final_bfinal_bit = 0u64;
+        for b in 0..blocks {
+            final_bfinal_bit = w.bit;
+            out_len += emit_random_block(rng, &mut w, b + 1 == blocks);
+        }
+        let end_bit = w.bit;
+        // Encoders zero-pad the tail of the last byte, and so does this.
+        w.align();
+        TestStream {
+            bytes: w.out,
+            end_bit,
+            final_bfinal_bit,
+            out_len,
+        }
+    }
+
+    #[test]
+    fn deflate_walker_matches_synthetic_streams() {
+        let mut rng = TestRng(0x5EED_1234_ABCD_0001);
+        let mut walker = DeflateWalker::new();
+        for case in 0..600 {
+            let blocks = 1 + case % 4;
+            let stream = random_stream(&mut rng, blocks);
+            let walk = walker
+                .walk(&stream.bytes)
+                .unwrap_or_else(|e| panic!("case {case} ({blocks} blocks) failed to walk: {e:?}"));
+            assert_eq!(walk.end_bit, stream.end_bit, "case {case}: end bit");
+            assert_eq!(
+                walk.final_bfinal_bit, stream.final_bfinal_bit,
+                "case {case}: final BFINAL bit"
+            );
+            assert_eq!(walk.out_len, stream.out_len, "case {case}: output length");
+            assert!(
+                stream.bytes.len() as u64 * 8 - walk.end_bit < 8,
+                "case {case}: the walk must land inside the last byte"
+            );
+        }
+    }
+
+    #[test]
+    fn deflate_walker_splices_streams_byte_aligned() {
+        let mut rng = TestRng(0x5EED_1234_ABCD_0002);
+        let mut walker = DeflateWalker::new();
+        let mut four_byte = 0usize;
+        let mut five_byte = 0usize;
+        for case in 0..400 {
+            let head = random_stream(&mut rng, 1 + case % 3);
+            let tail = random_stream(&mut rng, 1 + (case + 1) % 3);
+            let head_walk = walker.walk(&head.bytes).expect("head walks");
+
+            // Exactly what `write_zip_deflate_chunks` does to a non-final chunk.
+            let used = head_walk.end_bit.div_ceil(8) as usize;
+            let mut joined = head.bytes[..used].to_vec();
+            let bfinal_byte = (head_walk.final_bfinal_bit / 8) as usize;
+            joined[bfinal_byte] &= !(1u8 << (head_walk.final_bfinal_bit % 8));
+            let rem = (head_walk.end_bit % 8) as u32;
+            if rem != 0 {
+                joined[used - 1] &= ((1u16 << rem) - 1) as u8;
+            }
+            let joiner = zip_deflate_joiner(head_walk.end_bit);
+            if joiner.len() == 4 {
+                four_byte += 1;
+            } else {
+                five_byte += 1;
+            }
+            let prefix = used + joiner.len();
+            joined.extend_from_slice(joiner);
+            joined.extend_from_slice(&tail.bytes);
+
+            let walk = walker
+                .walk(&joined)
+                .unwrap_or_else(|e| panic!("case {case}: spliced stream does not walk: {e:?}"));
+            assert_eq!(
+                walk.out_len,
+                head.out_len + tail.out_len,
+                "case {case}: spliced output length"
+            );
+            assert_eq!(
+                walk.end_bit,
+                prefix as u64 * 8 + tail.end_bit,
+                "case {case}: spliced end bit"
+            );
+            assert_eq!(
+                walk.final_bfinal_bit,
+                prefix as u64 * 8 + tail.final_bfinal_bit,
+                "case {case}: spliced final BFINAL bit"
+            );
+        }
+        // Both joiner lengths have to be exercised, or the test proves nothing
+        // about the alignment decision.
+        assert!(four_byte > 20, "only {four_byte} four-byte joiners");
+        assert!(five_byte > 20, "only {five_byte} five-byte joiners");
+    }
+
+    #[test]
+    fn deflate_walker_handles_terminator_and_empty_stored_blocks() {
+        let mut walker = DeflateWalker::new();
+        let walk = walker.walk(&ZIP_DEFLATE_TERMINATOR).expect("terminator");
+        assert_eq!(walk.out_len, 0);
+        assert_eq!(walk.end_bit, 5 * 8);
+        assert_eq!(walk.final_bfinal_bit, 0);
+
+        // A non-final empty stored block followed by the terminator: the exact
+        // shape a spliced chunk is closed with on the extract path.
+        let mut bytes = vec![0x00, 0x00, 0x00, 0xff, 0xff];
+        bytes.extend_from_slice(&ZIP_DEFLATE_TERMINATOR);
+        let walk = walker.walk(&bytes).expect("joined empty blocks");
+        assert_eq!(walk.out_len, 0);
+        assert_eq!(walk.end_bit, 10 * 8);
+        assert_eq!(walk.final_bfinal_bit, 5 * 8);
+    }
+
+    #[test]
+    fn deflate_joiner_lengths_follow_the_spare_bits() {
+        for used in 0..8u64 {
+            let joiner = zip_deflate_joiner(64 + used);
+            let spare = if used == 0 { 0 } else { 8 - used };
+            let want = if spare >= 3 { 4 } else { 5 };
+            assert_eq!(joiner.len(), want, "{used} bits used in the last byte");
+            assert_eq!(joiner[joiner.len() - 2..], [0xff, 0xff]);
+            assert!(joiner[..joiner.len() - 2].iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn deflate_walker_rejects_malformed_streams() {
+        let mut walker = DeflateWalker::new();
+        assert!(walker.walk(&[]).is_err(), "empty input");
+        assert!(walker.walk(&[0x07]).is_err(), "reserved block type 3");
+        // Final stored block whose NLEN does not complement LEN.
+        assert!(
+            walker.walk(&[0x01, 0x05, 0x00, 0x00, 0x00]).is_err(),
+            "bad NLEN"
+        );
+        // Final stored block claiming more bytes than are present.
+        assert!(
+            walker.walk(&[0x01, 0x05, 0x00, 0xfa, 0xff, 0x01]).is_err(),
+            "stored block overruns"
+        );
+        // A fixed-Huffman block that never reaches its end-of-block symbol.
+        assert!(walker.walk(&[0x03]).is_err(), "truncated fixed block");
+        // Truncated dynamic header.
+        assert!(
+            walker.walk(&[0x05, 0x00]).is_err(),
+            "truncated dynamic header"
+        );
+    }
+
+    #[test]
+    fn deflate_table_rejects_over_subscribed_codes() {
+        let mut table = vec![0u16; DEFLATE_TABLE_LEN];
+        assert!(build_deflate_table(&[1, 1, 1], 15, &mut table).is_err());
+        assert!(build_deflate_table(&[1, 1], 15, &mut table).is_ok());
+        // Incomplete codes are legal; the unreachable half must stay undefined.
+        assert!(build_deflate_table(&[1], 15, &mut table).is_ok());
+        assert_eq!(table[0] & 0xf, 1, "the single one-bit code is decodable");
+        assert_eq!(table[1] & 0xf, 0, "its complement is not");
+    }
+
+    /// The end-to-end proof that the splice is right: take real nvCOMP Deflate
+    /// chunks, join them the way the ZIP writer does, and check that the result
+    /// is one stream that inflates back to the original bytes.
+    ///
+    /// The synthetic tests above pin the walker down against streams whose
+    /// answer is known by construction; this one pins it against the encoder
+    /// whose output actually ships, including the padding it leaves behind.
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn deflate_splice_of_nvcomp_chunks_roundtrips() {
+        let mib = 1024 * 1024usize;
+        let chunks = 8usize;
+        let mut vram = Vram::new(0, 64 * 1024 * 1024).expect("vram");
+        let mut codec =
+            NvcompBatchedCodec::load(&vram, NvcompFrameCodec::Deflate).expect("nvcomp deflate");
+        let base = vram.buf_device_ptr();
+
+        // Runs, pseudo-random, mixed and text-like payloads, plus a short final
+        // chunk — every shape a real member's chunks come in.
+        let mut rng = TestRng(0xC0FF_EE00_1234_5678);
+        let sizes: Vec<u64> = (0..chunks)
+            .map(|k| if k + 1 == chunks { mib / 3 } else { mib } as u64)
+            .collect();
+        let mut source: Vec<u8> = Vec::new();
+        for (k, &take) in sizes.iter().enumerate() {
+            for i in 0..take as usize {
+                source.push(match k % 4 {
+                    0 => (i / 64) as u8,
+                    1 => rng.next_u64() as u8,
+                    2 => {
+                        if i % 11 == 0 {
+                            rng.next_u64() as u8
+                        } else {
+                            (i % 250) as u8
+                        }
+                    }
+                    _ => b'a' + ((i / (2 + k)) % 26) as u8,
+                });
+            }
+        }
+        vram.write_at(0, &source).expect("stage source");
+        vram.sync().expect("sync");
+        let mut ptrs = Vec::with_capacity(chunks);
+        let mut off = 0u64;
+        for &s in &sizes {
+            ptrs.push(base + off);
+            off += s;
+        }
+        let comp = codec.compress_device(&ptrs, &sizes).expect("compress");
+
+        let mut walker = DeflateWalker::new();
+        let mut spliced: Vec<u8> = Vec::new();
+        for (i, &clen) in comp.iter().enumerate() {
+            let mut blob = vec![0u8; clen as usize];
+            codec
+                .copy_compressed_slot_to_host(i, &mut blob)
+                .expect("compressed slot to host");
+            if i + 1 == chunks {
+                spliced.extend_from_slice(&blob);
+                continue;
+            }
+            let walk = walker
+                .walk(&blob)
+                .unwrap_or_else(|e| panic!("nvCOMP chunk {i} does not walk: {e:?}"));
+            assert_eq!(
+                walk.out_len, sizes[i],
+                "chunk {i} decodes to its input size"
+            );
+            assert!(
+                blob.len() as u64 * 8 - walk.end_bit < 8,
+                "chunk {i}: end bit is not inside the last byte"
+            );
+            let used = walk.end_bit.div_ceil(8) as usize;
+            let rem = (walk.end_bit % 8) as u32;
+            if rem != 0 {
+                assert_eq!(
+                    blob[used - 1] >> rem,
+                    0,
+                    "chunk {i}: nvCOMP left non-zero padding after the stream"
+                );
+            }
+            blob.truncate(used);
+            let bfinal_byte = (walk.final_bfinal_bit / 8) as usize;
+            blob[bfinal_byte] &= !(1u8 << (walk.final_bfinal_bit % 8));
+            spliced.extend_from_slice(&blob);
+            spliced.extend_from_slice(zip_deflate_joiner(walk.end_bit));
+        }
+
+        let whole = walker.walk(&spliced).expect("spliced stream walks");
+        assert_eq!(
+            whole.out_len,
+            source.len() as u64,
+            "spliced stream accounts for the whole member"
+        );
+
+        let stage = 16 * 1024 * 1024u64;
+        let out = 32 * 1024 * 1024u64;
+        vram.write_at(stage, &spliced).expect("stage spliced");
+        vram.sync().expect("sync");
+        let produced = codec
+            .decompress_device(
+                &[base + stage],
+                &[spliced.len() as u64],
+                &[base + out],
+                &[source.len() as u64],
+            )
+            .expect("decompress spliced");
+        assert_eq!(produced, vec![source.len() as u64]);
+        let mut back = vec![0u8; source.len()];
+        vram.read_at(out, &mut back).expect("read back");
+        assert!(back == source, "spliced stream does not round-trip");
     }
 
     #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
@@ -7279,5 +9104,322 @@ mod tests {
             trace.raw_read_ops > 0 && trace.logical_read_bytes > 0,
             "concurrent shared reads must still land in the trace counters"
         );
+    }
+
+    /// The GF(2) fold has to reproduce a serial scan exactly, because these
+    /// checksums end up in ZIP local headers and gzip trailers that other
+    /// tools verify. Split points are chosen to cover the interesting shapes:
+    /// an empty tail, a sub-byte-ladder length, an exact power of two, and an
+    /// odd length that exercises both branches of the squaring loop.
+    #[test]
+    fn crc32_combine_reproduces_a_serial_scan() {
+        let data = patterned_bytes(9_973, 7);
+        let whole = crate::api_kernel::crc32_reference(&data);
+        for split in [0usize, 1, 2, 63, 64, 255, 4096, 9_972, 9_973] {
+            let (head, tail) = data.split_at(split);
+            let combined = crc32_combine_with(
+                &crc32_zero_shift(tail.len() as u64),
+                crate::api_kernel::crc32_reference(head),
+                crate::api_kernel::crc32_reference(tail),
+            );
+            assert_eq!(
+                combined, whole,
+                "combining at {split} must equal the serial CRC32"
+            );
+        }
+    }
+
+    /// Folding lane by lane, the way `crc32_range_gpu_cancellable` does, must
+    /// also land on the serial value — and starting the fold from 0 (the CRC of
+    /// the empty string) must be the identity for the first lane.
+    #[test]
+    fn crc32_combine_folds_equal_lanes() {
+        let data = patterned_bytes(4_100, 3);
+        let lane = 512usize;
+        let shift = crc32_zero_shift(lane as u64);
+        let mut crc = 0u32;
+        let mut off = 0usize;
+        while off < data.len() {
+            let take = (data.len() - off).min(lane);
+            let lane_shift = if take == lane {
+                shift
+            } else {
+                crc32_zero_shift(take as u64)
+            };
+            crc = crc32_combine_with(
+                &lane_shift,
+                crc,
+                crate::api_kernel::crc32_reference(&data[off..off + take]),
+            );
+            off += take;
+        }
+        assert_eq!(crc, crate::api_kernel::crc32_reference(&data));
+    }
+
+    /// A GPU device is not needed to pin the routing *policy*, only the two
+    /// measured throughputs it is derived from.
+    #[test]
+    fn calibration_routes_large_files_to_the_gpu_when_the_gpu_is_faster() {
+        // 2 GB/s on the GPU against 1 GB/s on the CPU: nothing to trade off,
+        // so no file is too large for the GPU and the old 128 MiB ceiling is
+        // simply absent.
+        let c = calibration_from_throughput(1 << 20, 0.0005, 2e9, 0.001, 1e9);
+        assert_eq!(c.cpu_route_threshold_bytes, u64::MAX);
+        // The launch budget still bounds one kernel, TDR being unrelated to
+        // which side is faster: 2 GB/s for 0.1 s.
+        assert_eq!(c.launch_budget_bytes, 200_000_000);
+    }
+
+    #[test]
+    fn calibration_keeps_large_files_off_a_slower_gpu() {
+        // What this machine actually measures: ~33 MB/s single-thread on the
+        // GPU against ~1.6 GB/s on the CPU.
+        let c = calibration_from_throughput(1 << 20, 0.0318, 33e6, 0.00065, 1.6e9);
+        assert!(
+            c.cpu_route_threshold_bytes <= c.launch_budget_bytes,
+            "a file admitted to the GPU must still fit in one launch so the \
+             batch it joins has room for other files: threshold {} budget {}",
+            c.cpu_route_threshold_bytes,
+            c.launch_budget_bytes
+        );
+        assert!(c.cpu_route_threshold_bytes >= GPU_HASH_ROUTE_THRESHOLD_MIN_BYTES);
+        assert!(
+            c.cpu_route_threshold_bytes < 128 * 1024 * 1024,
+            "the 0.25 s bound still applies when the GPU is the slower side"
+        );
+    }
+
+    /// The GPU CRC32 is folded from independent lanes, so the interesting
+    /// failures are at the seams: between lanes, between launches, and on a
+    /// final short lane. The launch size is shrunk so a small fixture crosses
+    /// all three.
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn gpu_crc32_matches_reference_across_lanes_and_launches() {
+        let mut e = engine(64, false);
+        // Three full launches of four lanes each, plus a short final lane.
+        e.set_crc32_launch_bytes(4 * CRC32_LANE_BYTES);
+        let len = (12 * CRC32_LANE_BYTES + 1234) as usize;
+        let data = patterned_bytes(len, 11);
+        e.table_mut().create_file("\\crc", 0).unwrap();
+        e.write("\\crc", 0, &data).unwrap();
+        assert_eq!(
+            e.crc32_range_gpu("\\crc", 0, len as u64).unwrap(),
+            crate::api_kernel::crc32_reference(&data)
+        );
+        // Sub-ranges must fold the same way, which is what the gzip reader
+        // verifies members with.
+        let off = CRC32_LANE_BYTES + 7;
+        let take = 5 * CRC32_LANE_BYTES + 99;
+        assert_eq!(
+            e.crc32_range_gpu("\\crc", off, take).unwrap(),
+            crate::api_kernel::crc32_reference(&data[off as usize..(off + take) as usize])
+        );
+        // A sparse hole is synthesized inside the kernel rather than read, so
+        // it has its own path through the lane builder.
+        e.table_mut().create_file("\\hole", 0).unwrap();
+        let hole_len = 3 * CRC32_LANE_BYTES;
+        e.set_size("\\hole", hole_len).unwrap();
+        assert_eq!(
+            e.crc32_range_gpu("\\hole", 0, hole_len).unwrap(),
+            crate::api_kernel::crc32_reference(&vec![0u8; hole_len as usize])
+        );
+    }
+
+    /// Coverage for the sizes the new routing rule can send to the GPU that
+    /// the old 128 MiB ceiling could not. The digests must still be the
+    /// RustCrypto ones, and the GPU and CPU routes must agree with each other.
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn gpu_hash_matches_reference_above_the_old_route_cap() {
+        let mut e = engine(512, false);
+        // Above `GPU_HASH_ROUTE_THRESHOLD_MAX_BYTES` as it used to be, so this
+        // file is only reachable on the GPU under the measured rule.
+        let len = 129 * 1024 * 1024usize;
+        let data = patterned_bytes(len, 23);
+        e.table_mut().create_file("\\big", 0).unwrap();
+        e.write("\\big", 0, &data).unwrap();
+        e.set_hash_cpu_route_threshold(u64::MAX);
+        assert!(
+            e.should_hash_on_gpu_routed("\\big").unwrap(),
+            "a file this size must be routable to the GPU once the ceiling is \
+             derived from measurement rather than fixed"
+        );
+        for alg in [HashAlgorithm::Fnv1a64, HashAlgorithm::Sha256] {
+            let expected = hash_reference(alg, &data);
+            assert_eq!(
+                e.hash_file(r"\big", alg).unwrap(),
+                expected,
+                "{} routed to the GPU at {len} bytes",
+                alg.name()
+            );
+            assert_eq!(
+                e.hash_file_cpu(r"\big", alg).unwrap(),
+                expected,
+                "{} on the CPU route at {len} bytes",
+                alg.name()
+            );
+        }
+    }
+
+    /// Naive reference scan, so the GPU result is checked against something
+    /// obviously correct rather than against itself.
+    fn search_reference(hay: &[u8], needle: &[u8], fold: bool) -> Vec<u64> {
+        let norm = |b: u8| if fold { b.to_ascii_lowercase() } else { b };
+        if needle.is_empty() || hay.len() < needle.len() {
+            return Vec::new();
+        }
+        (0..=hay.len() - needle.len())
+            .filter(|&i| (0..needle.len()).all(|k| norm(hay[i + k]) == norm(needle[k])))
+            .map(|i| i as u64)
+            .collect()
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn search_matches_a_reference_scan() {
+        let mut e = engine(16, false);
+        let mut data = Vec::new();
+        for i in 0..40_000u32 {
+            data.extend_from_slice(format!("line {i} needle-{}Q", i % 7).as_bytes());
+        }
+        e.table_mut().create_file("\\a.bin", 0).unwrap();
+        e.write("\\a.bin", 0, &data).unwrap();
+        for (pat, fold) in [
+            (&b"needle-3"[..], false),
+            (&b"NEEDLE-3"[..], true),
+            (&b"Q"[..], false),
+            (&b"line 39999 needle-3Q"[..], false),
+            (&b"zzz-absent"[..], false),
+        ] {
+            let stats = e
+                .search_files_gpu_cancellable(
+                    &["\\a.bin".to_string()],
+                    pat,
+                    fold,
+                    usize::MAX,
+                    |_, _| false,
+                )
+                .unwrap();
+            let want = search_reference(&data, pat, fold);
+            assert_eq!(
+                stats.total_matches,
+                want.len() as u64,
+                "count for {:?} fold={fold}",
+                String::from_utf8_lossy(pat)
+            );
+            let got: Vec<u64> = stats
+                .hits
+                .first()
+                .map(|h| h.offsets.clone())
+                .unwrap_or_default();
+            assert_eq!(got, want, "offsets for {:?}", String::from_utf8_lossy(pat));
+        }
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn search_finds_matches_across_window_seams() {
+        // The window is shrunk so the file spans many launches; a match placed
+        // deliberately astride each seam must still be found exactly once.
+        let mut e = engine(16, false);
+        e.set_search_window_bytes(CHUNK_SIZE);
+        let window = CHUNK_SIZE;
+        let needle = b"SEAMMARK";
+        let mut data = vec![b'.'; (window * 5) as usize];
+        // Straddle every seam: half the needle before it, half after.
+        for seam in 1..5u64 {
+            let at = (seam * (window - (needle.len() as u64 - 1))) as usize - needle.len() / 2;
+            data[at..at + needle.len()].copy_from_slice(needle);
+        }
+        e.table_mut().create_file("\\seam.bin", 0).unwrap();
+        e.write("\\seam.bin", 0, &data).unwrap();
+        let stats = e
+            .search_files_gpu_cancellable(
+                &["\\seam.bin".to_string()],
+                needle,
+                false,
+                usize::MAX,
+                |_, _| false,
+            )
+            .unwrap();
+        assert_eq!(
+            stats.total_matches,
+            search_reference(&data, needle, false).len() as u64
+        );
+        assert_eq!(
+            stats.hits[0].offsets,
+            search_reference(&data, needle, false)
+        );
+        assert_eq!(stats.bytes_scanned, data.len() as u64);
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn search_reads_compressed_and_sparse_files() {
+        let mut e = engine_compress(16);
+        // Highly compressible, so the chunks really do land compressed.
+        let mut data = b"the quick brown fox ".repeat(20_000);
+        let at = data.len() / 2;
+        data[at..at + 6].copy_from_slice(b"MARKER");
+        e.table_mut().create_file("\\c.bin", 0).unwrap();
+        e.write("\\c.bin", 0, &data).unwrap();
+        // Sparse: a hole, then content past it.
+        e.table_mut().create_file("\\s.bin", 0).unwrap();
+        e.write("\\s.bin", 4 * CHUNK_SIZE, b"MARKER").unwrap();
+
+        let stats = e
+            .search_files_gpu_cancellable(
+                &["\\c.bin".to_string(), "\\s.bin".to_string()],
+                b"MARKER",
+                false,
+                16,
+                |_, _| false,
+            )
+            .unwrap();
+        assert_eq!(stats.files_matched, 2);
+        assert_eq!(stats.total_matches, 2);
+        assert_eq!(stats.hits[0].offsets, vec![at as u64]);
+        assert_eq!(stats.hits[1].offsets, vec![4 * CHUNK_SIZE]);
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn search_reports_exact_counts_when_offsets_are_capped() {
+        let mut e = engine(8, false);
+        let data = b"ab".repeat(5_000);
+        e.table_mut().create_file("\\many.bin", 0).unwrap();
+        e.write("\\many.bin", 0, &data).unwrap();
+        let stats = e
+            .search_files_gpu_cancellable(&["\\many.bin".to_string()], b"ab", false, 10, |_, _| {
+                false
+            })
+            .unwrap();
+        assert_eq!(stats.total_matches, 5_000, "count must not be capped");
+        assert_eq!(stats.hits[0].offsets.len(), 10, "offsets are capped");
+        assert!(stats.hits[0].truncated);
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn search_rejects_unusable_patterns_and_honours_cancellation() {
+        let mut e = engine(8, false);
+        e.table_mut().create_file("\\x.bin", 0).unwrap();
+        e.write("\\x.bin", 0, &b"hello".repeat(1000)).unwrap();
+        assert!(matches!(
+            e.search_files_gpu_cancellable(&["\\x.bin".to_string()], b"", false, 8, |_, _| false),
+            Err(EngineError::InvalidInput(_))
+        ));
+        let long = vec![b'z'; SEARCH_MAX_PATTERN + 1];
+        assert!(matches!(
+            e.search_files_gpu_cancellable(&["\\x.bin".to_string()], &long, false, 8, |_, _| false),
+            Err(EngineError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            e.search_files_gpu_cancellable(&["\\x.bin".to_string()], b"hello", false, 8, |_, _| {
+                true
+            }),
+            Err(EngineError::Cancelled)
+        ));
     }
 }

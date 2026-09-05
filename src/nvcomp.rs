@@ -308,6 +308,42 @@ impl NvcompBatchedCodec {
         (self.a_d_out + i * self.max_comp) as u64
     }
 
+    /// Copy the first `out.len()` bytes of compressed slot `i` back to host
+    /// memory.
+    ///
+    /// Everything else in this file deliberately keeps payload bytes on the
+    /// device. This is the one host round trip, and it exists because the ZIP
+    /// writer has to find, on the CPU, the exact *bit* at which each chunk's
+    /// DEFLATE stream ends before it can splice chunks into one standard stream
+    /// (see `engine::DeflateWalker`). It moves only *compressed* bytes, and only
+    /// for the chunks that are actually spliced.
+    ///
+    /// Valid until the next compress/decompress call overwrites the scratch.
+    pub fn copy_compressed_slot_to_host(&self, i: usize, out: &mut [u8]) -> Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        if i >= self.out_slots {
+            bail!(
+                "compressed slot {i} is outside the {} reserved",
+                self.out_slots
+            );
+        }
+        if out.len() > self.max_comp {
+            bail!(
+                "compressed slot read of {} exceeds the {} byte slot stride",
+                out.len(),
+                self.max_comp
+            );
+        }
+        self.ctx.bind_to_thread()?;
+        let start = i * self.max_comp;
+        let view = self.d_out.slice(start..start + out.len());
+        self.stream.memcpy_dtoh(&view, out)?;
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
     pub fn compress_device(&mut self, input_ptrs: &[u64], input_sizes: &[u64]) -> Result<Vec<u64>> {
         if input_ptrs.len() != input_sizes.len() {
             bail!("input pointer/size length mismatch");
@@ -1463,6 +1499,99 @@ fn check(status: i32, what: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Why ZIP members are spliced instead of compressed as one stream.
+    ///
+    /// nvCOMP's Deflate parallelises *across* chunks and barely at all within
+    /// one, so wall time per launch tracks the chunk size rather than the batch
+    /// size. Measured on this machine over 256 MiB of mildly compressible data:
+    ///
+    /// ```text
+    /// chunk    1 MiB: n=256  0.163s 1.65 GB/s ratio=0.5014
+    /// chunk    4 MiB: n=64   0.637s 0.42 GB/s ratio=0.4999
+    /// chunk   64 MiB: n=4   12.015s 0.02 GB/s ratio=0.4995
+    /// chunk  256 MiB: n=1   46.668s 0.01 GB/s ratio=0.4995
+    /// ```
+    ///
+    /// Compressing a member as a single stream — which would make ZIP's
+    /// one-stream-per-member rule trivially satisfiable — is therefore a ~280x
+    /// regression for a 0.4% ratio gain, which is what sent the ZIP writer down
+    /// the bit-splicing route instead. Run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn deflate_chunk_size_bench() {
+        let total = 256 * 1024 * 1024usize;
+        let vram = Vram::new(0, 1024 * 1024 * 1024).expect("vram");
+        let mut codec = NvcompBatchedCodec::load(&vram, NvcompFrameCodec::Deflate).expect("load");
+        let base = vram.buf_device_ptr();
+        let mut vram = vram;
+        // Mildly compressible payload (roughly what a real file looks like).
+        let mut s = 0x9E37_79B9u32;
+        let block: Vec<u8> = (0..(4 * 1024 * 1024))
+            .map(|i: usize| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                if i % 7 == 0 {
+                    (s >> 24) as u8
+                } else {
+                    (i % 253) as u8
+                }
+            })
+            .collect();
+        let mut off = 0usize;
+        while off < total {
+            vram.write_at(off as u64, &block).expect("write");
+            off += block.len();
+        }
+        vram.sync().expect("sync");
+        for &chunk in &[
+            1usize << 20,
+            2 << 20,
+            4 << 20,
+            8 << 20,
+            16 << 20,
+            32 << 20,
+            64 << 20,
+            128 << 20,
+            256 << 20,
+        ] {
+            let n_total = total / chunk;
+            // Warm up + timed run.
+            for run in 0..2 {
+                let t = std::time::Instant::now();
+                let mut done = 0usize;
+                let mut comp_total = 0u64;
+                let mut ok = true;
+                while done < n_total {
+                    let n = (n_total - done).min(BATCH);
+                    let ptrs: Vec<u64> =
+                        (0..n).map(|i| base + ((done + i) * chunk) as u64).collect();
+                    let sizes: Vec<u64> = vec![chunk as u64; n];
+                    match codec.compress_device(&ptrs, &sizes) {
+                        Ok(v) => comp_total += v.iter().sum::<u64>(),
+                        Err(e) => {
+                            println!("chunk {:>4} MiB: FAILED {e}", chunk >> 20);
+                            ok = false;
+                            break;
+                        }
+                    }
+                    done += n;
+                }
+                if !ok {
+                    break;
+                }
+                if run == 1 {
+                    let el = t.elapsed().as_secs_f64();
+                    println!(
+                        "chunk {:>4} MiB: n={n_total:<4} {:.3}s {:.2} GB/s ratio={:.4}",
+                        chunk >> 20,
+                        el,
+                        total as f64 / el / 1e9,
+                        comp_total as f64 / total as f64
+                    );
+                }
+            }
+        }
+    }
 
     // Requires nvCOMP installed + a GPU; run with: cargo test -- --ignored
     #[test]

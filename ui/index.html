@@ -98,6 +98,9 @@
             <button id="open-archive" type="button" class="tool-btn">
               <span class="tool-name" data-i18n="toolArchive">圧縮・展開</span><span class="tool-desc">tar.zst / tar.gz / zip</span>
             </button>
+            <button id="open-search" type="button" class="tool-btn">
+              <span class="tool-name" data-i18n="toolSearch">全文検索</span><span class="tool-desc" data-i18n="toolSearchDesc">ドライブ全体を横断</span>
+            </button>
             <button id="open-encode" type="button" class="tool-btn">
               <span class="tool-name" data-i18n="toolEncode">エンコード</span><span class="tool-desc">Base64 / hex</span>
             </button>
@@ -279,6 +282,45 @@
           <div id="encode-done" class="status-text" role="status"></div>
         </form>
         <div id="encode-result" class="kv-list"></div>
+      </section>
+      <section id="screen-search" class="screen" hidden>
+        <div class="panel-head">
+          <button type="button" class="btn-back" data-back data-i18n="back">← 戻る</button>
+          <h2 data-i18n="toolSearch">全文検索</h2>
+        </div>
+
+        <form id="search-form" autocomplete="off">
+          <div class="field">
+            <label for="search-pattern" data-i18n="searchPattern">検索する文字列</label>
+            <input id="search-pattern" type="text" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="search-path" data-i18n="searchScope">対象（ファイル / フォルダ）</label>
+            <div class="row">
+              <input id="search-path" type="text" spellcheck="false" />
+              <button id="search-path-browse" type="button" class="btn" data-i18n="browse">参照...</button>
+            </div>
+          </div>
+          <div class="field">
+            <label class="check"><input id="search-ignore-case" type="checkbox" /> <span data-i18n="searchIgnoreCase">大文字小文字を区別しない</span></label>
+          </div>
+          <button id="search-btn" type="submit" class="btn btn-primary btn-block" data-i18n="searchRun">検索する</button>
+          <div class="job-row" id="search-job-row" hidden>
+            <span class="spinner" aria-hidden="true"></span>
+            <span class="status-text" id="search-status" role="status"></span>
+            <button type="button" class="btn" id="search-cancel" data-i18n="cancel">中止</button>
+          </div>
+          <div class="job-progress" id="search-progress" hidden role="progressbar" aria-valuemin="0" aria-valuemax="100" data-i18n-label="progressLabel">
+            <div class="job-progress-bar"><div class="job-progress-fill" id="search-progress-fill"></div></div>
+            <div class="job-progress-text">
+              <span id="search-progress-bytes"></span>
+              <span class="job-progress-eta" id="search-progress-eta"></span>
+              <span id="search-progress-pct"></span>
+            </div>
+          </div>
+          <div id="search-done" class="status-text" role="status"></div>
+        </form>
+        <div id="search-result" class="kv-list"></div>
       </section>
     </main>
 

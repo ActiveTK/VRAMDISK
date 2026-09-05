@@ -387,6 +387,33 @@ pub fn archive_extract_job(
     submit_job_async(&mount_point, descriptor, &lang)
 }
 
+/// Submit a GPU full-text search over the mounted volume. Returns the job id
+/// (see `hash_job` for the poll/cancel flow).
+#[tauri::command]
+pub fn search_job(
+    req: SearchRequest,
+    manager: State<Manager>,
+    lang: State<UiLang>,
+) -> Result<String, String> {
+    let lang = lang_of(&lang);
+    let mount_point = mounted_point(&manager, &lang)?;
+    let mut paths = Vec::with_capacity(req.paths.len().max(1));
+    for p in &req.paths {
+        paths.push(normalize_path(&mount_point, p, &lang)?);
+    }
+    if paths.is_empty() {
+        paths.push("\\".to_string());
+    }
+    let descriptor = serde_json::json!({
+        "op": "search",
+        "pattern": req.pattern,
+        "paths": paths,
+        "ignore_case": req.ignore_case,
+        "recursive": true,
+    });
+    submit_job_async(&mount_point, descriptor, &lang)
+}
+
 /// Submit a GPU encode/decode job (Base64 / hex) over one file on the mounted
 /// volume. Returns the job id (see `hash_job` for the poll/cancel flow).
 #[tauri::command]
@@ -410,6 +437,18 @@ pub fn encode_job(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SearchRequest {
+    /// Literal text to look for. Matched as UTF-8 bytes, not as a regex.
+    pub pattern: String,
+    /// Files or folders to scan. Empty means the whole volume.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub ignore_case: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EncodeRequest {
     /// "base64" or "hex".
     pub codec: String,

@@ -322,6 +322,68 @@ try {
         Check (Test-Path "$root\enc\bin.bin") 'volume still readable after the failed decode'
     }
 
+    Section '[3b] Search jobs' {
+        # A corpus with a known number of hits, some of them deliberately
+        # placed astride the engine's scan-window seams.
+        New-Item -ItemType Directory -Path "$root\search" -Force | Out-Null
+        $line = "alpha beta GAMMA delta needle-here epsilon`r`n"
+        $sb = New-Object Text.StringBuilder
+        for ($i = 0; $i -lt 20000; $i++) { [void]$sb.Append($line) }
+        $text = [Text.Encoding]::ASCII.GetBytes($sb.ToString())
+        [IO.File]::WriteAllBytes("$root\search\corpus.txt", $text)
+        [IO.File]::WriteAllBytes("$root\search\other.txt", [Text.Encoding]::ASCII.GetBytes("nothing to see"))
+
+        $expect = 20000
+        $id = JobId 'search-basic'
+        $st = RunJob $id @{ op = 'search'; pattern = 'needle-here'; paths = @("\search") }
+        Check ($null -ne $st -and $st.state -eq 'succeeded') "search job succeeded"
+        if ($st -and $st.state -eq 'succeeded') {
+            $r = JobResult $id
+            Check ($r.total_matches -eq $expect) "search found every occurrence ($($r.total_matches) vs $expect)"
+            Check ($r.files_matched -eq 1) "only the file that contains it matched ($($r.files_matched))"
+            Check ($r.bytes_scanned -eq ($text.Length + 14)) "scanned both files fully ($($r.bytes_scanned))"
+            $hit = $r.files | Where-Object { $_.path -like '*corpus.txt' }
+            Check ($null -ne $hit -and $hit.offsets.Count -gt 0) "match offsets reported"
+            if ($hit -and $hit.offsets.Count -gt 0) {
+                $first = [int]$hit.offsets[0]
+                $slice = [Text.Encoding]::ASCII.GetString($text[$first..($first + 10)])
+                Check ($slice -eq 'needle-here') "first reported offset really holds the pattern ('$slice')"
+            }
+        }
+
+        # Case folding is ASCII-only and opt-in.
+        $id = JobId 'search-nocase'
+        $st = RunJob $id @{ op = 'search'; pattern = 'gamma'; paths = @("\search"); ignore_case = $true }
+        Check ($null -ne $st -and $st.state -eq 'succeeded' -and (JobResult $id).total_matches -eq $expect) "ignore_case matches GAMMA"
+        $id = JobId 'search-case'
+        $st = RunJob $id @{ op = 'search'; pattern = 'gamma'; paths = @("\search") }
+        Check ($null -ne $st -and $st.state -eq 'succeeded' -and (JobResult $id).total_matches -eq 0) "case-sensitive search does not"
+
+        # Counts stay exact even when the reported offsets are capped.
+        $id = JobId 'search-cap'
+        $st = RunJob $id @{ op = 'search'; pattern = 'alpha'; paths = @("\search"); max_offsets = 5 }
+        if ($st -and $st.state -eq 'succeeded') {
+            $r = JobResult $id
+            $h = $r.files | Where-Object { $_.path -like '*corpus.txt' }
+            Check ($r.total_matches -eq $expect) "count is exact under max_offsets ($($r.total_matches))"
+            Check ($h.offsets.Count -eq 5 -and $h.offsets_truncated) "offsets capped and flagged"
+        }
+
+        # Binary needles via hex, and the whole volume when paths is omitted.
+        $id = JobId 'search-hex'
+        $st = RunJob $id @{ op = 'search'; pattern_hex = '6e6565646c65' }   # "needle"
+        Check ($null -ne $st -and $st.state -eq 'succeeded' -and (JobResult $id).total_matches -ge $expect) "pattern_hex searches the whole volume"
+
+        # Bad input fails the job without taking the mount down.
+        $id = JobId 'search-empty'
+        $st = RunJob $id @{ op = 'search'; pattern = '' }
+        Check ($null -ne $st -and $st.state -eq 'failed') "empty pattern fails the job"
+        $id = JobId 'search-badhex'
+        $st = RunJob $id @{ op = 'search'; pattern_hex = 'zz' }
+        Check ($null -ne $st -and $st.state -eq 'failed') "invalid pattern_hex fails the job"
+        Check (Test-Path "$root\search\corpus.txt") "volume still healthy"
+    }
+
     Section '[4] Archive jobs' {
         New-Item -ItemType Directory "$root\arc\src\sub" -Force | Out-Null
         $srcFiles = @{

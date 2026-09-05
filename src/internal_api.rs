@@ -65,6 +65,12 @@ VRAMDISK 内部API
   encode job descriptor 例:
       {\"op\":\"encode\",\"codec\":\"base64\",\"direction\":\"encode\",\"input\":\"\\\\a.bin\",\"output\":\"\\\\a.b64\"}
       codec は base64 / hex、direction は encode / decode に対応します。
+
+  search job descriptor 例:
+      {\"op\":\"search\",\"pattern\":\"TODO\",\"paths\":[\"\\\\data\"],\"ignore_case\":false}
+      VRAM 上のファイル本文を GPU で全文検索します。paths 省略時はボリューム全体。
+      pattern の代わりに pattern_hex で任意のバイト列を指定できます（偶数長の 16 進）。
+      max_offsets で 1 ファイルあたりの報告位置数を制限できます（既定 64、件数は常に正確）。
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

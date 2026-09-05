@@ -21,6 +21,16 @@ const DEFAULT_SEG_CAP: usize = 256;
 const STATE_BYTES: usize = 256;
 const MANY_THREADS_PER_BLOCK: u32 = 128;
 
+/// Longest search pattern the kernel will take. Long literals are rare and the
+/// per-thread inner loop is linear in this, so a generous but bounded cap keeps
+/// the device-side buffer a fixed allocation.
+pub const SEARCH_MAX_PATTERN: usize = 256;
+
+/// How many match offsets one launch can record. Hits past this are still
+/// counted -- only the recorded offsets are capped -- so a pathological pattern
+/// reports an honest total instead of silently truncating it.
+const SEARCH_HIT_CAP: usize = 1 << 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum HashAlgorithm {
@@ -83,6 +93,15 @@ unsafe impl DeviceRepr for HashFileDesc {}
 unsafe impl ValidAsZeroBits for HashFileDesc {}
 
 /// Loaded API kernel module plus persistent digest state and descriptor scratch.
+/// One search launch's result: every match counted, and the offsets that fit.
+#[derive(Debug, Default, Clone)]
+pub struct SearchLaunch {
+    /// Total matches in the scanned window, including any beyond the offset cap.
+    pub total: u64,
+    /// Ascending match offsets, at most [`SEARCH_HIT_CAP`] of them.
+    pub offsets: Vec<u64>,
+}
+
 pub struct ApiKernel {
     module: sys::CUmodule,
     init_func: sys::CUfunction,
@@ -98,6 +117,7 @@ pub struct ApiKernel {
     b64_decode_func: sys::CUfunction,
     hex_encode_func: sys::CUfunction,
     hex_decode_func: sys::CUfunction,
+    search_func: sys::CUfunction,
     segs_d: CudaSlice<HashSegment>,
     files_d: CudaSlice<HashFileDesc>,
     state_d: CudaSlice<u8>,
@@ -107,6 +127,9 @@ pub struct ApiKernel {
     outs_d: CudaSlice<u8>,
     crc_out_d: CudaSlice<u32>,
     status_d: CudaSlice<u32>,
+    needle_d: CudaSlice<u8>,
+    hits_d: CudaSlice<u64>,
+    hit_count_d: CudaSlice<u64>,
     seg_cap: usize,
     file_cap: usize,
     ctx: Arc<CudaContext>,
@@ -156,26 +179,7 @@ impl ApiKernel {
         let stream = vram.stream();
         ctx.bind_to_thread().context("bind ctx for ApiKernel")?;
 
-        let ptx = compile_ptx_with_opts(
-            api_cuda_source(),
-            CompileOptions {
-                // API_CUDA is plain scalar CUDA C++ (MD5/SHA1/SHA256/CRC32
-                // block math) with no warp/tensor intrinsics that need a
-                // newer architecture, so target the oldest arch NVRTC still
-                // supports rather than whatever a dev machine's default is —
-                // PTX JIT can run a lower-.target module on a newer GPU but
-                // never the reverse, so a needlessly high target here would
-                // silently break pre-Turing GPUs.
-                arch: Some("compute_50"),
-                options: vec!["--std=c++11".to_string()],
-                name: Some("vramdisk_api_kernel.cu".to_string()),
-                ..Default::default()
-            },
-        )
-        .context("compile API CUDA kernels with NVRTC")?;
-
-        let mut ptx_nul = ptx.to_src().into_bytes();
-        ptx_nul.push(0);
+        let ptx_nul = compiled_api_ptx()?;
         // Guarded from here on: every `?` below must unload the module again.
         let module = ModuleGuard(unsafe {
             dr::module::load_data(ptx_nul.as_ptr() as *const c_void)
@@ -194,6 +198,7 @@ impl ApiKernel {
         let b64_decode_func = get_func(module.0, "vramdisk_b64_decode")?;
         let hex_encode_func = get_func(module.0, "vramdisk_hex_encode")?;
         let hex_decode_func = get_func(module.0, "vramdisk_hex_decode")?;
+        let search_func = get_func(module.0, "vramdisk_search")?;
 
         let segs_d = stream
             .alloc_zeros::<HashSegment>(DEFAULT_SEG_CAP)
@@ -220,6 +225,15 @@ impl ApiKernel {
             .alloc_zeros::<u32>(1)
             .context("alloc API CRC32 output")?;
         let status_d = stream.alloc_zeros::<u32>(1).context("alloc API status")?;
+        let needle_d = stream
+            .alloc_zeros::<u8>(SEARCH_MAX_PATTERN)
+            .context("alloc API search pattern")?;
+        let hits_d = stream
+            .alloc_zeros::<u64>(SEARCH_HIT_CAP)
+            .context("alloc API search hits")?;
+        let hit_count_d = stream
+            .alloc_zeros::<u64>(1)
+            .context("alloc API search hit count")?;
         stream.synchronize()?;
 
         Ok(Self {
@@ -238,6 +252,7 @@ impl ApiKernel {
             b64_decode_func,
             hex_encode_func,
             hex_decode_func,
+            search_func,
             segs_d,
             files_d,
             state_d,
@@ -247,6 +262,9 @@ impl ApiKernel {
             outs_d,
             crc_out_d,
             status_d,
+            needle_d,
+            hits_d,
+            hit_count_d,
             seg_cap: DEFAULT_SEG_CAP,
             file_cap: 1,
             ctx,
@@ -775,6 +793,97 @@ impl ApiKernel {
         self.launch_transcode(func, "vramdisk_hex_decode", in_ptr, pairs, out_ptr, pairs)
     }
 
+    /// Scan `hay_len` bytes at device address `hay_ptr` for `needle`.
+    ///
+    /// Returns the total number of matches and up to [`SEARCH_HIT_CAP`] of
+    /// their offsets, each biased by `base_offset` so the caller can report
+    /// positions in the original file rather than in the staged window. The
+    /// recorded offsets are the ones that happened to win the atomic, not the
+    /// numerically first ones, so a caller that truncates must say so; they are
+    /// returned sorted for convenience.
+    ///
+    /// `fold_case` folds ASCII `A-Z` on both sides. It deliberately does not
+    /// attempt Unicode case folding: the data is arbitrary bytes, not
+    /// necessarily text in any particular encoding.
+    pub fn search(
+        &mut self,
+        hay_ptr: u64,
+        hay_len: u64,
+        needle: &[u8],
+        fold_case: bool,
+        base_offset: u64,
+    ) -> Result<SearchLaunch> {
+        anyhow::ensure!(!needle.is_empty(), "search pattern must not be empty");
+        anyhow::ensure!(
+            needle.len() <= SEARCH_MAX_PATTERN,
+            "search pattern longer than {SEARCH_MAX_PATTERN} bytes"
+        );
+        if hay_len < needle.len() as u64 {
+            return Ok(SearchLaunch::default());
+        }
+        self.ctx.bind_to_thread().context("bind ctx for search")?;
+
+        let mut staged = [0u8; SEARCH_MAX_PATTERN];
+        staged[..needle.len()].copy_from_slice(needle);
+        self.stream.memcpy_htod(&staged, &mut self.needle_d)?;
+        let zero = [0u64; 1];
+        self.stream.memcpy_htod(&zero, &mut self.hit_count_d)?;
+
+        let mut p_hay = hay_ptr as sys::CUdeviceptr;
+        let mut n_hay = hay_len;
+        let mut p_needle = ptr_u8(&self.needle_d, &self.stream);
+        let mut n_needle = needle.len() as u32;
+        let mut fold = u32::from(fold_case);
+        let mut base = base_offset;
+        let mut p_hits = ptr_u64(&self.hits_d, &self.stream);
+        let mut cap = SEARCH_HIT_CAP as u32;
+        let mut p_count = ptr_u64(&self.hit_count_d, &self.stream);
+        let mut params: [*mut c_void; 9] = [
+            &mut p_hay as *mut sys::CUdeviceptr as *mut c_void,
+            &mut n_hay as *mut u64 as *mut c_void,
+            &mut p_needle as *mut sys::CUdeviceptr as *mut c_void,
+            &mut n_needle as *mut u32 as *mut c_void,
+            &mut fold as *mut u32 as *mut c_void,
+            &mut base as *mut u64 as *mut c_void,
+            &mut p_hits as *mut sys::CUdeviceptr as *mut c_void,
+            &mut cap as *mut u32 as *mut c_void,
+            &mut p_count as *mut sys::CUdeviceptr as *mut c_void,
+        ];
+
+        // Grid-strided, so the launch is sized to keep the device busy rather
+        // than to cover the buffer: one thread per byte would be millions of
+        // blocks for a large window and no faster.
+        const THREADS: u32 = 256;
+        const MAX_BLOCKS: u64 = 4096;
+        let candidates = hay_len - needle.len() as u64 + 1;
+        let blocks = candidates.div_ceil(THREADS as u64).clamp(1, MAX_BLOCKS) as u32;
+        unsafe {
+            dr::launch_kernel(
+                self.search_func,
+                (blocks, 1, 1),
+                (THREADS, 1, 1),
+                0,
+                self.stream.cu_stream(),
+                &mut params,
+            )
+            .context("launch vramdisk_search")?;
+        }
+        self.stream.synchronize()?;
+
+        let mut count = [0u64; 1];
+        self.stream.memcpy_dtoh(&self.hit_count_d, &mut count)?;
+        let total = count[0];
+        let kept = (total.min(SEARCH_HIT_CAP as u64)) as usize;
+        let mut offsets = vec![0u64; kept];
+        if kept > 0 {
+            let view = self.hits_d.slice(0..kept);
+            self.stream.memcpy_dtoh(&view, &mut offsets)?;
+        }
+        self.stream.synchronize()?;
+        offsets.sort_unstable();
+        Ok(SearchLaunch { total, offsets })
+    }
+
     fn check_status(&self) -> Result<()> {
         let mut status = [0u32; 1];
         self.stream.memcpy_dtoh(&self.status_d, &mut status)?;
@@ -794,6 +903,11 @@ fn get_func(module: sys::CUmodule, name: &str) -> Result<sys::CUfunction> {
 }
 
 fn ptr_u8(slice: &CudaSlice<u8>, stream: &CudaStream) -> sys::CUdeviceptr {
+    let (p, _g) = slice.device_ptr(stream);
+    p
+}
+
+fn ptr_u64(slice: &CudaSlice<u64>, stream: &CudaStream) -> sys::CUdeviceptr {
     let (p, _g) = slice.device_ptr(stream);
     p
 }
@@ -850,6 +964,70 @@ const fn crc32_table() -> [u32; 256] {
         i += 1;
     }
     table
+}
+
+/// NUL-terminated PTX for [`API_CUDA`], compiled at most once per process.
+///
+/// NVRTC takes about six seconds to compile this translation unit on a typical
+/// desktop, and the result depends on nothing but the source text and the
+/// options below — both compile-time constants. Recompiling it per
+/// [`ApiKernel`] made every fresh engine (each mount, and each test that
+/// builds one) pay that again for an identical answer.
+///
+/// The failure is cached as a message rather than retried: a compile that
+/// failed once for this fixed input will fail the same way every time, and
+/// re-running a six-second compile per call to say so is worse than repeating
+/// the diagnostic.
+static API_PTX: std::sync::OnceLock<Result<Vec<u8>, String>> = std::sync::OnceLock::new();
+
+/// Compile [`API_CUDA`] now, so the first [`ApiKernel::new`] does not have to.
+///
+/// NVRTC needs no CUDA context, so this is safe to call from any thread —
+/// including a background one that does not own the device — and a later
+/// `ApiKernel::new` on any thread reuses the result. Errors are left for that
+/// call to report: a warm-up has nobody to report to.
+pub fn precompile() {
+    let _ = compiled_api_ptx();
+}
+
+fn compiled_api_ptx() -> Result<&'static Vec<u8>> {
+    API_PTX
+        .get_or_init(|| {
+            let ptx = compile_ptx_with_opts(
+                api_cuda_source(),
+                CompileOptions {
+                    // API_CUDA is plain scalar CUDA C++ (MD5/SHA1/SHA256/CRC32
+                    // block math) with no warp/tensor intrinsics that need a
+                    // newer architecture, so target the oldest arch NVRTC still
+                    // supports rather than whatever a dev machine's default is —
+                    // PTX JIT can run a lower-.target module on a newer GPU but
+                    // never the reverse, so a needlessly high target here would
+                    // silently break pre-Turing GPUs.
+                    arch: Some("compute_50"),
+                    options: vec!["--std=c++11".to_string()],
+                    name: Some("vramdisk_api_kernel.cu".to_string()),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| format!("{e:#}"))?;
+            let mut bytes = ptx.to_src().into_bytes();
+            bytes.push(0);
+            Ok(bytes)
+        })
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("compile API CUDA kernels with NVRTC: {e}"))
+}
+
+/// Host-side reference CRC-32, used by tests to pin what the device kernels
+/// and the GF(2) lane combiner in `engine` must reproduce exactly.
+#[cfg(test)]
+pub(crate) fn crc32_reference(data: &[u8]) -> u32 {
+    let table = crc32_table();
+    let mut crc = 0xffff_ffffu32;
+    for &b in data {
+        crc = (crc >> 8) ^ table[((crc ^ b as u32) & 0xff) as usize];
+    }
+    crc ^ 0xffff_ffff
 }
 
 /// [`API_CUDA`] with the CRC-32 table literals substituted in. NVRTC compiles
@@ -1289,6 +1467,56 @@ extern "C" __global__ void vramdisk_hex_decode(const u8* in, u64 pairs, u8* out,
     if ((hi | lo) < 0) { atomicExch(status, 1u); return; }
     out[i] = (u8)((hi << 4) | lo);
 }
+
+// --- literal substring search ------------------------------------------------
+//
+// One thread per candidate start offset, grid-strided so the launch shape does
+// not depend on the buffer size. The filter is the point: a candidate is
+// rejected on the first *and* last needle byte before the body is compared, so
+// the overwhelmingly common non-match costs two loads and no branching beyond
+// the compare. That keeps the kernel bandwidth-bound, which is what makes this
+// worth doing on a GPU at all -- the data is already in VRAM, so the scan runs
+// at device memory bandwidth instead of streaming over PCIe to the host.
+//
+// `count` is incremented for every hit, including hits past `cap`, so callers
+// get a true total even when they only keep a sample of the offsets.
+
+__device__ __forceinline__ u8 ascii_lower(u8 c) {
+    return (c >= 'A' && c <= 'Z') ? (u8)(c + 32) : c;
+}
+
+extern "C" __global__ void vramdisk_search(
+    const u8* hay, u64 hay_len,
+    const u8* needle, u32 needle_len,
+    u32 fold_case, u64 base_offset,
+    u64* out_offsets, u32 cap, u64* count)
+{
+    if (needle_len == 0 || hay_len < (u64)needle_len) return;
+    u64 last = hay_len - (u64)needle_len;
+    u64 stride = (u64)blockDim.x * (u64)gridDim.x;
+    u8 n_first = needle[0];
+    u8 n_last = needle[needle_len - 1];
+    if (fold_case) { n_first = ascii_lower(n_first); n_last = ascii_lower(n_last); }
+
+    for (u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x; i <= last; i += stride) {
+        u8 c_first = hay[i];
+        u8 c_last = hay[i + needle_len - 1];
+        if (fold_case) { c_first = ascii_lower(c_first); c_last = ascii_lower(c_last); }
+        if (c_first != n_first || c_last != n_last) continue;
+        bool hit = true;
+        for (u32 k = 1; k + 1 < needle_len; ++k) {
+            u8 a = hay[i + k];
+            u8 b = needle[k];
+            if (fold_case) { a = ascii_lower(a); b = ascii_lower(b); }
+            if (a != b) { hit = false; break; }
+        }
+        if (hit) {
+            u64 slot = atomicAdd(count, 1ULL);
+            if (slot < (u64)cap) out_offsets[slot] = base_offset + i;
+        }
+    }
+}
+
 "#;
 
 #[cfg(test)]

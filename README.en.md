@@ -13,6 +13,7 @@ While a disk is mounted, the following GPU tools are available (from the GUI too
 | Hashing | Computes MD5 / SHA-1 / SHA-256 / FNV-1a 64, automatically dispatched to GPU or CPU |
 | Compress / extract | Creates and extracts tar.zst / tar.lz4 / tar.gz / zip on the GPU (requires nvCOMP) |
 | Encoding | Encodes and decodes Base64 / hex (hex text) on the GPU |
+| Full-text search | Scans every file on the drive on the GPU, at VRAM bandwidth, without crossing PCIe |
 
 Note: data in VRAM is lost when you unmount or the process exits. When you unmount or quit from the GUI, you get the option to save the drive's contents to a ZIP file on your PC first.
 

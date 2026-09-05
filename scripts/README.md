@@ -37,6 +37,28 @@ pwsh -File scripts\e2e_robustness.ps1 [-Drive T] [-Exe path\to\vramdisk.exe]
 
 Mounts a 512 MiB volume.
 
+## bench_vs_ramdisk.ps1
+
+Head-to-head performance against an ordinary RAM disk, which is the thing
+VRAMDISK is really competing with. Measures sequential throughput at 4 KiB /
+64 KiB / 1 MiB / 16 MiB blocks in both unbuffered and buffered mode, 4 KiB
+random-read latency, and a small-file/metadata workload (create, stat, read,
+delete).
+
+```powershell
+pwsh -File scriptsench_vs_ramdisk.ps1 -RamDisk R:\ [-Drive V:] [-Size 4GiB]
+```
+
+You need a RAM disk mounted already -- ImDisk, OSFMount, whatever -- and its
+drive letter passed in. Creating one normally needs elevation, which this
+script deliberately does not ask for. It mounts and unmounts VRAMDISK itself.
+
+Both drives go through the identical harness, using raw
+`CreateFile`/`ReadFile`/`WriteFile` with page-aligned buffers so unbuffered
+mode really bypasses the Windows cache manager. Both modes are reported
+because both drives sit behind that cache; measuring only one would say more
+about the cache than about the device.
+
 ## e2e_jobs.ps1
 
 The `$VRAMDISK` internal virtual API (DEV.md section 11), which the robustness

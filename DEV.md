@@ -450,6 +450,18 @@ Windows の `RwLock` は SRWLOCK であり fair ではないため、理屈の�
 未実装である。write callback、および圧縮データを含む read は依然として
 exclusive guard 上で直列化される。
 
+### メタデータキャッシュ
+
+WinFsp のキャッシュタイムアウトは `file_info` のみ設定されており、`dir_info` /
+`volume_info` / `security` / `stream_info` は 0（キャッシュしない）だった。
+これらは 1 つ miss するごとに user-mode への往復が発生する。実測でこのスタックの
+往復は約 14 マイクロ秒で、cold path への `GetFileAttributesEx` はその往復を
+何度も踏む。特に security は path 解決のたびに問い合わされる。
+
+現在は 5 つとも 1000 ms を設定している。代償は staleness で、別ハンドル経由の
+ACL / サイズ変更が観測されるまで最大 1 秒かかる。これは元から `file_info` が
+受け入れていた条件と同じである。
+
 ### open handle と rename
 
 open handle は現在パスと delete-pending 状態を保持する。rename 時は対象サブツリー
@@ -474,6 +486,16 @@ token の照会に失敗した場合に限り、Everyone フルアクセス
 （`O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)`）へ fallback し、その旨を
 stderr に警告する。開けないボリュームより緩いボリュームの方がましだという判断で
 あり、実際にこの経路へ落ちることは想定していない。
+
+### CUDA kernel の事前コンパイル
+
+API kernel の PTX は NVRTC で実行時にコンパイルする。これに約 6 秒かかり、
+以前は最初の hash / archive / encode job がその全額を負担していた。
+
+現在はプロセスにつき 1 回だけコンパイルし（`OnceLock`）、`StorageEngine::new`
+から detached thread で先行して開始する。マウント時に同期実行すると mount が
+0.20 秒から 5.60 秒に伸びるため、背景で走らせている。mount は 0.23 秒のまま、
+最初の job は module load と calibration の約 0.2 秒だけを負担する。
 
 ### WinFsp DLL 解決
 
@@ -548,6 +570,7 @@ job は次の pending descriptor を `CREATE_NEW` で作成し、JSON を書き�
 - `archive.compress`
 - `archive.extract`
 - `encode`
+- `search`
 
 #### Hash jobs
 
@@ -575,11 +598,25 @@ raw/sparse/LZ4 の場合は CUDA API kernel の init/update/final 段で処理�
 `StorageEngine::read` で 32 MiB window ごとに materialize して RustCrypto hash へ
 逐次投入する。
 
-初回 hash 時（または API kernel 初期化時）には、約 1 MiB の VRAM scratch を
-single-thread SHA-256 で 1 回測り、per-thread throughput から次の 2 値を導出する。
+hash kernel は message に対して逐次であるため、GPU 側は **1 スレッド**で走る。
+1 ファイルのスループットでは CPU に勝てないのが普通で、実測では RTX 4070 の
+SHA-256 が 0.055 GB/s に対し、SHA-NI を持つ i9-12900K は 1.64 GB/s だった
+（約 30 倍）。GPU が効くのは多数のファイルを 1 launch にまとめる batch 経路である。
 
-- GPU hash launch budget: `throughput x 0.10 s` を `[4 MiB, 512 MiB]` に clamp。
-- CPU routing threshold: `throughput x 0.25 s` を `[1 MiB, 128 MiB]` に clamp。
+そのため初回 hash 時には、同じ約 1 MiB の sample で **GPU と CPU の両方**を測り、
+per-byte でどちらが速いかを比較して振り分けを決める。
+
+- GPU hash launch budget: `GPU throughput x 0.10 s` を `[4 MiB, 512 MiB]` に clamp。
+- CPU routing threshold:
+  - GPU が CPU 以上に速い場合は上限なし（`u64::MAX`）。
+    `hash_file_gpu_cancellable` は launch budget 単位で分割して流すので、
+    1 回の kernel に無制限の仕事が入ることはない。
+  - GPU の方が遅い場合は `GPU throughput x 0.25 s` と launch budget の小さい方。
+    batch を共有できる大きさのファイルだけを GPU へ入れる。
+
+以前は GPU 側のスループットだけを見て閾値を決めており（上限 128 MiB の clamp
+付き）、CPU と比較していなかったため、GPU の方が遅いサイズ帯まで GPU へ送って
+いた。
 
 raw チャンクは VRAM address descriptor として kernel に渡す。LZ4 compressed
 チャンクは nvCOMP で device scratch に D2D 解凍し、その scratch address を hash
@@ -619,6 +656,20 @@ CPU zstd fallback で格納された compressed chunk は GPU kernel へは渡�
 - `tar.lz4`
 - `tar.gz`
 - `zip`
+
+#### CRC32
+
+zip は payload ごとに CRC-32 を必要とする。`vramdisk_crc32_many` は batch 要素
+1 つにつき 1 スレッドしか割り当てないため、範囲全体を 1 要素として渡すと単一
+スレッドが逐次走査することになる（実測 256 MiB で 7.98 秒、約 5 MB/s）。
+
+現在は範囲を `CRC32_LANE_BYTES`（64 KiB）の lane に分割し、`CRC32_LAUNCH_BYTES`
+（512 MiB）ごとに 1 launch でまとめて計算したうえで、GF(2) 上の CRC-32 連結
+（zlib の `crc32_combine` 相当。lane 長が全て等しいので operator ladder は 1 回
+だけ構築する）で畳み込む。同じ 256 MiB が 11.2 ms（約 24 GB/s）になった。
+
+compressed placement を含む範囲は、lane ごとに一時 chunk を要するため hash の
+launch budget に従う。
 
 archive jobs では、対応できる範囲でファイル本文を GPU 上に保持する。CPU は
 descriptor、archive header、path metadata を扱う。source file と input archive は
@@ -663,6 +714,46 @@ GPU 上で Base64 / hex のエンコード・デコードを行う。descriptor 
 - hex は小文字で出力し、decode は大文字小文字両方を受け付ける。
 - 不正な入力文字は kernel の status flag 経由で明示エラーになる。
 - 失敗・キャンセル時は書きかけの出力ファイルと staging temp を除去する。
+
+#### Search jobs
+
+VRAM 上のファイル本文を GPU で全文検索する。descriptor 例:
+
+```json
+{
+  "op": "search",
+  "pattern": "TODO",
+  "paths": ["\src"],
+  "ignore_case": false,
+  "max_offsets": 64
+}
+```
+
+- `pattern` は正規表現ではなくリテラル。UTF-8 バイト列として照合する。
+  任意のバイト列を探す場合は `pattern` の代わりに `pattern_hex`（偶数長の 16 進）
+  を使う。上限は 256 バイト。
+- `paths` 省略時はボリューム全体を対象にする。他の job family と異なりこれを
+  既定にしているのは、全体検索が最も普通の使い方だからである。
+- `ignore_case` は ASCII の `A-Z` のみ畳む。対象は任意のバイト列であり、
+  特定のエンコーディングのテキストとは限らないため、Unicode の case folding は
+  行わない。
+- `max_offsets` は 1 ファイルあたりに**報告する**位置の数（既定 64）。
+  一致件数は常に正確で、位置だけが切り詰められる。切り詰めた場合は
+  `offsets_truncated` が真になる。
+
+この機能がこのハードウェアで意味を持つ理由は、データが既に VRAM にあることに尽きる。
+CPU 側の grep は同じ仕事をするのにボリューム全体を PCIe 越しに引き出す必要があるが、
+GPU カーネルはデバイスメモリ帯域でそのまま走査できる。
+
+実装はファイルのチャンクが連続とは限らず圧縮されている場合もあるため、
+`SEARCH_STAGE_BYTES`（64 MiB）の窓へ device-to-device で materialize してから
+走査する。窓は `窓長 - (pattern 長 - 1)` ずつ進めるので、継ぎ目をまたぐ一致も
+検出される。カーネルの最後の候補位置は次の窓の最初の候補位置のちょうど 1 つ手前
+なので、二重計上は起きない。
+
+カーネルは 1 候補位置につき 1 スレッドの grid-stride で、pattern の**先頭と末尾**の
+バイトで先に落とす。大多数を占める不一致がロード 2 回で済むため、全体が
+帯域律速になる。
 
 ---
 
@@ -753,6 +844,7 @@ frontend は Tauri が直接読み込む静的 HTML/CSS/JS である。別途 No
 - hash job。
 - archive compress / extract。
 - encode（Base64 / hex）。
+- search（GPU 全文検索）。
 
 window はリサイズ可能（既定 404x580、最小 380x460）。
 
@@ -790,6 +882,7 @@ UI は日本語 / 英語の二言語対応で、右上のセレクタで切り�
 | `archive_compress_job` | archive compression job を投入し job id を返す。 |
 | `archive_extract_job` | archive extraction job を投入し job id を返す。 |
 | `encode_job` | Base64/hex encode job を投入し job id を返す。 |
+| `search_job` | 全文検索 job を投入し job id を返す。 |
 | `job_status` | 指定 job の `status.json` を返す。 |
 | `job_result` | 指定 job の `result.json` を返す。 |
 | `job_cancel` | 指定 job のキャンセルを要求する。 |

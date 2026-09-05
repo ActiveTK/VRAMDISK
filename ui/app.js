@@ -52,7 +52,19 @@ const I18N = {
     toolsLabel: "マウント中のファイルを GPU で処理",
     toolHash: "ハッシュ計算",
     toolArchive: "圧縮・展開",
-    toolEncode: "エンコード",
+    toolEncode: "エンコード",
+    toolSearch: "全文検索",
+    toolSearchDesc: "ドライブ全体を横断",
+    searchPattern: "検索する文字列",
+    searchScope: "対象（ファイル / フォルダ）",
+    searchIgnoreCase: "大文字小文字を区別しない",
+    searchRun: "検索する",
+    searchPatternRequired: "検索する文字列を入力してください",
+    searchSummary: "見つかった数",
+    searchSummaryValue: "{0} 件 / {1} ファイル（{2} ファイルを走査）",
+    searchScanned: "走査したデータ",
+    searchHit: "{0} 件  {1}",
+    searchNoHits: "一致なし",
     unmount: "アンマウント",
     back: "← 戻る",
     hashPath: "対象（ファイル / フォルダ）",
@@ -171,7 +183,19 @@ const I18N = {
     toolsLabel: "Process mounted files on the GPU",
     toolHash: "Hash",
     toolArchive: "Compress / extract",
-    toolEncode: "Encode",
+    toolEncode: "Encode",
+    toolSearch: "Full-text search",
+    toolSearchDesc: "Across the whole drive",
+    searchPattern: "Text to find",
+    searchScope: "Target (file or folder)",
+    searchIgnoreCase: "Ignore case",
+    searchRun: "Search",
+    searchPatternRequired: "Enter something to search for",
+    searchSummary: "Matches found",
+    searchSummaryValue: "{0} in {1} file(s), {2} scanned",
+    searchScanned: "Data scanned",
+    searchHit: "{0} match(es)  {1}",
+    searchNoHits: "No matches",
     unmount: "Unmount",
     back: "← Back",
     hashPath: "Target (file or folder)",
@@ -337,14 +361,14 @@ function setText(id, msg, kind) {
 }
 
 function screenName() {
-  for (const s of ["setup", "mounted", "hash", "archive", "encode"]) {
+  for (const s of ["setup", "mounted", "hash", "archive", "search", "encode"]) {
     if (!el("screen-" + s).hidden) return s;
   }
   return null;
 }
 
 function showScreen(name) {
-  for (const s of ["setup", "mounted", "hash", "archive", "encode"]) {
+  for (const s of ["setup", "mounted", "hash", "archive", "search", "encode"]) {
     el("screen-" + s).hidden = s !== name;
   }
 }
@@ -841,6 +865,7 @@ const jobs = {
   hash: { running: false, generation: 0, jobId: null },
   archive: { running: false, generation: 0, jobId: null },
   encode: { running: false, generation: 0, jobId: null },
+  search: { running: false, generation: 0, jobId: null },
 };
 
 function jobUi(panel, running) {
@@ -1179,6 +1204,49 @@ function doEncodeJob(ev) {
   );
 }
 
+// --- search panel -------------------------------------------------------------
+
+function doSearchJob(ev) {
+  ev.preventDefault();
+  const pattern = el("search-pattern").value;
+  if (!pattern) {
+    setText("search-done", t("searchPatternRequired"), "error");
+    return;
+  }
+  const path = el("search-path").value.trim() || "\\";
+  const ignoreCase = el("search-ignore-case").checked;
+
+  runJob(
+    "search",
+    () => invoke("search_job", { req: { pattern, paths: [path], ignoreCase } }),
+    (res) => {
+      const rows = [];
+      const files = res.files || [];
+      rows.push(
+        kvRow(
+          t("searchSummary"),
+          t("searchSummaryValue", res.total_matches ?? 0, files.length, res.files_scanned ?? 0)
+        )
+      );
+      if (res.bytes_scanned != null) {
+        rows.push(kvRow(t("searchScanned"), formatSize(res.bytes_scanned)));
+      }
+      if (res.throughput_mib_s != null) {
+        rows.push(kvRow(t("kvThroughput"), `${Number(res.throughput_mib_s).toFixed(0)} MB/s`));
+      }
+      // One row per matching file, with a few positions so the result is
+      // actionable rather than just a count.
+      for (const f of files) {
+        const where = (f.offsets || []).slice(0, 4).map((o) => `+${o}`).join(", ");
+        const more = f.offsets_truncated || (f.offsets || []).length < f.matches ? "…" : "";
+        rows.push(kvRow(f.path, t("searchHit", f.matches, where + more)));
+      }
+      if (!files.length) rows.push(kvRow(t("resultKey"), t("searchNoHits")));
+      return rows.join("");
+    }
+  );
+}
+
 // --- boot --------------------------------------------------------------------
 
 // Each boot step is individually guarded: one failing invoke (e.g. a driver
@@ -1251,6 +1319,9 @@ async function boot() {
       showScreen("archive");
     }
   });
+  el("open-search").addEventListener("click", () => {
+    showScreen("search");
+  });
   el("open-encode").addEventListener("click", () => {
     updateEncodePlaceholders();
     suggestEncodeOutput();
@@ -1273,6 +1344,8 @@ async function boot() {
   for (const tab of document.querySelectorAll("#screen-encode .seg-btn")) {
     tab.addEventListener("click", () => setEncodeDirection(tab.dataset.direction));
   }
+  el("search-form").addEventListener("submit", doSearchJob);
+  el("search-cancel").addEventListener("click", () => cancelJob("search"));
   el("encode-form").addEventListener("submit", doEncodeJob);
   el("encode-cancel").addEventListener("click", () => cancelJob("encode"));
   el("encode-codec").addEventListener("change", () => {
@@ -1298,6 +1371,9 @@ async function boot() {
     }
   };
   el("hash-path-browse").addEventListener("click", () => pickInto("browse_file", "hash-path"));
+  el("search-path-browse").addEventListener("click", () =>
+    pickInto("browse_file", "search-path")
+  );
   el("archive-paths-browse").addEventListener("click", () => pickInto("browse_folder", "archive-paths"));
   el("archive-output-browse").addEventListener("click", () => pickInto("browse_save", "archive-output"));
   el("archive-input-browse").addEventListener("click", () => pickInto("browse_file", "archive-input"));
@@ -1358,6 +1434,9 @@ async function boot() {
   );
   await step(
     () =>
+      listen("open-search-panel", () => {
+        if (currentStatus) showScreen("search");
+      }),
       listen("open-encode-panel", () => {
         if (currentStatus) {
           updateEncodePlaceholders();
