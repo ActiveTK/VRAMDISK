@@ -2480,6 +2480,92 @@ pub fn mount(engine: StorageEngine, mount: &str, label: &str) -> anyhow::Result<
 }
 
 /// Mount the engine as a WinFsp volume and block until the user unmounts.
+/// Release a drive letter whose VRAMDISK was killed instead of unmounted.
+///
+/// `TerminateProcess` on a WinFsp host skips the unmount, and the volume device
+/// can survive with nobody to answer its I/O. The drive letter is then a black
+/// hole: every read of it blocks forever, so anything that enumerates drives --
+/// PowerShell's provider initialisation, Explorer, a file dialog -- hangs too,
+/// and the letter cannot be reused. The mapping outlives the process because it
+/// lives in the system-wide device map.
+///
+/// Refuses to act on a drive that answers, so it cannot take a live volume
+/// away. Removing the definition needs administrator rights; without them
+/// `DefineDosDevice` reports success while changing only this process's view,
+/// which is why the result is verified rather than trusted.
+pub fn release_stale_mount(mount: &str) -> anyhow::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        DefineDosDeviceW, DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION,
+    };
+
+    let letter = mount.trim().trim_end_matches(['\\', '/']).to_string();
+    anyhow::ensure!(
+        letter.len() == 2
+            && letter.ends_with(':')
+            && letter.starts_with(|c: char| c.is_ascii_alphabetic()),
+        "expected a drive letter such as T:, got {mount:?}"
+    );
+    let wide: Vec<u16> = letter.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let target = query_dos_device(&wide);
+    let Some(target) = target else {
+        println!("{letter} is not mapped to anything; nothing to release.");
+        return Ok(());
+    };
+    println!("{letter} -> {target}");
+
+    // A live drive answers this immediately; a stale one never answers at all.
+    let probe_path = format!("{letter}\\");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::fs::metadata(&probe_path).is_ok());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(_) => {
+            anyhow::bail!(
+                "{letter} is responding, so it is not stale -- refusing to touch it. Unmount it normally instead."
+            );
+        }
+        Err(_) => println!("{letter} did not respond in 5s; treating it as stale."),
+    }
+
+    let target_w: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = DefineDosDeviceW(
+            DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE | DDD_RAW_TARGET_PATH,
+            PCWSTR(wide.as_ptr()),
+            PCWSTR(target_w.as_ptr()),
+        );
+    }
+
+    match query_dos_device(&wide) {
+        None => {
+            println!("Released {letter}.");
+            Ok(())
+        }
+        Some(_) => anyhow::bail!(
+            "{letter} is still mapped. The definition lives in the system-wide device map, so removing it needs administrator rights -- re-run this from an elevated prompt."
+        ),
+    }
+}
+
+/// The device `name` (e.g. `T:`) currently resolves to, if any.
+fn query_dos_device(name: &[u16]) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
+    let mut buf = vec![0u16; 2048];
+    let n = unsafe { QueryDosDeviceW(PCWSTR(name.as_ptr()), Some(&mut buf)) };
+    if n == 0 {
+        return None;
+    }
+    // A double-NUL terminated list; the first entry is the active definition.
+    String::from_utf16_lossy(&buf[..n as usize])
+        .split('\0')
+        .find(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// Set when the user asks the CLI mount to stop, from either the console
 /// control handler or the stdin watcher.
 static CLI_SHUTDOWN: AtomicBool = AtomicBool::new(false);

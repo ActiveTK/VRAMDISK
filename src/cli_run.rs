@@ -40,6 +40,19 @@ pub fn run(args: Vec<String>) -> i32 {
 }
 
 fn run_inner(args: Cli) -> Result<()> {
+    // Recovery path: no GPU, no mount, nothing to set up.
+    if let Some(mount) = args.release_stale_mount.as_deref() {
+        #[cfg(windows)]
+        {
+            return crate::fs::release_stale_mount(mount);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = mount;
+            anyhow::bail!("--release-stale-mount is Windows-only");
+        }
+    }
+
     if args.bench_io {
         bench::run_io(args.device)?;
         return Ok(());

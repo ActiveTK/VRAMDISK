@@ -56,6 +56,21 @@ pub struct Cli {
     /// compression/deduplication combinations, then exit.
     #[arg(long, conflicts_with_all = ["bench", "compress", "dedup", "size", "mount"])]
     pub bench_io: bool,
+
+    /// Release a drive letter left behind by a VRAMDISK that was killed rather
+    /// than unmounted, then exit.
+    ///
+    /// Ending the process from Task Manager (or any other `TerminateProcess`)
+    /// skips the unmount, and WinFsp can leave the volume device in place. The
+    /// drive letter then answers no I/O at all -- anything that enumerates
+    /// drives, PowerShell included, hangs on it -- and it cannot be reused.
+    ///
+    /// This refuses to touch a drive that is actually responding, so it cannot
+    /// take a live volume away. Removing the leftover definition needs
+    /// administrator rights, because the mapping lives in the system-wide
+    /// device map; run it from an elevated prompt.
+    #[arg(long, value_name = "MOUNT", conflicts_with_all = ["bench", "bench_io", "compress", "dedup", "size", "mount"])]
+    pub release_stale_mount: Option<String>,
 }
 
 /// Parse a human-friendly byte size such as `2GB`, `512MiB`, `1048576`.
