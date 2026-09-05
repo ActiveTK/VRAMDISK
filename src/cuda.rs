@@ -513,6 +513,7 @@ impl Vram {
 mod tests {
     use super::*;
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn copy_within_uses_device_to_device_path() {
         let mut vram = Vram::new(0, 128 * 1024).expect("test vram");

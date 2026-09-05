@@ -58,13 +58,20 @@ pub struct MountStatus {
 /// Reply channel for a request.
 type Reply<T> = Sender<T>;
 
+/// The manager thread is spawned before Tauri exists, so it cannot reach
+/// `UiLang` app state the way a command can. Rather than handing it a shared
+/// handle to mutable state it would have to lock on every failure, the three
+/// commands that can produce a user-visible message carry the caller's
+/// language with the request: the caller (a Tauri command, or the tray path in
+/// `main.rs`) always knows it, and the message is then rendered in whatever
+/// language was selected at the moment the request was made.
 enum Cmd {
     ListGpus(Reply<Vec<GpuDto>>),
     ListFreeDrives(Reply<Vec<String>>),
-    Mount(MountConfig, Reply<Result<(), String>>),
-    Unmount(Reply<Result<(), String>>),
+    Mount(MountConfig, String, Reply<Result<(), String>>),
+    Unmount(String, Reply<Result<(), String>>),
     Status(Reply<Option<MountStatus>>),
-    Stats(Reply<Result<serde_json::Value, String>>),
+    Stats(String, Reply<Result<serde_json::Value, String>>),
     MountPoint(Reply<Option<String>>),
     Shutdown(Reply<()>),
 }
@@ -91,17 +98,17 @@ impl Manager {
                         Cmd::ListFreeDrives(reply) => {
                             let _ = reply.send(list_free_drives());
                         }
-                        Cmd::Mount(cfg, reply) => {
-                            let _ = reply.send(state.mount(cfg).map_err(|e| e.to_string()));
+                        Cmd::Mount(cfg, lang, reply) => {
+                            let _ = reply.send(state.mount(cfg, &lang).map_err(|e| e.to_string()));
                         }
-                        Cmd::Unmount(reply) => {
-                            let _ = reply.send(state.unmount().map_err(|e| e.to_string()));
+                        Cmd::Unmount(lang, reply) => {
+                            let _ = reply.send(state.unmount(&lang).map_err(|e| e.to_string()));
                         }
                         Cmd::Status(reply) => {
                             let _ = reply.send(state.status());
                         }
-                        Cmd::Stats(reply) => {
-                            let _ = reply.send(state.stats().map_err(|e| e.to_string()));
+                        Cmd::Stats(lang, reply) => {
+                            let _ = reply.send(state.stats(&lang).map_err(|e| e.to_string()));
                         }
                         Cmd::MountPoint(reply) => {
                             let _ = reply.send(state.mount_point());
@@ -139,12 +146,16 @@ impl Manager {
         self.request(Cmd::ListFreeDrives)
     }
 
-    pub fn mount(&self, cfg: MountConfig) -> Result<(), String> {
-        self.request(|r| Cmd::Mount(cfg, r))
+    /// `lang` is the UI language ("ja" / "en") the failure message should be
+    /// rendered in; see [`Cmd`].
+    pub fn mount(&self, cfg: MountConfig, lang: &str) -> Result<(), String> {
+        let lang = lang.to_string();
+        self.request(|r| Cmd::Mount(cfg, lang, r))
     }
 
-    pub fn unmount(&self) -> Result<(), String> {
-        self.request(Cmd::Unmount)
+    pub fn unmount(&self, lang: &str) -> Result<(), String> {
+        let lang = lang.to_string();
+        self.request(|r| Cmd::Unmount(lang, r))
     }
 
     /// The current mount, if any.
@@ -152,8 +163,9 @@ impl Manager {
         self.request(Cmd::Status)
     }
 
-    pub fn stats(&self) -> Result<serde_json::Value, String> {
-        self.request(Cmd::Stats)
+    pub fn stats(&self, lang: &str) -> Result<serde_json::Value, String> {
+        let lang = lang.to_string();
+        self.request(|r| Cmd::Stats(lang, r))
     }
 
     /// The mount point (drive letter or directory) of the current mount, if
@@ -207,17 +219,17 @@ impl ManagerState {
     }
 
     #[cfg(windows)]
-    fn mount(&mut self, cfg: MountConfig) -> anyhow::Result<()> {
+    fn mount(&mut self, cfg: MountConfig, lang: &str) -> anyhow::Result<()> {
         if self.mount.is_some() {
-            anyhow::bail!("a disk is already mounted; unmount it first");
+            anyhow::bail!("{}", crate::tr(lang, "err_already_mounted"));
         }
         let mount_point = normalize_mount_point(&cfg.mount_point);
         if mount_point.is_empty() {
-            anyhow::bail!("マウント先を指定してください");
+            anyhow::bail!("{}", crate::tr(lang, "err_mount_point_required"));
         }
         let directory_mode = !is_drive_letter_form(&mount_point);
         if directory_mode {
-            validate_mount_point(&mount_point)?;
+            validate_mount_point(&mount_point, lang)?;
         }
 
         let total = Vram::device_total_mem(cfg.device)?;
@@ -226,10 +238,17 @@ impl ManagerState {
             None => default_size(total),
         };
         if size == 0 {
-            anyhow::bail!("disk size must be greater than 0");
+            anyhow::bail!("{}", crate::tr(lang, "err_size_zero"));
         }
         if size > total {
-            anyhow::bail!("requested {size} bytes exceeds device VRAM ({total} bytes)");
+            anyhow::bail!(
+                "{}",
+                crate::trf(
+                    lang,
+                    "err_size_exceeds_vram",
+                    &[&size.to_string(), &total.to_string()],
+                )
+            );
         }
 
         let vram = Vram::new(cfg.device, size)?;
@@ -244,7 +263,14 @@ impl ManagerState {
         let removed_existing = directory_mode && std::path::Path::new(&mount_point).exists();
         if removed_existing {
             std::fs::remove_dir(&mount_point).map_err(|e| {
-                anyhow::anyhow!("マウント先フォルダを準備できません: {mount_point}: {e}")
+                anyhow::anyhow!(
+                    "{}",
+                    crate::trf(
+                        lang,
+                        "err_mount_prepare_folder",
+                        &[&mount_point, &e.to_string()],
+                    )
+                )
             })?;
         }
 
@@ -256,7 +282,12 @@ impl ManagerState {
                         // Both the mount and the restore failed: say so
                         // instead of silently leaving the user's folder gone.
                         return Err(anyhow::anyhow!(
-                            "{e:#}（さらに、マウント先フォルダの復元にも失敗しました: {restore}）"
+                            "{}",
+                            crate::trf(
+                                lang,
+                                "err_mount_restore_folder",
+                                &[&format!("{e:#}"), &restore.to_string()],
+                            )
                         ));
                     }
                 }
@@ -278,31 +309,39 @@ impl ManagerState {
     }
 
     #[cfg(not(windows))]
-    fn mount(&mut self, _cfg: MountConfig) -> anyhow::Result<()> {
-        anyhow::bail!("mounting is only supported on Windows (WinFsp)")
+    fn mount(&mut self, _cfg: MountConfig, lang: &str) -> anyhow::Result<()> {
+        anyhow::bail!("{}", crate::tr(lang, "err_mount_windows_only"))
     }
 
-    fn unmount(&mut self) -> anyhow::Result<()> {
+    fn unmount(&mut self, lang: &str) -> anyhow::Result<()> {
         match self.mount.take() {
             Some(_record) => {
                 #[cfg(windows)]
                 _record.mounted.unmount();
                 Ok(())
             }
-            None => anyhow::bail!("nothing is mounted"),
+            None => anyhow::bail!("{}", crate::tr(lang, "err_not_mounted")),
         }
     }
 
     /// Read the mounted volume's `$VRAMDISK\stats.json` and return it parsed.
-    fn stats(&self) -> anyhow::Result<serde_json::Value> {
+    fn stats(&self, lang: &str) -> anyhow::Result<serde_json::Value> {
         let Some(record) = self.mount.as_ref() else {
-            anyhow::bail!("nothing is mounted");
+            anyhow::bail!("{}", crate::tr(lang, "err_not_mounted"));
         };
         let path = format!("{}\\$VRAMDISK\\stats.json", record.status.mount_point);
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
-        let value: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("parse {path}: {e}"))?;
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!(
+                "{}",
+                crate::trf(lang, "err_read_failed", &[&path, &e.to_string()])
+            )
+        })?;
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "{}",
+                crate::trf(lang, "err_parse_failed", &[&path, &e.to_string()])
+            )
+        })?;
         Ok(value)
     }
 
@@ -363,7 +402,7 @@ fn normalize_mount_point(input: &str) -> String {
 /// an existing non-directory, or a non-empty directory — is rejected.
 /// Drive-letter mount points are left to WinFsp itself to validate (it
 /// already knows which letters are free).
-fn validate_mount_point(mount_point: &str) -> anyhow::Result<()> {
+fn validate_mount_point(mount_point: &str, lang: &str) -> anyhow::Result<()> {
     if is_drive_letter_form(mount_point) {
         return Ok(());
     }
@@ -372,12 +411,26 @@ fn validate_mount_point(mount_point: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     if !path.is_dir() {
-        anyhow::bail!("マウント先はフォルダではありません: {mount_point}");
+        anyhow::bail!(
+            "{}",
+            crate::trf(lang, "err_mount_point_not_folder", &[mount_point])
+        );
     }
-    let mut entries = std::fs::read_dir(path)
-        .map_err(|e| anyhow::anyhow!("マウント先フォルダを開けません: {mount_point}: {e}"))?;
+    let mut entries = std::fs::read_dir(path).map_err(|e| {
+        anyhow::anyhow!(
+            "{}",
+            crate::trf(
+                lang,
+                "err_mount_folder_open_failed",
+                &[mount_point, &e.to_string()],
+            )
+        )
+    })?;
     if entries.next().is_some() {
-        anyhow::bail!("マウント先フォルダが空ではありません: {mount_point}");
+        anyhow::bail!(
+            "{}",
+            crate::trf(lang, "err_mount_folder_not_empty", &[mount_point])
+        );
     }
     Ok(())
 }
@@ -439,17 +492,20 @@ mod tests {
             .expect("a free drive letter F..Z");
         let mgr = Manager::spawn();
 
-        mgr.mount(MountConfig {
-            size: Some(128 * 1024 * 1024),
-            mount_point: drive.clone(),
-            device: 0,
-            compress: false,
-            dedup: false,
-        })
+        mgr.mount(
+            MountConfig {
+                size: Some(128 * 1024 * 1024),
+                mount_point: drive.clone(),
+                device: 0,
+                compress: false,
+                dedup: false,
+            },
+            "ja",
+        )
         .expect("mount");
 
         // Volume should be visible and report a sane total.
-        let stats = mgr.stats().expect("stats");
+        let stats = mgr.stats("ja").expect("stats");
         assert!(stats["volume"]["total_bytes"].as_u64().unwrap() >= 128 * 1024 * 1024);
         assert!(mgr.status().is_some());
 
@@ -460,7 +516,7 @@ mod tests {
         let back = std::fs::read(&path).expect("read from mounted drive");
         assert_eq!(back, payload);
 
-        mgr.unmount().expect("unmount");
+        mgr.unmount("ja").expect("unmount");
         assert!(mgr.status().is_none());
         assert!(!std::path::Path::new(&format!("{drive}\\")).exists());
 
@@ -493,16 +549,19 @@ mod tests {
         let mount_point = dir.to_string_lossy().to_string();
 
         let mgr = Manager::spawn();
-        mgr.mount(MountConfig {
-            size: Some(128 * 1024 * 1024),
-            mount_point: mount_point.clone(),
-            device: 0,
-            compress: false,
-            dedup: false,
-        })
+        mgr.mount(
+            MountConfig {
+                size: Some(128 * 1024 * 1024),
+                mount_point: mount_point.clone(),
+                device: 0,
+                compress: false,
+                dedup: false,
+            },
+            "ja",
+        )
         .expect("mount to pre-existing empty directory");
 
-        let stats = mgr.stats().expect("stats");
+        let stats = mgr.stats("ja").expect("stats");
         assert!(stats["volume"]["total_bytes"].as_u64().unwrap() >= 128 * 1024 * 1024);
 
         let path = format!("{mount_point}\\hello.txt");
@@ -511,7 +570,7 @@ mod tests {
         let back = std::fs::read(&path).expect("read from mounted directory");
         assert_eq!(back, payload);
 
-        mgr.unmount().expect("unmount");
+        mgr.unmount("ja").expect("unmount");
         mgr.shutdown();
 
         // WinFsp owns the directory's lifecycle in directory-mount mode: it
@@ -531,17 +590,20 @@ mod tests {
         let mount_point = dir.to_string_lossy().to_string();
 
         let mgr = Manager::spawn();
-        mgr.mount(MountConfig {
-            size: Some(128 * 1024 * 1024),
-            mount_point: mount_point.clone(),
-            device: 0,
-            compress: false,
-            dedup: false,
-        })
+        mgr.mount(
+            MountConfig {
+                size: Some(128 * 1024 * 1024),
+                mount_point: mount_point.clone(),
+                device: 0,
+                compress: false,
+                dedup: false,
+            },
+            "ja",
+        )
         .expect("mount to not-yet-existing directory");
 
         assert!(dir.exists());
-        mgr.unmount().expect("unmount");
+        mgr.unmount("ja").expect("unmount");
         mgr.shutdown();
         assert!(!dir.exists());
     }
@@ -563,13 +625,16 @@ mod tests {
 
         let mgr = Manager::spawn();
         let err = mgr
-            .mount(MountConfig {
-                size: Some(128 * 1024 * 1024),
-                mount_point: mount_point.clone(),
-                device: 9999, // no such CUDA device -> Vram::device_total_mem fails
-                compress: false,
-                dedup: false,
-            })
+            .mount(
+                MountConfig {
+                    size: Some(128 * 1024 * 1024),
+                    mount_point: mount_point.clone(),
+                    device: 9999, // no such CUDA device -> Vram::device_total_mem fails
+                    compress: false,
+                    dedup: false,
+                },
+                "ja",
+            )
             .expect_err("mount with a bogus device ordinal must fail");
         assert!(!err.is_empty());
 

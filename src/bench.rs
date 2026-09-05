@@ -479,58 +479,79 @@ fn bench_engine(device: usize, vram_size: u64) -> Result<()> {
 
 // ─── [2a] Deduplicated storage engine throughput ────────────────────────────
 
+/// Dedup write throughput in both candidate-confirmation modes.
+///
+/// The two columns are the price of correctness: `verify` reads each confirmed
+/// duplicate chunk back from VRAM and compares it byte for byte (the default),
+/// while `trust-hash` (`--dedup-trust-hash`) confirms with a batched GPU
+/// re-hash and can therefore be fooled by a deliberate FNV-1a collision. Unique
+/// writes find no candidates and so should be near-identical in both columns;
+/// the duplicate row is where the difference shows up.
 fn bench_engine_dedup(device: usize) -> Result<()> {
     println!("[2a] Dedup Engine Throughput  (--dedup, avg of {RUNS} runs)");
 
     let size = 64 * 1024 * 1024u64;
-    let vram = match Vram::new(device, size + 4 * CHUNK_SIZE) {
-        Ok(v) => v,
-        Err(_) => {
-            println!("    (skipped: cannot allocate VRAM)\n");
-            return Ok(());
-        }
-    };
-    let mut engine = StorageEngine::new(vram, false, true)?;
-    engine.table_mut().create_file("\\unique", 0).unwrap();
-    engine.table_mut().create_file("\\dupe", 0).unwrap();
     let unique: Vec<u8> = (0..size as usize).map(|i| (i % 251) as u8).collect();
 
-    println!("    {:<18} {:>16}", "Case", "Write");
-    println!("    {}", "─".repeat(38));
+    println!(
+        "    {:<18} {:>16} {:>16}",
+        "Case", "Write (verify)", "Write (trust)"
+    );
+    println!("    {}", "─".repeat(52));
 
-    let mut unique_times = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
-        engine
-            .set_size("\\unique", 0)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let t = Instant::now();
-        engine
-            .write("\\unique", 0, &unique)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        unique_times.push(t.elapsed());
-    }
+    // One engine per mode: the dedup index and the chunk bitmap both carry
+    // state between runs, so reusing an engine would let the first mode's
+    // leftovers decide what the second mode gets to share.
+    let mut unique_tp = Vec::with_capacity(2);
+    let mut dupe_tp = Vec::with_capacity(2);
+    for verify in [true, false] {
+        let vram = match Vram::new(device, size + 4 * CHUNK_SIZE) {
+            Ok(v) => v,
+            Err(_) => {
+                println!("    (skipped: cannot allocate VRAM)\n");
+                return Ok(());
+            }
+        };
+        let mut engine = StorageEngine::new(vram, false, true)?;
+        engine.set_dedup_verify_bytes(verify);
+        engine.table_mut().create_file("\\unique", 0).unwrap();
+        engine.table_mut().create_file("\\dupe", 0).unwrap();
 
-    let mut dupe_times = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
-        engine
-            .set_size("\\dupe", 0)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let t = Instant::now();
-        engine
-            .write("\\dupe", 0, &unique)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        dupe_times.push(t.elapsed());
+        let mut unique_times = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            engine
+                .set_size("\\unique", 0)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let t = Instant::now();
+            engine
+                .write("\\unique", 0, &unique)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            unique_times.push(t.elapsed());
+        }
+
+        let mut dupe_times = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            engine
+                .set_size("\\dupe", 0)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let t = Instant::now();
+            engine
+                .write("\\dupe", 0, &unique)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            dupe_times.push(t.elapsed());
+        }
+
+        unique_tp.push(throughput(size, avg(&unique_times)));
+        dupe_tp.push(throughput(size, avg(&dupe_times)));
     }
 
     println!(
-        "    {:<18} {:>16}",
-        "unique write",
-        throughput(size, avg(&unique_times))
+        "    {:<18} {:>16} {:>16}",
+        "unique write", unique_tp[0], unique_tp[1]
     );
     println!(
-        "    {:<18} {:>16}",
-        "duplicate write",
-        throughput(size, avg(&dupe_times))
+        "    {:<18} {:>16} {:>16}",
+        "duplicate write", dupe_tp[0], dupe_tp[1]
     );
     println!();
     Ok(())

@@ -9,6 +9,16 @@ license = "MIT"
 name = "vramdisk"
 path = "src/lib.rs"
 
+# Tests that allocate real VRAM (`Vram::new`), launch CUDA kernels or load
+# nvCOMP are gated behind `gpu-tests`, which is ON by default so a plain
+# `cargo test` on a development machine still runs everything. CI has no
+# NVIDIA device, so it runs `cargo test --no-default-features`, which leaves
+# the GPU-free tests (namespace, allocator, job registry, CLI parsing, CRC
+# tables) running there instead of skipping testing altogether.
+[features]
+default = ["gpu-tests"]
+gpu-tests = []
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

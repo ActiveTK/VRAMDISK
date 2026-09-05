@@ -22,6 +22,20 @@ pub struct Cli {
     #[arg(short, long, default_value_t = false)]
     pub dedup: bool,
 
+    /// Share deduplicated chunks on a 64-bit FNV-1a hash match alone, without
+    /// reading the candidate back and comparing the bytes.
+    ///
+    /// Faster, and unsafe against untrusted writers. By default every dedup
+    /// hit is confirmed byte for byte, which costs one 64KiB device-to-host
+    /// read per duplicate chunk. FNV-1a is not collision resistant and
+    /// collisions can be constructed on purpose, so with this flag anyone who
+    /// can write chosen bytes to the volume can make an unrelated file's chunk
+    /// alias theirs: that file then silently reads back the attacker's data,
+    /// with no error and no way to recover the original. Only use this when
+    /// every writer to the volume is trusted. Has no effect without --dedup.
+    #[arg(long, default_value_t = false)]
+    pub dedup_trust_hash: bool,
+
     /// Drive letter / mount point to expose the disk on (Windows).
     #[arg(short, long, default_value = "R:")]
     pub mount: String,
@@ -168,6 +182,18 @@ mod tests {
             (1.5 * 1024.0 * 1024.0) as u64
         );
         assert_eq!(parse_size("64kib").unwrap(), 65536);
+    }
+
+    #[test]
+    fn dedup_trust_hash_defaults_to_off() {
+        // The safe default has to survive the clap definition: an engine built
+        // from these args verifies dedup candidates byte for byte unless the
+        // user explicitly asked not to.
+        let plain = Cli::parse_from(["vramdisk", "--dedup"]);
+        assert!(plain.dedup);
+        assert!(!plain.dedup_trust_hash);
+        let opted_out = Cli::parse_from(["vramdisk", "--dedup", "--dedup-trust-hash"]);
+        assert!(opted_out.dedup_trust_hash);
     }
 
     #[test]

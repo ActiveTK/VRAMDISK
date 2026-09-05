@@ -233,6 +233,7 @@ mod tests {
 
     // Requires a GPU. Validates that a single batched launch hashes many chunks
     // and that each matches the CPU reference.
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn batch_matches_cpu() {
         let chunks = 8usize;

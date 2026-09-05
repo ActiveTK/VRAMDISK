@@ -38,6 +38,16 @@ vramdisk = { path = ".." }
 # the Windows display language reported by sys-locale.
 winreg = "0.55"
 sys-locale = "0.3"
+# "Save the disk to a ZIP before unmounting" (see commands::export_zip). Only
+# Deflate is enabled: it is the one method every unzip tool on Windows —
+# Explorer's built-in one included — can read without extra software, which is
+# the whole point of a rescue archive. `time` lets ZIP entries carry the real
+# file mtimes instead of all landing on 1980-01-01.
+zip = { version = "8.6.0", default-features = false, features = ["deflate", "time"] }
+# Converting a std SystemTime into the Y/M/D-H:M:S fields a ZIP entry stores.
+# `local-offset` because ZIP timestamps are, by format convention, local time;
+# on Windows it reads the timezone from the OS and is sound to call.
+time = { version = "0.3", default-features = false, features = ["std", "local-offset"] }
 
 [profile.release]
 opt-level = 3

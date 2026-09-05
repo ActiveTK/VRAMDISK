@@ -85,6 +85,12 @@ fn run_inner(args: Cli) -> Result<()> {
         if args.compress { "on" } else { "off" }
     );
     println!("  dedup       : {}", if args.dedup { "on" } else { "off" });
+    if args.dedup && args.dedup_trust_hash {
+        println!(
+            "  dedup verify: off (--dedup-trust-hash: 64-bit hash match only; \
+             a deliberate collision can alias one file's data onto another)"
+        );
+    }
     println!(
         "  disk size   : {} ({} chunks x {})",
         format_size(size),
@@ -98,7 +104,10 @@ fn run_inner(args: Cli) -> Result<()> {
 
     self_test(&mut vram)?;
 
-    let engine = engine::StorageEngine::new(vram, args.compress, args.dedup)?;
+    let mut engine = engine::StorageEngine::new(vram, args.compress, args.dedup)?;
+    // Byte verification is the engine default; `--dedup-trust-hash` opts out of
+    // it in exchange for throughput (see the flag's help for what that costs).
+    engine.set_dedup_verify_bytes(!args.dedup_trust_hash);
 
     #[cfg(windows)]
     {

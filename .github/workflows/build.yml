@@ -1,11 +1,12 @@
 name: build
 
-# Build-only CI: GitHub-hosted runners have no NVIDIA GPU, so this verifies
-# that vramdisk.exe compiles on every push/PR. It intentionally does not run
-# `cargo test` — the unit tests allocate real GPU VRAM (`Vram::new`) and
-# require an actual CUDA device, which this workflow cannot provide.
-# GPU-dependent test/E2E verification stays a local/manual step (see
-# CURRENT.md). There is no installer to build (bundle.active=false in
+# GitHub-hosted runners have no NVIDIA GPU, so this verifies that
+# vramdisk.exe compiles on every push/PR and runs everything that can be
+# checked without a CUDA device. Tests that allocate real VRAM are gated
+# behind the `gpu-tests` feature (on by default, so a local `cargo test` still
+# runs them); the lint job below runs the rest with --no-default-features.
+# Full GPU test and E2E verification stays a local/manual step (see
+# scripts/README.md). There is no installer to build (bundle.active=false in
 # tauri.conf.json) — vramdisk.exe is a standalone executable, so this is a
 # plain `cargo build`, no Node/npm/tauri-cli involved.
 #
@@ -69,7 +70,7 @@ jobs:
           if-no-files-found: error
 
   lint:
-    name: Clippy (root crate)
+    name: Lint and GPU-free tests
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,3 +104,10 @@ jobs:
       # build job above.
       - name: cargo clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+
+      # The GPU-gated tests are compiled and linted by the step above but
+      # cannot run here, so this runs the rest: namespace, chunk allocator,
+      # compressed-blob arena, job registry, CLI parsing and the CRC tables.
+      # Better than the previous state, where CI ran no tests at all.
+      - name: cargo test (GPU-free subset)
+        run: cargo test --lib --no-default-features --locked

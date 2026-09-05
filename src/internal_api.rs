@@ -307,6 +307,7 @@ compress.raw_fallback_chunks: {}\r\n\
 dedup.hash_chunks: {}\r\n\
 dedup.candidate_chunks: {}\r\n\
 dedup.shared_chunks: {}\r\n\
+dedup.rejected_chunks: {}\r\n\
 dedup.unique_chunks: {}\r\n\
 gpu.hash_chunks: {}\r\n",
         t.read_calls,
@@ -328,6 +329,7 @@ gpu.hash_chunks: {}\r\n",
         t.dedup_hash_chunks,
         t.dedup_candidate_chunks,
         t.dedup_shared_chunks,
+        t.dedup_rejected_chunks,
         t.dedup_unique_chunks,
         t.gpu_hash_chunks,
     )
@@ -354,6 +356,7 @@ fn trace_json(engine: &StorageEngine) -> String {
             "    \"hash_chunks\": {},\r\n",
             "    \"candidate_chunks\": {},\r\n",
             "    \"shared_chunks\": {},\r\n",
+            "    \"rejected_chunks\": {},\r\n",
             "    \"unique_chunks\": {}\r\n",
             "  }},\r\n",
             "  \"gpu\": {{\"hash_chunks\": {}}}\r\n",
@@ -378,6 +381,7 @@ fn trace_json(engine: &StorageEngine) -> String {
         t.dedup_hash_chunks,
         t.dedup_candidate_chunks,
         t.dedup_shared_chunks,
+        t.dedup_rejected_chunks,
         t.dedup_unique_chunks,
         t.gpu_hash_chunks,
     )
@@ -718,6 +722,7 @@ mod tests {
         assert!(!is_internal_path("\\normal"));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn resolves_public_entries_without_md5_alias() {
         let vram = crate::cuda::Vram::new(0, crate::CHUNK_SIZE).expect("test vram");
@@ -759,6 +764,7 @@ mod tests {
         assert_eq!(resolve("\\$vramdisk\\md5\\file.bin", &engine), None);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn chunks_json_reports_raw_and_sparse_chunks() {
         let vram = crate::cuda::Vram::new(0, crate::CHUNK_SIZE * 4).expect("test vram");
@@ -777,6 +783,7 @@ mod tests {
         assert!(json.contains("\"physical_chunk\": 0"));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn chunks_json_reports_dedup_refcount_and_hash() {
         let vram = crate::cuda::Vram::new(0, crate::CHUNK_SIZE * 4).expect("test vram");

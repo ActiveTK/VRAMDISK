@@ -13,7 +13,6 @@
 
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
-const dialog = window.__TAURI__.dialog;
 
 const el = (id) => document.getElementById(id);
 
@@ -89,17 +88,39 @@ const I18N = {
     chooseFolder: "フォルダを指定してください",
     mounting: "マウント中…",
     mountFail: "マウントできません: {0}",
-    unmountWarning: "本当にアンマウントしますか？\nドライブ上のデータは全て失われます。",
-    continueBtn: "続行",
     cancelBtn: "キャンセル",
     unmounting: "アンマウント中…",
     unmountFail: "アンマウントできません: {0}",
+    quitting: "終了しています…",
+    quitFail: "終了できません: {0}",
+    teardownTitle: "アンマウントの前に",
+    teardownBody:
+      "アンマウントするとドライブ上のデータは全て失われます。\nZIP ファイルに保存してから続行できます。",
+    teardownQuitTitle: "終了の前に",
+    teardownQuitBody:
+      "終了するとドライブ上のデータは全て失われます。\nZIP ファイルに保存してから続行できます。",
+    saveAndUnmount: "ZIP に保存してアンマウント",
+    unmountWithoutSaving: "保存せずアンマウント",
+    saveAndQuit: "ZIP に保存して終了",
+    quitWithoutSaving: "保存せず終了",
+    exporting: "ZIP に保存中…",
+    exportCancelled: "保存を中止しました。データはそのままです。",
+    exportDone: "{0} に保存しました（{1} ファイル）",
+    exportFail: "保存できません: {0}",
+    exportPartial: "{0} 件を保存できませんでした。データを失わないよう、そのままにしました。",
+    exportMoreFailures: "ほか {0} 件",
     badgeCompress: "圧縮",
     badgeDedup: "共有",
     usageUsed: "使用 {0} / {1}",
     interrupted: "アンマウントされたため中断しました",
     jobStatusFail: "失敗: ジョブの状態を確認できません",
     processing: "GPU で処理中… {0} 秒",
+    progressLabel: "進捗",
+    progressBytes: "{0} / {1}",
+    progressPct: "{0}%",
+    etaSeconds: "残り約 {0} 秒",
+    etaMinutes: "残り約 {0} 分",
+    etaHours: "残り約 {0} 時間 {1} 分",
     jobFailed: "失敗: {0}",
     jobError: "処理に失敗しました",
     cancelled: "中止しました",
@@ -189,17 +210,39 @@ const I18N = {
     chooseFolder: "Enter a folder",
     mounting: "Mounting…",
     mountFail: "Could not mount: {0}",
-    unmountWarning: "Unmount now?\nAll data on the drive will be lost.",
-    continueBtn: "Continue",
     cancelBtn: "Cancel",
     unmounting: "Unmounting…",
     unmountFail: "Could not unmount: {0}",
+    quitting: "Exiting…",
+    quitFail: "Could not exit: {0}",
+    teardownTitle: "Before unmounting",
+    teardownBody:
+      "Unmounting loses everything on the drive.\nYou can save it to a ZIP file first.",
+    teardownQuitTitle: "Before exiting",
+    teardownQuitBody:
+      "Exiting loses everything on the drive.\nYou can save it to a ZIP file first.",
+    saveAndUnmount: "Save to ZIP, then unmount",
+    unmountWithoutSaving: "Unmount without saving",
+    saveAndQuit: "Save to ZIP, then exit",
+    quitWithoutSaving: "Exit without saving",
+    exporting: "Saving to ZIP…",
+    exportCancelled: "Saving cancelled. Nothing was discarded.",
+    exportDone: "Saved to {0} ({1} files)",
+    exportFail: "Could not save: {0}",
+    exportPartial: "{0} item(s) could not be saved, so nothing was discarded.",
+    exportMoreFailures: "{0} more",
     badgeCompress: "compressed",
     badgeDedup: "dedup",
     usageUsed: "{0} of {1} used",
     interrupted: "Interrupted by unmount",
     jobStatusFail: "Failed: cannot read the job's status",
     processing: "Processing on the GPU… {0} s",
+    progressLabel: "Progress",
+    progressBytes: "{0} / {1}",
+    progressPct: "{0}%",
+    etaSeconds: "About {0} s left",
+    etaMinutes: "About {0} min left",
+    etaHours: "About {0} h {1} min left",
     jobFailed: "Failed: {0}",
     jobError: "The operation failed",
     cancelled: "Cancelled",
@@ -237,8 +280,11 @@ const I18N = {
 
 let LANG = "ja";
 
+// Missing keys degrade to the key name, never to undefined/"": an untranslated
+// or typo'd key must still show *something* rather than silently blanking a
+// label, and the key name makes the omission obvious instead of invisible.
 function t(key, ...args) {
-  let s = (I18N[LANG] && I18N[LANG][key]) || I18N.ja[key] || key;
+  let s = (I18N[LANG] && I18N[LANG][key]) || I18N.ja[key] || String(key);
   for (let i = 0; i < args.length; i++) {
     s = s.replaceAll(`{${i}}`, String(args[i]));
   }
@@ -253,11 +299,15 @@ function applyLanguage() {
   for (const node of document.querySelectorAll("[data-i18n]")) {
     node.textContent = t(node.dataset.i18n);
   }
+  for (const node of document.querySelectorAll("[data-i18n-label]")) {
+    node.setAttribute("aria-label", t(node.dataset.i18nLabel));
+  }
   el("size-value").placeholder = t("sizePlaceholder");
   updateSizeHint();
   applyNvcompAvailability(nvcompOk);
   setArchiveMode(archiveMode());
   setEncodeDirection(encodeDirection(), { keepOutput: true });
+  renderTeardownTexts();
   if (currentStatus) {
     renderMountedHead(currentStatus);
     pollStats();
@@ -587,27 +637,139 @@ async function doMount(ev) {
   }
 }
 
-async function doUnmount() {
-  const warning = t("unmountWarning");
-  const confirmed = dialog
-    ? await dialog.confirm(warning, {
-        title: "VRAMDISK",
-        kind: "warning",
-        okLabel: t("continueBtn"),
-        cancelLabel: t("cancelBtn"),
-      })
-    : confirm(warning);
-  if (!confirmed) return;
+// --- teardown: unmount / quit, with an optional ZIP rescue -------------------
+//
+// Both unmounting and exiting throw the whole volume away, so both go through
+// one three-way prompt: save the disk to a ZIP on the host filesystem and then
+// tear down, tear down without saving, or cancel. It is an in-window modal
+// rather than a native dialog because native message dialogs only offer two
+// buttons; the tray reaches it through the "request-teardown" event after
+// showing the window.
 
-  const btn = el("unmount-btn");
-  btn.disabled = true;
-  setText("mounted-status", t("unmounting"));
+let teardownIntent = null; // "unmount" | "quit" while the prompt is up
+let exportRunning = false;
+let exportStartedAt = 0;
+
+// How many failed entries to name before collapsing the rest into a count.
+const EXPORT_FAILURES_SHOWN = 20;
+
+function openTeardown(intent) {
+  if (!currentStatus || exportRunning) return;
+  teardownIntent = intent;
+  el("teardown-actions").hidden = false;
+  el("export-job-row").hidden = true;
+  el("export-failures").innerHTML = "";
+  setText("export-done", "");
+  renderJobProgress("export", null, 0);
+  renderTeardownTexts();
+  el("teardown-backdrop").hidden = false;
+  el("teardown-save").focus();
+}
+
+// Deliberately refuses to close mid-export: the archive is still being written
+// and this modal is the only thing saying so.
+function closeTeardown() {
+  if (exportRunning) return;
+  teardownIntent = null;
+  el("teardown-backdrop").hidden = true;
+}
+
+// The prompt's wording differs between the two intents (and has to survive a
+// language switch while it is open), so it is rendered rather than static.
+function renderTeardownTexts() {
+  if (!teardownIntent) return;
+  const quitting = teardownIntent === "quit";
+  el("teardown-title").textContent = t(quitting ? "teardownQuitTitle" : "teardownTitle");
+  el("teardown-body").textContent = t(quitting ? "teardownQuitBody" : "teardownBody");
+  el("teardown-save").textContent = t(quitting ? "saveAndQuit" : "saveAndUnmount");
+  el("teardown-discard").textContent = t(quitting ? "quitWithoutSaving" : "unmountWithoutSaving");
+  el("teardown-cancel").textContent = t("cancelBtn");
+}
+
+// Tear down for real, once the user has either saved or chosen not to.
+async function completeTeardown() {
+  const quitting = teardownIntent === "quit";
+  el("teardown-actions").hidden = true;
+  setText("export-done", t(quitting ? "quitting" : "unmounting"));
   try {
-    await invoke("unmount");
+    await invoke(quitting ? "quit_app" : "unmount");
+    // Unmounting fires "mount-changed", which closes this modal; quitting is
+    // already on its way out of the process.
   } catch (e) {
-    setText("mounted-status", t("unmountFail", e), "error");
+    setText("export-done", t(quitting ? "quitFail" : "unmountFail", e), "error");
+    el("teardown-actions").hidden = false;
+  }
+}
+
+// "Save to ZIP, then tear down". The teardown only happens if the export
+// really succeeded — if anything was left behind, the volume stays mounted so
+// the data is still recoverable.
+async function saveThenTeardown() {
+  let destination;
+  try {
+    destination = await invoke("browse_export_zip");
+  } catch (e) {
+    setText("export-done", t("exportFail", e), "error");
+    return;
+  }
+  if (!destination) return; // save dialog dismissed: back to the three choices
+
+  el("teardown-actions").hidden = true;
+  el("export-job-row").hidden = false;
+  el("export-failures").innerHTML = "";
+  setText("export-done", "");
+  setText("export-status", t("exporting"));
+  renderJobProgress("export", null, 0);
+  exportRunning = true;
+  exportStartedAt = Date.now();
+
+  let report = null;
+  try {
+    report = await invoke("export_zip", { destination });
+  } catch (e) {
+    setText("export-done", t("exportFail", e), "error");
   } finally {
-    btn.disabled = false;
+    exportRunning = false;
+    el("export-job-row").hidden = true;
+  }
+  if (!report) {
+    el("teardown-actions").hidden = false;
+    return;
+  }
+
+  if (report.cancelled) {
+    setText("export-done", t("exportCancelled"));
+    el("teardown-actions").hidden = false;
+    return;
+  }
+  const failures = report.failures || [];
+  if (failures.length) {
+    renderExportFailures(failures);
+    setText("export-done", t("exportPartial", failures.length), "error");
+    el("teardown-actions").hidden = false;
+    return;
+  }
+  setText("export-done", t("exportDone", report.destination, report.file_count), "ok");
+  await completeTeardown();
+}
+
+function renderExportFailures(failures) {
+  const rows = failures
+    .slice(0, EXPORT_FAILURES_SHOWN)
+    .map((f) => kvRow(f.path, f.error));
+  if (failures.length > EXPORT_FAILURES_SHOWN) {
+    rows.push(kvRow("", t("exportMoreFailures", failures.length - EXPORT_FAILURES_SHOWN)));
+  }
+  el("export-failures").innerHTML = rows.join("");
+}
+
+async function cancelExport() {
+  if (!exportRunning) return;
+  setText("export-status", t("cancelling"));
+  try {
+    await invoke("export_cancel");
+  } catch (e) {
+    /* the export may have already finished */
   }
 }
 
@@ -659,6 +821,11 @@ function applyMountStatus(status) {
   setText("mounted-status", "");
   setText("setup-status", "");
   if (!currentStatus) {
+    // The volume is gone, so the teardown prompt has nothing left to offer —
+    // close it even if an export was somehow still marked as running.
+    exportRunning = false;
+    teardownIntent = null;
+    el("teardown-backdrop").hidden = true;
     // Unmounting invalidates every in-flight job: bump generations so their
     // poll loops stop, and reset the per-panel job UI.
     for (const panel of Object.keys(jobs)) {
@@ -698,6 +865,62 @@ const jobs = {
 function jobUi(panel, running) {
   el(`${panel}-job-row`).hidden = !running;
   el(`${panel}-btn`).disabled = running;
+  // The bar only appears once a poll actually reports byte counts, so both
+  // edges of a job (start and finish) reset it to hidden.
+  renderJobProgress(panel, null, 0);
+}
+
+// `job_status.progress` is optional: the backend omits it for job families
+// that can't measure themselves, and reports total_bytes 0 while a job is
+// still enumerating. Anything we can't turn into a real fraction is treated as
+// "no progress", so the UI falls back to elapsed seconds instead of drawing a
+// 0% / NaN% bar.
+function jobProgress(status) {
+  const p = status && status.progress;
+  if (!p) return null;
+  const total = Number(p.total_bytes);
+  const done = Number(p.done_bytes);
+  if (!Number.isFinite(total) || total <= 0) return null;
+  if (!Number.isFinite(done) || done < 0) return null;
+  return { done: Math.min(done, total), total, frac: Math.min(1, done / total) };
+}
+
+// An ETA extrapolated from a barely-started job swings by minutes between
+// polls (a slow first chunk reads as "hours left"), so it stays hidden until
+// both enough wall time and enough of the work have gone by to mean something.
+const ETA_MIN_ELAPSED_MS = 2000;
+const ETA_MIN_FRACTION = 0.03;
+
+function etaText(frac, elapsedMs) {
+  if (elapsedMs < ETA_MIN_ELAPSED_MS || frac < ETA_MIN_FRACTION || frac >= 1) return "";
+  const remainMs = (elapsedMs * (1 - frac)) / frac;
+  if (!Number.isFinite(remainMs) || remainMs <= 0) return "";
+  const secs = Math.round(remainMs / 1000);
+  if (secs < 60) return t("etaSeconds", Math.max(1, secs));
+  if (secs < 3600) return t("etaMinutes", Math.max(1, Math.round(secs / 60)));
+  // Clamp the minutes so rounding can never produce a nonsense "1 h 60 min".
+  return t("etaHours", Math.floor(secs / 3600), Math.min(59, Math.round((secs % 3600) / 60)));
+}
+
+// `progress` is a jobProgress() object, or null to hide the bar entirely.
+function renderJobProgress(panel, progress, elapsedMs) {
+  const box = el(`${panel}-progress`);
+  if (!progress) {
+    box.hidden = true;
+    el(`${panel}-progress-fill`).style.width = "0%";
+    return;
+  }
+  const pct = progress.frac * 100;
+  box.hidden = false;
+  box.setAttribute("aria-valuenow", pct.toFixed(0));
+  el(`${panel}-progress-fill`).style.width = pct.toFixed(1) + "%";
+  el(`${panel}-progress-bytes`).textContent = t(
+    "progressBytes",
+    formatSize(progress.done),
+    formatSize(progress.total)
+  );
+  el(`${panel}-progress-pct`).textContent = t("progressPct", pct.toFixed(1));
+  el(`${panel}-progress-eta`).textContent = etaText(progress.frac, elapsedMs);
 }
 
 async function runJob(panel, submit, renderResult) {
@@ -725,6 +948,7 @@ async function runJob(panel, submit, renderResult) {
 
     // Poll until the job turns terminal.
     let pollFailures = 0;
+    let lastStatus = null;
     for (;;) {
       await new Promise((r) => setTimeout(r, JOB_POLL_MS));
       if (job.generation !== generation) return;
@@ -742,19 +966,25 @@ async function runJob(panel, submit, renderResult) {
         continue;
       }
       if (job.generation !== generation) return;
+      lastStatus = status;
       if (status.terminal) break;
-      const secs = ((Date.now() - startedAt) / 1000).toFixed(0);
-      setText(`${panel}-status`, t("processing", secs));
+      const elapsedMs = Date.now() - startedAt;
+      setText(`${panel}-status`, t("processing", (elapsedMs / 1000).toFixed(0)));
+      renderJobProgress(panel, jobProgress(status), elapsedMs);
     }
 
     const result = await invoke("job_result", { jobId });
     if (job.generation !== generation) return;
     if (!result.ok) {
-      const err = result.error || t("jobError");
-      finish(
-        String(err).includes("cancelled") ? t("cancelled") : t("jobFailed", err),
-        String(err).includes("cancelled") ? "" : "error"
-      );
+      // Branch on the machine-readable JobState ("cancelled" / "failed"), not
+      // on the wording of the backend's error message: that text is English,
+      // free to change, and never something the UI should parse.
+      const state = (result && result.state) || (lastStatus && lastStatus.state) || "";
+      if (state === "cancelled") {
+        finish(t("cancelled"));
+        return;
+      }
+      finish(t("jobFailed", result.error || t("jobError")), "error");
       return;
     }
     const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
@@ -999,7 +1229,14 @@ async function boot() {
   await step(async () => applyCliOverrides(await invoke("initial_overrides")), "stepCli");
 
   el("mount-form").addEventListener("submit", doMount);
-  el("unmount-btn").addEventListener("click", doUnmount);
+  el("unmount-btn").addEventListener("click", () => openTeardown("unmount"));
+  el("teardown-save").addEventListener("click", saveThenTeardown);
+  el("teardown-discard").addEventListener("click", completeTeardown);
+  el("teardown-cancel").addEventListener("click", closeTeardown);
+  el("export-cancel").addEventListener("click", cancelExport);
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !el("teardown-backdrop").hidden) closeTeardown();
+  });
   el("device").addEventListener("change", () => {
     updateSizeHint();
     validateSizeField();
@@ -1097,6 +1334,31 @@ async function boot() {
   await step(async () => applyMountStatus(await invoke("mount_status")), "stepMount");
 
   await step(() => listen("mount-changed", (e) => applyMountStatus(e.payload)), "stepEvents");
+  // The tray's unmount / exit entries hand their prompt to this window.
+  await step(
+    () =>
+      listen("request-teardown", (e) => openTeardown(e.payload === "quit" ? "quit" : "unmount")),
+    "stepEvents"
+  );
+  // Closing the window while mounted only hides it, so an unanswered teardown
+  // prompt would still be up the next time the tray reopens the window. Treat
+  // the hide as a キャンセル and reopen on a clean screen. `closeTeardown`
+  // still refuses mid-export, which is right: that one must keep reporting.
+  await step(() => listen("window-hidden", closeTeardown), "stepEvents");
+  // The export reports `{done_bytes, total_bytes}`, the same shape the job
+  // system publishes, so the job progress helpers render it as-is.
+  await step(
+    () =>
+      listen("export-progress", (e) => {
+        if (!exportRunning) return;
+        renderJobProgress(
+          "export",
+          jobProgress({ progress: e.payload }),
+          Date.now() - exportStartedAt
+        );
+      }),
+    "stepEvents"
+  );
   await step(
     () =>
       listen("open-archive-panel", () => {

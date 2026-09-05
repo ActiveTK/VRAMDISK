@@ -331,6 +331,12 @@ pub struct EngineTrace {
     pub dedup_hash_chunks: u64,
     pub dedup_candidate_chunks: u64,
     pub dedup_shared_chunks: u64,
+    /// Candidates that the hash index offered but confirmation turned down, so
+    /// the chunk was stored on its own instead of being shared. Under the
+    /// default byte verification a non-zero value means an actual FNV-1a
+    /// collision was caught before it could corrupt a file; under
+    /// `--dedup-trust-hash` it only counts stale index entries.
+    pub dedup_rejected_chunks: u64,
     pub dedup_unique_chunks: u64,
     pub gpu_hash_chunks: u64,
 }
@@ -647,6 +653,29 @@ pub struct StorageEngine {
     compressed_refcount: HashMap<u64, u32>,
     /// Hash currently indexed for a compressed blob, keyed by absolute blob offset.
     compressed_hash: HashMap<u64, u64>,
+    /// Confirm every dedup hit by comparing the candidate's stored bytes with
+    /// the bytes being written, instead of trusting the FNV-1a hash.
+    ///
+    /// The index is *keyed* by a two-level FNV-1a 64-bit hash, which is the
+    /// right structure — it turns "find an identical chunk" into one hash-map
+    /// probe. But FNV-1a is not collision resistant and collisions are cheap
+    /// to construct on purpose, so the hash can only ever be a *candidate*
+    /// filter. Sharing on the hash alone lets anyone who can write chosen
+    /// bytes to the volume make an unrelated file's chunk alias theirs, which
+    /// is silent data corruption of somebody else's data. Verification is
+    /// therefore the default: a wrong answer here is undetectable and
+    /// unrecoverable, while the cost is bounded and measurable (one 64 KiB
+    /// device-to-host read per *confirmed duplicate*, nothing at all on
+    /// unique data).
+    ///
+    /// Set to `false` (`--dedup-trust-hash`) to restore the pre-verification
+    /// behaviour, where a candidate is confirmed by re-hashing it on the GPU.
+    /// That is only safe when every writer to the volume is trusted.
+    dedup_verify_bytes: bool,
+    /// Reusable 64 KiB landing buffer for the byte-verification read-back.
+    /// A batched write confirms many candidates in a row, so this is allocated
+    /// once and reused rather than per candidate.
+    verify_scratch: Vec<u8>,
 
     // Compression state (only populated when `compress` is true).
     /// Sub-allocator packing variable-length compressed blobs into chunks.
@@ -709,6 +738,8 @@ impl StorageEngine {
             hash_index: HashMap::new(),
             compressed_refcount: HashMap::new(),
             compressed_hash: HashMap::new(),
+            dedup_verify_bytes: true,
+            verify_scratch: Vec::new(),
             carena: CompressedAllocator::new(),
             codec,
             vram_base,
@@ -829,6 +860,31 @@ impl StorageEngine {
     pub fn set_hash_cpu_route_threshold(&mut self, threshold: u64) {
         self.hash_cpu_route_threshold = clamp_hash_cpu_route_threshold(threshold);
         self.hash_cpu_route_threshold_override = true;
+    }
+
+    /// Whether dedup confirms a hash hit by comparing bytes. See
+    /// [`set_dedup_verify_bytes`](Self::set_dedup_verify_bytes).
+    pub fn dedup_verify_bytes(&self) -> bool {
+        self.dedup_verify_bytes
+    }
+
+    /// Choose how a dedup candidate is confirmed before two logical chunks are
+    /// made to share one physical chunk.
+    ///
+    /// `true` (the default) compares the candidate's stored bytes against the
+    /// bytes being written. `false` trusts the two-level FNV-1a 64-bit hash the
+    /// index is keyed by, confirming only that the candidate still hashes to
+    /// the same value.
+    ///
+    /// The default is verification because FNV-1a is not collision resistant:
+    /// collisions can be constructed cheaply and deliberately, so hash-only
+    /// matching lets an attacker who can write chosen bytes to the volume
+    /// alias an unrelated file's chunk onto their own — silent, unrecoverable
+    /// corruption of data the attacker never had to be able to write. Trusting
+    /// the hash buys back one 64 KiB device-to-host read per confirmed
+    /// duplicate and is only appropriate when every writer is trusted.
+    pub fn set_dedup_verify_bytes(&mut self, verify: bool) {
+        self.dedup_verify_bytes = verify;
     }
 
     pub fn file_size(&self, path: &str) -> EResult<u64> {
@@ -1002,12 +1058,15 @@ impl StorageEngine {
         }
     }
 
-    /// Verify a dedup candidate by comparing the GPU hash of the stored chunk
-    /// with the CPU hash of the incoming data. Both use the same two-level
-    /// FNV-1a algorithm, so they produce identical values for identical content.
+    /// Hash-only confirmation of a raw dedup candidate: re-hash the stored
+    /// chunk on the GPU and compare with the CPU hash of the incoming data.
+    /// Both use the same two-level FNV-1a algorithm, so identical content
+    /// produces identical values.
     ///
-    /// Replaces the previous 64 KiB D2H transfer with a GPU kernel (produces
-    /// 8 bytes instead of 65536 bytes of host traffic per dedup hit).
+    /// This is the `--dedup-trust-hash` path only. It cannot separate
+    /// identical content from an FNV-1a collision — it re-derives the very
+    /// value that selected the candidate — so it answers "is this still the
+    /// chunk the index says it is", not "is this the same data".
     fn verify_chunk(&mut self, c: ChunkId, expected_hash: u64) -> EResult<bool> {
         let hasher = self
             .gpu_hasher
@@ -1017,6 +1076,8 @@ impl StorageEngine {
         Ok(gpu_hash == expected_hash)
     }
 
+    /// Hash-only confirmation of any placement. See [`verify_chunk`](Self::verify_chunk)
+    /// for why this is not a safety check.
     fn verify_placement(&mut self, p: Placement, expected_hash: u64) -> EResult<bool> {
         match p {
             Placement::Raw { chunk } => self.verify_chunk(chunk, expected_hash),
@@ -1026,18 +1087,163 @@ impl StorageEngine {
         }
     }
 
-    fn try_share_hashed(&mut self, path: &str, lc: usize, h: u64) -> EResult<bool> {
+    /// Exact confirmation of a dedup candidate: compare the bytes that are
+    /// really stored behind `p` against the 64 KiB the caller is about to
+    /// write. This is the only check that can tell identical content apart
+    /// from an FNV-1a collision, which is why it is the default.
+    ///
+    /// A raw candidate costs one 64 KiB device-to-host read into the reusable
+    /// [`verify_scratch`](Self::verify_scratch) buffer; a compressed candidate
+    /// costs a decompression of its blob. Both are paid only for chunks the
+    /// index already matched, i.e. once per *confirmed duplicate*, never on
+    /// unique data.
+    ///
+    /// Errors are genuine device or codec failures and propagate, exactly as
+    /// the hash-only path's kernel launch does; a plain content mismatch is
+    /// `Ok(false)` and makes the caller store the chunk normally.
+    fn candidate_matches_bytes(&mut self, p: Placement, incoming: &[u8]) -> EResult<bool> {
+        debug_assert_eq!(incoming.len(), CHUNK_SIZE as usize);
+        match p {
+            Placement::Raw { chunk } => {
+                if self.verify_scratch.len() != CHUNK_SIZE as usize {
+                    self.verify_scratch.resize(CHUNK_SIZE as usize, 0);
+                }
+                cuda(
+                    self.vram
+                        .read_at(chunk as u64 * CHUNK_SIZE, &mut self.verify_scratch),
+                )?;
+                Ok(self.verify_scratch.as_slice() == incoming)
+            }
+            Placement::Compressed { offset, len, codec } => {
+                let full = self.decompress_blob(offset, len, codec)?;
+                Ok(full.as_slice() == incoming)
+            }
+        }
+    }
+
+    /// Confirm a single dedup candidate the way the current mode demands:
+    /// byte comparison by default, hash re-check under `--dedup-trust-hash`.
+    fn confirm_candidate(&mut self, p: Placement, h: u64, incoming: &[u8]) -> EResult<bool> {
+        if self.dedup_verify_bytes {
+            self.candidate_matches_bytes(p, incoming)
+        } else {
+            self.verify_placement(p, h)
+        }
+    }
+
+    /// Make logical chunk `lc` of `path` point at the already-stored placement
+    /// `p`, taking a reference on it and releasing whatever the chunk held
+    /// before. Callers must have confirmed that `p` really holds the intended
+    /// content.
+    fn share_placement(&mut self, path: &str, lc: usize, p: Placement) {
+        self.ref_inc_placement(p);
+        if let Some(old) = self.coord(path, lc) {
+            self.free_placement(old);
+        }
+        self.set_coord(path, lc, Some(p));
+    }
+
+    /// Single-chunk dedup attempt: look the content hash up, confirm the
+    /// candidate really holds `incoming`, and share it if so.
+    ///
+    /// `incoming` is the full 64 KiB the caller is about to store; every caller
+    /// already has it on the host, which is what makes exact confirmation
+    /// affordable.
+    fn try_share_hashed(
+        &mut self,
+        path: &str,
+        lc: usize,
+        h: u64,
+        incoming: &[u8],
+    ) -> EResult<bool> {
         let Some(cand) = self.hash_index.get(&h).copied() else {
             return Ok(false);
         };
-        if !self.verify_placement(cand, h)? {
+        if !self.confirm_candidate(cand, h, incoming)? {
+            self.trace.dedup_rejected_chunks += 1;
             return Ok(false);
         }
-        self.ref_inc_placement(cand);
-        if let Some(p) = self.coord(path, lc) {
-            self.free_placement(p);
+        self.share_placement(path, lc, cand);
+        Ok(true)
+    }
+
+    /// `--dedup-trust-hash` pre-pass for a batched write: confirm every
+    /// candidate of the batch up front, re-hashing all raw candidates in a
+    /// single GPU launch. `Some(ok)` is indexed like `hashes`.
+    ///
+    /// Returns `None` in the default byte-verifying mode, where confirmation
+    /// happens one chunk at a time inside the placement loop instead — that is
+    /// both where the incoming bytes are addressable and the only point at
+    /// which the index is guaranteed still to describe the candidate.
+    fn batch_trusted_candidates(&mut self, hashes: &[u64]) -> EResult<Option<Vec<bool>>> {
+        if self.dedup_verify_bytes {
+            return Ok(None);
         }
-        self.set_coord(path, lc, Some(cand));
+        let mut ok = vec![false; hashes.len()];
+        let mut offsets = Vec::new();
+        let mut items = Vec::new();
+        for (i, h) in hashes.iter().enumerate() {
+            match self.hash_index.get(h) {
+                Some(Placement::Raw { chunk }) => {
+                    offsets.push(*chunk as u64 * CHUNK_SIZE);
+                    items.push(i);
+                }
+                Some(Placement::Compressed { offset, .. }) => {
+                    ok[i] = self.compressed_hash.get(offset) == Some(h);
+                }
+                None => {}
+            }
+        }
+        if !offsets.is_empty() {
+            let mut out = vec![0u64; offsets.len()];
+            let base = self.vram_base;
+            let hasher = self
+                .gpu_hasher
+                .as_mut()
+                .expect("gpu_hasher present when dedup");
+            cuda(hasher.hash_chunks(base, &offsets, &mut out))?;
+            self.trace.gpu_hash_chunks += out.len() as u64;
+            for (slot, &i) in items.iter().enumerate() {
+                ok[i] = out[slot] == hashes[i];
+            }
+        }
+        Ok(Some(ok))
+    }
+
+    /// Batched dedup attempt for chunk `i` of a write whose per-chunk content
+    /// hashes are `hashes` and whose chunk `i` holds `incoming`.
+    ///
+    /// The index is re-read here rather than from a snapshot taken before the
+    /// batch started placing chunks. While a batch runs, entries are only ever
+    /// *removed* from the index (a chunk rewritten in place, or released when
+    /// its last reference went away) and never replaced, so a fresh lookup can
+    /// only be the snapshot's placement or nothing at all. Taking it fresh is
+    /// what makes the byte comparison meaningful: a candidate the index still
+    /// vouches for cannot be a chunk this same batch has already overwritten
+    /// or freed, so the bytes read back are the bytes the index promised.
+    fn try_share_batched(
+        &mut self,
+        path: &str,
+        lc: usize,
+        i: usize,
+        hashes: &[u64],
+        incoming: &[u8],
+        trusted: Option<&Vec<bool>>,
+    ) -> EResult<bool> {
+        let Some(cand) = self.hash_index.get(&hashes[i]).copied() else {
+            return Ok(false);
+        };
+        self.trace.dedup_candidate_chunks += 1;
+        let ok = match trusted {
+            Some(t) => t[i],
+            None => self.candidate_matches_bytes(cand, incoming)?,
+        };
+        if !ok {
+            self.trace.dedup_rejected_chunks += 1;
+            return Ok(false);
+        }
+        self.share_placement(path, lc, cand);
+        self.trace.dedup_shared_chunks += 1;
         Ok(true)
     }
 
@@ -1299,17 +1505,56 @@ impl StorageEngine {
     /// CPU zstd fallback chunks cannot satisfy the GPU-only contract and are
     /// rejected instead of silently pulling file bytes through host memory.
     pub fn hash_file_gpu(&mut self, path: &str, alg: HashAlgorithm) -> EResult<Vec<u8>> {
-        self.hash_file_gpu_cancellable(path, alg, || false)
+        self.hash_file_gpu_cancellable(path, alg, |_, _| false)
     }
 
+    /// Hash one file on the GPU, reporting progress and honouring cancellation.
+    ///
+    /// # The `progress` callback
+    ///
+    /// Every long-running engine job takes the same callback, and this is the
+    /// canonical description of its contract; the other `*_cancellable`
+    /// entry points refer back here.
+    ///
+    /// The engine calls `progress(done_bytes, total_bytes)` at each of its
+    /// safe points — the places where it can abandon the job without leaving
+    /// VRAM or the namespace inconsistent — meaning *"I have completed
+    /// `done_bytes` of an estimated `total_bytes`; return `true` if I should
+    /// stop"*. Returning `true` makes the job unwind at that point and fail
+    /// with [`EngineError::Cancelled`] after cleaning up its staging temps;
+    /// returning `false` lets it continue.
+    ///
+    /// The counters exist because these jobs routinely move tens of gigabytes:
+    /// a caller that only learns "still running" cannot tell the user whether
+    /// to keep waiting, so every poll carries the most meaningful byte counts
+    /// available at that point in the code.
+    ///
+    /// Guarantees the engine makes, which callers may rely on:
+    ///
+    /// - `done_bytes` never goes backwards within a single call.
+    /// - `total_bytes` is a *best estimate*, not a promise. It is whatever the
+    ///   job can cheaply know when it ticks, it may be revised (usually
+    ///   upward) as the job learns more, and the unit it counts is the one
+    ///   that makes the ratio meaningful for that job — staged tar bytes,
+    ///   archive bytes consumed, payload bytes transcoded — not necessarily
+    ///   the size of any one file. Consequently `done_bytes` can momentarily
+    ///   exceed a total that has just been revised, so treat the ratio as
+    ///   advisory rather than clamped to 1.
+    /// - `(0, 0)` is the documented "no useful counter here" signal, used at
+    ///   pre-flight checks that run before any measurable work. Callers that
+    ///   store the counters should ignore such a tick rather than let it wipe
+    ///   out a meaningful total reported earlier.
+    ///
+    /// The callback is invoked from the engine thread while the engine lock is
+    /// held, so it must be cheap and must not re-enter the engine.
     pub fn hash_file_gpu_cancellable<F>(
         &mut self,
         path: &str,
         alg: HashAlgorithm,
-        mut should_cancel: F,
+        mut progress: F,
     ) -> EResult<Vec<u8>>
     where
-        F: FnMut() -> bool,
+        F: FnMut(u64, u64) -> bool,
     {
         self.ensure_hash_calibration()?;
         let (size, is_dir) = {
@@ -1330,7 +1575,9 @@ impl StorageEngine {
         let comp_seg_limit = raw_seg_limit.min(crate::nvcomp::BATCH);
         let mut pos = 0u64;
         while pos < size {
-            if should_cancel() {
+            // `pos` is exactly how many of the file's bytes have been fed to
+            // the hash kernel, so the file size is an exact total here.
+            if progress(pos, size) {
                 return cancelled();
             }
             let lc = (pos / CHUNK_SIZE) as usize;
@@ -1429,19 +1676,37 @@ impl StorageEngine {
         paths: &[String],
         alg: HashAlgorithm,
     ) -> EResult<Vec<Vec<u8>>> {
-        self.hash_files_gpu_many_cancellable(paths, alg, || false)
+        self.hash_files_gpu_many_cancellable(paths, alg, |_, _| false)
     }
 
+    /// Hash many files in one batched GPU pass.
+    ///
+    /// `progress` follows the contract documented on
+    /// [`StorageEngine::hash_file_gpu_cancellable`]. The counters here span
+    /// the *whole* set: the total is the summed size of every requested file
+    /// and `done_bytes` accumulates across both phases — first the files that
+    /// must be hashed one at a time because they are not purely raw/sparse,
+    /// then the batched round-robin below — so the caller sees one bar for the
+    /// set instead of one that restarts per file.
     pub fn hash_files_gpu_many_cancellable<F>(
         &mut self,
         paths: &[String],
         alg: HashAlgorithm,
-        mut should_cancel: F,
+        mut progress: F,
     ) -> EResult<Vec<Vec<u8>>>
     where
-        F: FnMut() -> bool,
+        F: FnMut(u64, u64) -> bool,
     {
         self.ensure_hash_calibration()?;
+        // Total the set up front so the very first tick already carries a real
+        // denominator. Sizes come from the in-memory lookup table, so this pass
+        // is cheap; a path that is missing (or is a directory) contributes 0
+        // here and is rejected with the proper error by the loop below.
+        let total_bytes: u64 = paths
+            .iter()
+            .map(|path| self.table.get(path).map(|node| node.size).unwrap_or(0))
+            .sum();
+        let mut done_bytes = 0u64;
         let mut out = vec![Vec::new(); paths.len()];
         let mut batch_paths = Vec::new();
         let mut batch_sizes = Vec::new();
@@ -1459,7 +1724,14 @@ impl StorageEngine {
                 batch_paths.push(path.clone());
                 batch_sizes.push(size);
             } else {
-                out[idx] = self.hash_file_gpu_cancellable(path, alg, &mut should_cancel)?;
+                // Shift the single-file hash's own counters into the set's
+                // frame: it reports 0..size for this file, which continues the
+                // set's running total instead of restarting the bar.
+                let done_before = done_bytes;
+                out[idx] = self.hash_file_gpu_cancellable(path, alg, |file_done, _| {
+                    progress(done_before.saturating_add(file_done), total_bytes)
+                })?;
+                done_bytes = done_bytes.saturating_add(size);
             }
         }
 
@@ -1476,10 +1748,11 @@ impl StorageEngine {
             .zip(batch_sizes.iter())
             .any(|(&offset, &size)| offset < size)
         {
-            if should_cancel() {
+            if progress(done_bytes, total_bytes) {
                 return cancelled();
             }
             let mut round = Vec::with_capacity(nfiles);
+            let mut round_bytes = 0u64;
             let mut progressed = false;
             for ((path, &size), offset) in batch_paths
                 .iter()
@@ -1493,12 +1766,16 @@ impl StorageEngine {
                 }
                 round.push(self.file_segments_raw(path, *offset, take)?);
                 *offset += take;
+                round_bytes += take;
                 progressed = true;
             }
             if !progressed {
                 break;
             }
             cuda(self.api_kernel()?.update_many(&round))?;
+            // Only credit the round once its kernel has actually run, so the
+            // reported count never runs ahead of the work.
+            done_bytes = done_bytes.saturating_add(round_bytes);
         }
 
         let digests = cuda(self.api_kernel()?.finish_many(alg, nfiles))?;
@@ -2015,58 +2292,21 @@ impl StorageEngine {
         let hashes = fnv1a_chunks(data);
         self.trace.dedup_hash_chunks += n as u64;
 
-        let candidates: Vec<Option<Placement>> = hashes
-            .iter()
-            .map(|h| self.hash_index.get(h).copied())
-            .collect();
-        self.trace.dedup_candidate_chunks +=
-            candidates.iter().filter(|c| c.is_some()).count() as u64;
-
-        let mut raw_verify_offsets = Vec::new();
-        let mut raw_verify_items = Vec::new();
-        for (i, cand) in candidates.iter().enumerate() {
-            if let Some(Placement::Raw { chunk }) = cand {
-                raw_verify_offsets.push(*chunk as u64 * CHUNK_SIZE);
-                raw_verify_items.push(i);
-            }
-        }
-
-        let mut raw_verified = vec![false; n];
-        if !raw_verify_offsets.is_empty() {
-            let mut out = vec![0u64; raw_verify_offsets.len()];
-            let base = self.vram_base;
-            let hasher = self
-                .gpu_hasher
-                .as_mut()
-                .expect("gpu_hasher present when dedup");
-            cuda(hasher.hash_chunks(base, &raw_verify_offsets, &mut out))?;
-            for (slot, &i) in raw_verify_items.iter().enumerate() {
-                raw_verified[i] = out[slot] == hashes[i];
-            }
-        }
+        // `--dedup-trust-hash` only: confirm the whole batch up front with one
+        // GPU re-hash launch. The default byte-verifying mode confirms inside
+        // the loop below instead, where the incoming bytes are in hand.
+        let trusted = self.batch_trusted_candidates(&hashes)?;
 
         let mut indexed_writes = Vec::new();
         let mut wrote = false;
         for i in 0..n {
             let lc = lc0 + i;
-            let old = self.coord(path, lc);
-            let candidate_ok = match candidates[i] {
-                Some(Placement::Raw { .. }) => raw_verified[i],
-                Some(Placement::Compressed { offset, .. }) => {
-                    self.compressed_hash.get(&offset) == Some(&hashes[i])
-                }
-                None => false,
-            };
-            if candidate_ok {
-                let p = candidates[i].unwrap();
-                self.ref_inc_placement(p);
-                if let Some(old) = old {
-                    self.free_placement(old);
-                }
-                self.set_coord(path, lc, Some(p));
-                self.trace.dedup_shared_chunks += 1;
+            let s = i * CHUNK_SIZE as usize;
+            let incoming = &data[s..s + CHUNK_SIZE as usize];
+            if self.try_share_batched(path, lc, i, &hashes, incoming, trusted.as_ref())? {
                 continue;
             }
+            let old = self.coord(path, lc);
 
             let chunk = match old {
                 Some(Placement::Raw { chunk }) if self.refcount[chunk as usize] == 1 => {
@@ -2075,10 +2315,9 @@ impl StorageEngine {
                 }
                 _ => self.alloc_chunk()?,
             };
-            let s = i * CHUNK_SIZE as usize;
             cuda(
                 self.vram
-                    .write_at_async(chunk as u64 * CHUNK_SIZE, &data[s..s + CHUNK_SIZE as usize]),
+                    .write_at_async(chunk as u64 * CHUNK_SIZE, incoming),
             )?;
             self.trace.raw_write_ops += 1;
             self.trace.raw_write_bytes += CHUNK_SIZE;
@@ -2426,59 +2665,21 @@ impl StorageEngine {
             let group = &data[g0..g0 + m * cs as usize];
             let hashes = fnv1a_chunks(group);
             self.trace.dedup_hash_chunks += m as u64;
-            let candidates: Vec<Option<Placement>> = hashes
-                .iter()
-                .map(|h| self.hash_index.get(h).copied())
-                .collect();
-            self.trace.dedup_candidate_chunks +=
-                candidates.iter().filter(|c| c.is_some()).count() as u64;
 
-            let mut raw_verify_offsets = Vec::new();
-            let mut raw_verify_items = Vec::new();
-            for (i, cand) in candidates.iter().enumerate() {
-                if let Some(Placement::Raw { chunk }) = cand {
-                    raw_verify_offsets.push(*chunk as u64 * CHUNK_SIZE);
-                    raw_verify_items.push(i);
-                }
-            }
-            let mut raw_verified = vec![false; m];
-            if !raw_verify_offsets.is_empty() {
-                let mut out = vec![0u64; raw_verify_offsets.len()];
-                let base = self.vram_base;
-                let hasher = self
-                    .gpu_hasher
-                    .as_mut()
-                    .expect("gpu_hasher present when dedup");
-                cuda(hasher.hash_chunks(base, &raw_verify_offsets, &mut out))?;
-                self.trace.gpu_hash_chunks += out.len() as u64;
-                for (slot, &i) in raw_verify_items.iter().enumerate() {
-                    raw_verified[i] = out[slot] == hashes[i];
-                }
-            }
+            // `--dedup-trust-hash` only: one batched GPU re-hash confirms the
+            // whole group. Byte verification instead compares each candidate's
+            // stored bytes with `group` inside the loop below.
+            let trusted = self.batch_trusted_candidates(&hashes)?;
 
             let mut misses = Vec::new();
             let mut miss_buf = Vec::new();
             for i in 0..m {
                 let lc = lc0 + j + i;
-                let candidate_ok = match candidates[i] {
-                    Some(Placement::Raw { .. }) => raw_verified[i],
-                    Some(Placement::Compressed { offset, .. }) => {
-                        self.compressed_hash.get(&offset) == Some(&hashes[i])
-                    }
-                    None => false,
-                };
-                if candidate_ok {
-                    let p = candidates[i].unwrap();
-                    self.ref_inc_placement(p);
-                    if let Some(old) = self.coord(path, lc) {
-                        self.free_placement(old);
-                    }
-                    self.set_coord(path, lc, Some(p));
-                    self.trace.dedup_shared_chunks += 1;
-                } else {
-                    let s = i * cs as usize;
+                let s = i * cs as usize;
+                let incoming = &group[s..s + cs as usize];
+                if !self.try_share_batched(path, lc, i, &hashes, incoming, trusted.as_ref())? {
                     misses.push((i, lc, self.coord(path, lc), hashes[i]));
-                    miss_buf.extend_from_slice(&group[s..s + cs as usize]);
+                    miss_buf.extend_from_slice(incoming);
                 }
             }
 
@@ -2600,7 +2801,7 @@ impl StorageEngine {
         // Dedup path for full-chunk writes: try to share an identical chunk.
         if self.dedup && full {
             let h = fnv1a(sub);
-            if self.try_share_hashed(path, lc, h)? {
+            if self.try_share_hashed(path, lc, h, sub)? {
                 return Ok(());
             }
             // No dedup match.
@@ -2642,7 +2843,7 @@ impl StorageEngine {
             whole[s..s + sub.len()].copy_from_slice(sub);
             if self.dedup {
                 let h = fnv1a(&whole);
-                if self.try_share_hashed(path, lc, h)? {
+                if self.try_share_hashed(path, lc, h, &whole)? {
                     return Ok(());
                 }
                 return self.store_compressed(path, lc, &whole, Some(h));
@@ -2748,7 +2949,7 @@ impl StorageEngine {
                         }
                         let h = self.dedup.then(|| fnv1a(&whole));
                         let shared = if let Some(h) = h {
-                            self.try_share_hashed(path, last, h)?
+                            self.try_share_hashed(path, last, h, &whole)?
                         } else {
                             false
                         };
@@ -2785,18 +2986,29 @@ impl StorageEngine {
         files: &[String],
         output: &str,
     ) -> EResult<ArchiveJobStats> {
-        self.archive_compress_gpu_cancellable(format, files, output, || false)
+        self.archive_compress_gpu_cancellable(format, files, output, |_, _| false)
     }
 
+    /// Build an archive from `files` on the GPU.
+    ///
+    /// `progress` follows the contract documented on
+    /// [`StorageEngine::hash_file_gpu_cancellable`]. For the tar-based formats
+    /// the counters measure the *staged tar image*: `total_bytes` is the tar
+    /// length computed while planning (headers, payloads, padding and the
+    /// 1024-byte trailer) and `done_bytes` is how much of it has been written
+    /// into the staging file. The codec pass that follows is a single nvCOMP
+    /// launch with no interior safe point, so the counters park at the staged
+    /// total while it runs. The ZIP path counts differently — see
+    /// `archive_zip_compress_gpu`.
     pub fn archive_compress_gpu_cancellable<F>(
         &mut self,
         format: NvcompFrameCodec,
         files: &[String],
         output: &str,
-        mut should_cancel: F,
+        mut progress: F,
     ) -> EResult<ArchiveJobStats>
     where
-        F: FnMut() -> bool,
+        F: FnMut(u64, u64) -> bool,
     {
         let mut output_created = false;
         let result = map_archive_job_result((|| {
@@ -2808,7 +3020,7 @@ impl StorageEngine {
                     &output,
                     start,
                     &mut output_created,
-                    &mut should_cancel,
+                    &mut progress,
                 )?;
                 return Ok(stats);
             }
@@ -2820,7 +3032,11 @@ impl StorageEngine {
             let mut planned = Vec::with_capacity(files.len());
             let mut tar_total = 1024u64;
             for file in files {
-                if should_cancel() {
+                // Planning only reads metadata: no payload has been staged and
+                // `tar_total` is still being accumulated, so a denominator
+                // taken from it would grow under the caller's feet. `(0, 0)`
+                // is the documented "nothing meaningful to report" tick.
+                if progress(0, 0) {
                     let _ = self.remove(&tmp);
                     return cancelled();
                 }
@@ -2844,7 +3060,10 @@ impl StorageEngine {
             let mut tar_pos = 0u64;
             let mut input_bytes = 0u64;
             for (path, size, header) in planned {
-                if should_cancel() {
+                // `tar_pos` and `tar_total` are the same unit — bytes of the
+                // tar image, headers and padding included — so this ratio is
+                // exact rather than an estimate.
+                if progress(tar_pos, tar_total) {
                     let _ = self.remove(&tmp);
                     return cancelled();
                 }
@@ -2862,7 +3081,10 @@ impl StorageEngine {
             self.write_raw_internal(&tmp, tar_pos, &[0u8; 1024])?;
             tar_pos += 1024;
 
-            if should_cancel() {
+            // The tar image is complete here (`tar_pos == tar_total`); the
+            // codec pass below has no interior safe point, so this is the last
+            // chance to stop before it.
+            if progress(tar_pos, tar_total) {
                 let _ = self.remove(&tmp);
                 return cancelled();
             }
@@ -2913,29 +3135,34 @@ impl StorageEngine {
         archive: &str,
         output_dir: &str,
     ) -> EResult<ArchiveExtractStats> {
-        self.archive_extract_gpu_cancellable(format, archive, output_dir, || false)
+        self.archive_extract_gpu_cancellable(format, archive, output_dir, |_, _| false)
     }
 
+    /// Extract an archive on the GPU.
+    ///
+    /// `progress` follows the contract documented on
+    /// [`StorageEngine::hash_file_gpu_cancellable`]. For the tar-based formats
+    /// the counters measure the *decompressed tar image*: the archive is
+    /// inflated into a staging file first (one nvCOMP launch, no interior safe
+    /// point, so the counters stay at zero for it) and the per-member loop
+    /// then walks that image, reporting its offset against the tar length. The
+    /// ZIP path instead walks the archive itself — see
+    /// `archive_zip_extract_gpu`.
     pub fn archive_extract_gpu_cancellable<F>(
         &mut self,
         format: NvcompFrameCodec,
         archive: &str,
         output_dir: &str,
-        mut should_cancel: F,
+        mut progress: F,
     ) -> EResult<ArchiveExtractStats>
     where
-        F: FnMut() -> bool,
+        F: FnMut(u64, u64) -> bool,
     {
         let result = map_archive_job_result((|| {
             let start = Instant::now();
             let archive = crate::lookup::normalize(archive);
             if format == NvcompFrameCodec::Deflate {
-                return self.archive_zip_extract_gpu(
-                    &archive,
-                    output_dir,
-                    start,
-                    &mut should_cancel,
-                );
+                return self.archive_zip_extract_gpu(&archive, output_dir, start, &mut progress);
             }
             let archive_size = {
                 let node = self.table.get(&archive).ok_or(LookupError::NotFound)?;
@@ -2984,7 +3211,10 @@ impl StorageEngine {
             let mut files = 0usize;
             let mut output_bytes = 0u64;
             while pos + 512 <= tar_size {
-                if should_cancel() {
+                // `pos` is the offset of the member about to be extracted
+                // within the decompressed tar, so it and `tar_size` share a
+                // unit and the ratio is exact.
+                if progress(pos, tar_size) {
                     let _ = self.remove(&tmp);
                     if let Some(packed_archive) = packed_archive.as_ref() {
                         let _ = self.remove(packed_archive);
@@ -3441,20 +3671,43 @@ impl StorageEngine {
         self.set_size(path, len)
     }
 
+    /// ZIP writer: GPU CRC32 per member, then GPU Deflate per member.
+    ///
+    /// `progress` follows the contract documented on
+    /// [`StorageEngine::hash_file_gpu_cancellable`]. Unlike the tar formats,
+    /// ZIP reads every payload *twice* — once for the CRC32 that has to go in
+    /// the local header, once for the Deflate pass — so the denominator here
+    /// is twice the summed input size: the CRC pass fills the first half and
+    /// the compression pass the second. Counting only one pass would make the
+    /// bar reach 100% at the halfway point and then sit there.
     fn archive_zip_compress_gpu<F>(
         &mut self,
         files: &[String],
         output: &str,
         start: Instant,
         output_created: &mut bool,
-        should_cancel: &mut F,
+        progress: &mut F,
     ) -> EResult<ArchiveJobStats>
     where
-        F: FnMut() -> bool,
+        F: FnMut(u64, u64) -> bool,
     {
+        // Sizes come from the in-memory lookup table; a path that is missing
+        // or is a directory contributes 0 and is rejected with the proper
+        // error by the CRC loop below.
+        let payload_total: u64 = files
+            .iter()
+            .map(|file| {
+                self.table
+                    .get(&crate::lookup::normalize(file))
+                    .map(|node| node.size)
+                    .unwrap_or(0)
+            })
+            .sum();
+        let progress_total = payload_total.saturating_mul(2);
+        let mut crc_done = 0u64;
         let mut planned = Vec::with_capacity(files.len());
         for file in files {
-            if should_cancel() {
+            if progress(crc_done, progress_total) {
                 return cancelled();
             }
             let path = crate::lookup::normalize(file);
@@ -3471,7 +3724,13 @@ impl StorageEngine {
                     "zip path must be ASCII: {name}"
                 )));
             }
-            let crc = self.crc32_file_gpu(&path, size, should_cancel)?;
+            // Shift the CRC pass's own 0..size counters into the job's frame so
+            // a single large member still moves the bar while it is scanned.
+            let crc_done_before = crc_done;
+            let crc = self.crc32_file_gpu(&path, size, &mut |file_done, _| {
+                progress(crc_done_before.saturating_add(file_done), progress_total)
+            })?;
+            crc_done = crc_done.saturating_add(size);
             planned.push((path, name, size, 0u64, crc));
         }
         self.create_or_truncate_file(output)?;
@@ -3484,7 +3743,10 @@ impl StorageEngine {
         let mut central = Vec::new();
         let mut input_bytes = 0u64;
         for (path, name, size, _comp_size, crc) in &planned {
-            if should_cancel() {
+            // The CRC pass covered `payload_total`; this pass adds the payload
+            // bytes it has deflated so far, so the count continues rather than
+            // restarting at the phase boundary.
+            if progress(payload_total.saturating_add(input_bytes), progress_total) {
                 return cancelled();
             }
             let local_offset = out_pos;
@@ -3612,15 +3874,24 @@ impl StorageEngine {
         })
     }
 
+    /// ZIP reader: walk the local headers, inflating each member on the GPU.
+    ///
+    /// `progress` follows the contract documented on
+    /// [`StorageEngine::hash_file_gpu_cancellable`]. The ZIP is read in place
+    /// rather than staged, so the natural counters are the walk's own: how far
+    /// into the archive the header cursor has advanced, against the archive
+    /// size. The central directory at the tail is never reached (the walk
+    /// stops at its signature), so the count ends slightly short of the total
+    /// — harmless, since a job that returns `Ok` is snapped to its total.
     fn archive_zip_extract_gpu<F>(
         &mut self,
         archive: &str,
         output_dir: &str,
         start: Instant,
-        should_cancel: &mut F,
+        progress: &mut F,
     ) -> EResult<ArchiveExtractStats>
     where
-        F: FnMut() -> bool,
+        F: FnMut(u64, u64) -> bool,
     {
         let archive_size = {
             let node = self.table.get(archive).ok_or(LookupError::NotFound)?;
@@ -3639,7 +3910,7 @@ impl StorageEngine {
         let mut files = 0usize;
         let mut output_bytes = 0u64;
         while pos + 4 <= archive_size {
-            if should_cancel() {
+            if progress(pos, archive_size) {
                 return cancelled();
             }
             let sig = self.read(archive, pos, 4)?;
@@ -3861,32 +4132,41 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn crc32_file_gpu<F>(&mut self, path: &str, len: u64, should_cancel: &mut F) -> EResult<u32>
+    /// CRC32 over a whole file. `progress` reports `0..len` for this file
+    /// alone; callers that are part of a larger job wrap it to shift those
+    /// counters into their own frame.
+    fn crc32_file_gpu<F>(&mut self, path: &str, len: u64, progress: &mut F) -> EResult<u32>
     where
-        F: FnMut() -> bool,
+        F: FnMut(u64, u64) -> bool,
     {
-        self.crc32_range_gpu_cancellable(path, 0, len, should_cancel)
+        self.crc32_range_gpu_cancellable(path, 0, len, progress)
     }
 
     fn crc32_range_gpu(&mut self, path: &str, offset: u64, len: u64) -> EResult<u32> {
-        self.crc32_range_gpu_cancellable(path, offset, len, &mut || false)
+        self.crc32_range_gpu_cancellable(path, offset, len, &mut |_, _| false)
     }
 
+    /// CRC32 over `[offset, offset + len)`, in GPU-launch-budget sized passes.
+    ///
+    /// `progress` follows the contract documented on
+    /// [`StorageEngine::hash_file_gpu_cancellable`], counting bytes of the
+    /// requested range: `done_bytes` is what previous passes have fed to the
+    /// kernel and `total_bytes` is `len`, so the ratio is exact.
     fn crc32_range_gpu_cancellable<F>(
         &mut self,
         path: &str,
         offset: u64,
         len: u64,
-        should_cancel: &mut F,
+        progress: &mut F,
     ) -> EResult<u32>
     where
-        F: FnMut() -> bool,
+        F: FnMut(u64, u64) -> bool,
     {
         self.ensure_hash_calibration()?;
         cuda(self.api_kernel()?.begin_crc32_many(1))?;
         let mut done = 0u64;
         while done < len {
-            if should_cancel() {
+            if progress(done, len) {
                 return cancelled();
             }
             let take = (len - done).min(self.gpu_hash_launch_budget);
@@ -4463,16 +4743,20 @@ impl StorageEngine {
     /// result into the output file's chunks device-to-device. File payload
     /// bytes never round-trip through host memory; only the trailing partial
     /// Base64 group is finished on the CPU.
+    ///
+    /// `progress` follows the contract documented on
+    /// [`StorageEngine::hash_file_gpu_cancellable`] and counts *input* bytes
+    /// transcoded on the GPU: one staged pass per tick.
     pub fn encode_file_gpu_cancellable<F>(
         &mut self,
         codec: EncodeCodec,
         direction: EncodeDirection,
         input: &str,
         output: &str,
-        mut should_cancel: F,
+        mut progress: F,
     ) -> EResult<EncodeJobStats>
     where
-        F: FnMut() -> bool,
+        F: FnMut(u64, u64) -> bool,
     {
         let start = Instant::now();
         let input = crate::lookup::normalize(input);
@@ -4489,7 +4773,7 @@ impl StorageEngine {
             &input,
             &output,
             &mut output_created,
-            &mut should_cancel,
+            &mut progress,
         ));
         match result {
             Ok((input_bytes, output_bytes)) => Ok(EncodeJobStats {
@@ -4518,10 +4802,10 @@ impl StorageEngine {
         input: &str,
         output: &str,
         output_created: &mut bool,
-        should_cancel: &mut F,
+        progress: &mut F,
     ) -> EResult<(u64, u64)>
     where
-        F: FnMut() -> bool,
+        F: FnMut(u64, u64) -> bool,
     {
         let size = {
             let node = self.table.get(input).ok_or(LookupError::NotFound)?;
@@ -4616,7 +4900,11 @@ impl StorageEngine {
         let mut in_pos = 0u64;
         let mut out_pos = 0u64;
         while in_pos < gpu_in_len {
-            if should_cancel() {
+            // `gpu_in_len` rather than the file size: it is the length this
+            // loop actually transcodes, i.e. the input minus the trailing
+            // whitespace a decode ignores and minus the final padded Base64
+            // group, which is finished on the host after the loop.
+            if progress(in_pos, gpu_in_len) {
                 let _ = self.remove(&staging);
                 return cancelled();
             }
@@ -5263,7 +5551,6 @@ mod tests {
         assert_archive_tree(&mut e, "\\packed-out", &originals);
     }
 
-    #[allow(dead_code)]
     fn engine_compress_dedup(mib: u64) -> StorageEngine {
         let vram = Vram::new(0, mib * 1024 * 1024).expect("alloc vram for test");
         StorageEngine::new(vram, true, true).expect("compress+dedup engine (nvCOMP)")
@@ -5308,6 +5595,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn write_read_roundtrip_small() {
         let mut e = engine(1, false);
@@ -5318,6 +5606,7 @@ mod tests {
         assert_eq!(e.read("\\a", 0, 1024).unwrap(), data);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn gpu_api_hash_known_vectors() {
         let mut e = engine(2, false);
@@ -5358,6 +5647,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn gpu_api_hash_small_budget_matches_known_digests() {
         let mut e = engine_with_hash_budget(8, false, 64 * 1024);
@@ -5421,6 +5711,7 @@ mod tests {
         assert_eq!(crate::api_kernel::digest_hex(&sha256[1]), expected[1].3);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn cpu_and_gpu_hash_digests_match_all_algorithms() {
         let mut e = engine(16, false);
@@ -5448,6 +5739,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn routed_large_file_hash_uses_cpu_and_matches_rustcrypto() {
         let mut e = engine(16, false);
@@ -5464,6 +5756,7 @@ mod tests {
         assert_eq!(digest, hash_reference(HashAlgorithm::Sha256, &data));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn routed_hash_succeeds_for_cpu_zstd_fallback_chunks() {
         let mut e = engine_compress(16);
@@ -5487,6 +5780,7 @@ mod tests {
         assert_eq!(digest, hash_reference(HashAlgorithm::Sha256, &data));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn write_spans_multiple_chunks() {
         let mut e = engine(2, false);
@@ -5501,6 +5795,7 @@ mod tests {
         assert_eq!(e.read("\\big", off, n).unwrap(), data);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn raw_full_chunk_write_uses_contiguous_storage() {
         let mut e = engine(8, false);
@@ -5518,6 +5813,7 @@ mod tests {
         assert_eq!(e.read("\\big", 0, n).unwrap(), data);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn partial_chunk_zero_fill() {
         let mut e = engine(1, false);
@@ -5529,6 +5825,7 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn read_clamps_to_eof() {
         let mut e = engine(1, false);
@@ -5538,6 +5835,7 @@ mod tests {
         assert!(e.read("\\c", 6, 100).unwrap().is_empty());
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn truncate_frees_and_extends() {
         let mut e = engine(2, false);
@@ -5554,6 +5852,7 @@ mod tests {
         assert!(tail.iter().all(|&b| b == 0));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn overwrite_updates_in_place() {
         let mut e = engine(1, false);
@@ -5565,6 +5864,7 @@ mod tests {
         assert_eq!(e.read("\\o", 0, 8).unwrap(), b"AAbbAAAA");
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn write_past_capacity_is_rejected_not_panic() {
         // 1 MiB volume = 16 chunks. A write whose end exceeds the volume's
@@ -5583,6 +5883,7 @@ mod tests {
         assert_eq!(e.read("\\big", 0, 2).unwrap(), b"ok");
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn write_offset_overflow_is_rejected() {
         let mut e = engine(1, false);
@@ -5594,6 +5895,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn set_size_huge_is_rejected_not_panic() {
         let mut e = engine(1, false);
@@ -5611,6 +5913,7 @@ mod tests {
         assert_eq!(e.get("\\t").unwrap().size, 4 * CHUNK_SIZE);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn remove_frees_chunks() {
         let mut e = engine(1, false);
@@ -5627,6 +5930,7 @@ mod tests {
         (0..CHUNK_SIZE as usize).map(|i| (i as u8) ^ seed).collect()
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn dedup_shares_identical_chunks() {
         let mut e = engine(4, true);
@@ -5647,6 +5951,7 @@ mod tests {
         assert_eq!(e.read("\\f2", 0, CHUNK_SIZE as usize).unwrap(), block);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn stats_report_dedup_physical_savings() {
         let mut e = engine(4, true);
@@ -5666,6 +5971,7 @@ mod tests {
         assert_eq!(s.used_physical_bytes, CHUNK_SIZE);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn dedup_distinct_chunks_not_shared() {
         let mut e = engine(4, true);
@@ -5677,6 +5983,7 @@ mod tests {
         assert_eq!(e.used_chunks(), n1 + 1);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn dedup_cow_on_partial_write() {
         let mut e = engine(4, true);
@@ -5695,6 +6002,7 @@ mod tests {
         assert_eq!(&y, b"DIFFERENT");
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn clone_range_shares_full_chunks_and_cows() {
         let mut e = engine(4, true);
@@ -5869,6 +6177,7 @@ mod tests {
         assert_eq!(y_tail, block[7..], "remainder of y corrupted");
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn dedup_refcount_frees_only_at_zero() {
         let mut e = engine(4, true);
@@ -5887,8 +6196,262 @@ mod tests {
         assert_eq!(e.used_chunks(), shared - 1);
     }
 
+    // ---- dedup candidate verification --------------------------------------
+    //
+    // The dedup index is keyed by a two-level FNV-1a 64-bit hash, which is not
+    // collision resistant: collisions can be constructed on purpose. These
+    // tests forge the situation an attacker would engineer — the index says
+    // "this hash lives at that placement" while the placement holds different
+    // bytes — and assert that the engine refuses to share, because sharing
+    // there means one file silently reading another's data.
+
+    /// Point `hash` at `p` in the dedup index, standing in for an FNV-1a
+    /// collision that an attacker constructed. For a compressed candidate the
+    /// blob's reverse-map entry is rewritten too, so the hash-only check has
+    /// nothing left to notice — only the bytes still disagree.
+    fn forge_collision(e: &mut StorageEngine, hash: u64, p: Placement) {
+        e.hash_index.insert(hash, p);
+        if let Placement::Compressed { offset, .. } = p {
+            e.compressed_hash.insert(offset, hash);
+        }
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn dedup_verification_rejects_forged_raw_collision() {
+        let mut e = engine(4, true);
+        let a = chunk_pattern(0x11);
+        let b = chunk_pattern(0x22);
+        e.table_mut().create_file("\\a", 0).unwrap();
+        e.table_mut().create_file("\\b", 0).unwrap();
+        e.write("\\a", 0, &a).unwrap();
+        e.write("\\b", 0, &b).unwrap();
+
+        let b_place = e.coord("\\b", 0).unwrap();
+        assert!(matches!(b_place, Placement::Raw { .. }));
+        forge_collision(&mut e, fnv1a(&a), b_place);
+
+        let before = e.used_chunks();
+        e.table_mut().create_file("\\c", 0).unwrap();
+        e.write("\\c", 0, &a).unwrap();
+
+        assert_eq!(
+            e.read("\\c", 0, CHUNK_SIZE as usize).unwrap(),
+            a,
+            "forged collision aliased \\c onto \\b's chunk"
+        );
+        assert_eq!(
+            e.used_chunks(),
+            before + 1,
+            "a rejected candidate must be stored in its own chunk"
+        );
+        assert_eq!(
+            e.read("\\b", 0, CHUNK_SIZE as usize).unwrap(),
+            b,
+            "\\b must be untouched by the rejected share"
+        );
+        assert_eq!(e.trace.dedup_rejected_chunks, 1);
+        assert_eq!(
+            e.trace.dedup_shared_chunks, 0,
+            "a rejected candidate must not be counted as shared"
+        );
+
+        // Refcount bookkeeping survives the mismatch: each file still owns
+        // exactly one chunk, so deleting them all releases everything.
+        e.remove("\\a").unwrap();
+        e.remove("\\b").unwrap();
+        e.remove("\\c").unwrap();
+        assert_eq!(e.used_chunks(), 0, "rejected path leaked a chunk");
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn dedup_verification_rejects_forged_compressed_collision() {
+        let mut e = engine_compress_dedup(8);
+        let a = vec![b'A'; CHUNK_SIZE as usize];
+        let b = vec![b'B'; CHUNK_SIZE as usize];
+        e.table_mut().create_file("\\a", 0).unwrap();
+        e.table_mut().create_file("\\b", 0).unwrap();
+        e.write("\\a", 0, &a).unwrap();
+        e.write("\\b", 0, &b).unwrap();
+
+        let b_place = e.coord("\\b", 0).unwrap();
+        assert!(
+            matches!(b_place, Placement::Compressed { .. }),
+            "fixture must produce a compressed candidate, got {b_place:?}"
+        );
+        forge_collision(&mut e, fnv1a(&a), b_place);
+
+        e.table_mut().create_file("\\c", 0).unwrap();
+        e.write("\\c", 0, &a).unwrap();
+
+        assert_eq!(
+            e.read("\\c", 0, CHUNK_SIZE as usize).unwrap(),
+            a,
+            "forged collision aliased \\c onto \\b's blob"
+        );
+        assert_eq!(e.read("\\b", 0, CHUNK_SIZE as usize).unwrap(), b);
+        assert_eq!(e.trace.dedup_rejected_chunks, 1);
+        assert_eq!(e.trace.dedup_shared_chunks, 0);
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn dedup_verification_rejects_forged_collision_on_partial_write() {
+        // Partial writes take the single-chunk `try_share_hashed` path: the
+        // chunk is materialized, patched, then offered to the dedup index.
+        let mut e = engine_compress_dedup(8);
+        let victim = vec![b'V'; CHUNK_SIZE as usize];
+        let mut patched = vec![b'W'; CHUNK_SIZE as usize];
+        patched[10..12].copy_from_slice(b"XY");
+
+        e.table_mut().create_file("\\victim", 0).unwrap();
+        e.table_mut().create_file("\\w", 0).unwrap();
+        e.write("\\victim", 0, &victim).unwrap();
+        e.write("\\w", 0, &vec![b'W'; CHUNK_SIZE as usize]).unwrap();
+
+        let victim_place = e.coord("\\victim", 0).unwrap();
+        assert!(matches!(victim_place, Placement::Compressed { .. }));
+        forge_collision(&mut e, fnv1a(&patched), victim_place);
+
+        e.write("\\w", 10, b"XY").unwrap();
+
+        assert_eq!(
+            e.read("\\w", 0, CHUNK_SIZE as usize).unwrap(),
+            patched,
+            "forged collision aliased \\w onto \\victim's blob"
+        );
+        assert_eq!(e.read("\\victim", 0, CHUNK_SIZE as usize).unwrap(), victim);
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn dedup_trust_hash_restores_hash_only_sharing() {
+        // `--dedup-trust-hash` puts the pre-verification decision back: the
+        // candidate is confirmed from the index's own hash bookkeeping, so a
+        // forged collision is taken and \c silently reads \b's data. This test
+        // documents the behaviour the flag opts back into — the corruption is
+        // the point, and is why verification is the default.
+        let mut e = engine_compress_dedup(8);
+        e.set_dedup_verify_bytes(false);
+        assert!(!e.dedup_verify_bytes());
+
+        let a = vec![b'A'; CHUNK_SIZE as usize];
+        let b = vec![b'B'; CHUNK_SIZE as usize];
+        e.table_mut().create_file("\\a", 0).unwrap();
+        e.table_mut().create_file("\\b", 0).unwrap();
+        e.write("\\a", 0, &a).unwrap();
+        e.write("\\b", 0, &b).unwrap();
+
+        let b_place = e.coord("\\b", 0).unwrap();
+        forge_collision(&mut e, fnv1a(&a), b_place);
+
+        e.table_mut().create_file("\\c", 0).unwrap();
+        e.write("\\c", 0, &a).unwrap();
+
+        assert_eq!(
+            e.coord("\\c", 0),
+            Some(b_place),
+            "trust-hash mode must share on the hash alone"
+        );
+        assert_eq!(e.trace.dedup_shared_chunks, 1);
+        assert_eq!(e.trace.dedup_rejected_chunks, 0);
+        // ...and the flag really did cost correctness: \c reads \b's bytes.
+        assert_eq!(e.read("\\c", 0, CHUNK_SIZE as usize).unwrap(), b);
+
+        // The same forgery is refused as soon as verification is turned on.
+        e.set_dedup_verify_bytes(true);
+        e.table_mut().create_file("\\d", 0).unwrap();
+        e.write("\\d", 0, &a).unwrap();
+        assert_eq!(e.read("\\d", 0, CHUNK_SIZE as usize).unwrap(), a);
+        assert_eq!(e.trace.dedup_rejected_chunks, 1);
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn dedup_batched_write_still_shares_genuine_duplicates() {
+        // Regression cover for the batched full-chunk path in both modes:
+        // verification must not cost dedup its whole reason for existing.
+        for verify in [true, false] {
+            let mut e = engine(8, true);
+            e.set_dedup_verify_bytes(verify);
+            let data: Vec<u8> = (0..(CHUNK_SIZE as usize * 4))
+                .map(|i| ((i * 31) / 7) as u8)
+                .collect();
+            e.table_mut().create_file("\\f1", 0).unwrap();
+            e.table_mut().create_file("\\f2", 0).unwrap();
+            e.write("\\f1", 0, &data).unwrap();
+            let after_first = e.used_chunks();
+            assert_eq!(after_first, 4, "fixture should occupy four chunks");
+
+            let rehashes_before = e.trace.gpu_hash_chunks;
+            e.write("\\f2", 0, &data).unwrap();
+
+            assert_eq!(
+                e.used_chunks(),
+                after_first,
+                "batched duplicate write consumed extra chunks (verify={verify})"
+            );
+            assert_eq!(e.trace.dedup_shared_chunks, 4);
+            assert_eq!(e.trace.dedup_rejected_chunks, 0);
+            assert_eq!(e.read("\\f1", 0, data.len()).unwrap(), data);
+            assert_eq!(e.read("\\f2", 0, data.len()).unwrap(), data);
+
+            let s = e.stats();
+            assert_eq!(s.dedup_shared_logical_chunks, 4);
+            assert_eq!(s.dedup_saved_bytes, 4 * CHUNK_SIZE);
+
+            // The two modes confirm by different means: only trust-hash runs
+            // the batched GPU re-hash over the candidates.
+            let rehashed = e.trace.gpu_hash_chunks - rehashes_before;
+            if verify {
+                assert_eq!(rehashed, 0, "byte verification must not re-hash");
+            } else {
+                assert_eq!(rehashed, 4, "trust-hash must confirm by re-hashing");
+            }
+        }
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn dedup_batched_write_does_not_alias_a_chunk_it_just_rewrote() {
+        // Swapping two chunks in one batched write offers each chunk of the
+        // file as a candidate for the other's slot. Confirming against the
+        // index at the moment of the decision — rather than a snapshot taken
+        // before the batch started placing chunks — is what keeps a released
+        // or already-rewritten chunk from being adopted.
+        let mut e = engine(8, true);
+        let a = chunk_pattern(0x0A);
+        let b = chunk_pattern(0x0B);
+        e.table_mut().create_file("\\f", 0).unwrap();
+
+        let mut ab = a.clone();
+        ab.extend_from_slice(&b);
+        e.write("\\f", 0, &ab).unwrap();
+        assert_eq!(e.used_chunks(), 2);
+
+        let mut ba = b.clone();
+        ba.extend_from_slice(&a);
+        e.write("\\f", 0, &ba).unwrap();
+
+        assert_eq!(e.read("\\f", 0, ba.len()).unwrap(), ba);
+        assert_eq!(
+            e.used_chunks(),
+            2,
+            "a chunk the file still points at was returned to the allocator"
+        );
+
+        // A later allocation must not be handed a chunk \f is still using.
+        e.table_mut().create_file("\\g", 0).unwrap();
+        let c = chunk_pattern(0x0C);
+        e.write("\\g", 0, &c).unwrap();
+        assert_eq!(e.read("\\f", 0, ba.len()).unwrap(), ba);
+        assert_eq!(e.read("\\g", 0, CHUNK_SIZE as usize).unwrap(), c);
+    }
+
     // ---- rename fixes --------------------------------------------------------
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn rename_replace_frees_target_chunks() {
         let mut e = engine(4, false);
@@ -5906,6 +6469,7 @@ mod tests {
         assert!(got.iter().all(|&b| b == 1));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn case_only_rename_updates_display_name() {
         let mut e = engine(2, false);
@@ -5960,7 +6524,7 @@ mod tests {
                 EncodeDirection::Encode,
                 &src,
                 &b64,
-                || false,
+                |_, _| false,
             )
             .unwrap();
         assert_eq!(stats.output_bytes, (data.len() as u64).div_ceil(3) * 4);
@@ -5976,7 +6540,7 @@ mod tests {
             EncodeDirection::Decode,
             &b64,
             &back,
-            || false,
+            |_, _| false,
         )
         .unwrap();
         assert_eq!(e.file_size(&back).unwrap(), data.len() as u64);
@@ -5988,7 +6552,7 @@ mod tests {
                 EncodeDirection::Encode,
                 &src,
                 &hex,
-                || false,
+                |_, _| false,
             )
             .unwrap();
         assert_eq!(stats.output_bytes, data.len() as u64 * 2);
@@ -6001,12 +6565,13 @@ mod tests {
             EncodeDirection::Decode,
             &hex,
             &hexback,
-            || false,
+            |_, _| false,
         )
         .unwrap();
         assert_eq!(e.read(&hexback, 0, data.len().max(1)).unwrap(), data);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn encode_base64_hex_roundtrip_all_paddings() {
         let mut e = engine(16, false);
@@ -6021,6 +6586,7 @@ mod tests {
         encode_roundtrip_case(&mut e, "big", &big);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn encode_decode_accepts_trailing_newline_and_rejects_garbage() {
         let mut e = engine(8, false);
@@ -6031,7 +6597,7 @@ mod tests {
             EncodeDirection::Decode,
             "\\ok.b64",
             "\\ok.out",
-            || false,
+            |_, _| false,
         )
         .unwrap();
         assert_eq!(e.read("\\ok.out", 0, 16).unwrap(), b"hello");
@@ -6043,7 +6609,7 @@ mod tests {
             EncodeDirection::Decode,
             "\\bad.b64",
             "\\bad.out",
-            || false,
+            |_, _| false,
         );
         assert!(err.is_err(), "invalid base64 must be rejected");
         assert!(
@@ -6059,11 +6625,12 @@ mod tests {
                 EncodeDirection::Decode,
                 "\\bad.hex",
                 "\\badhex.out",
-                || false,
+                |_, _| false,
             )
             .is_err());
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn encode_handles_sparse_input_and_leaves_no_temp_files() {
         let mut e = engine(16, false);
@@ -6079,7 +6646,7 @@ mod tests {
             EncodeDirection::Encode,
             "\\sparse.bin",
             "\\sparse.b64",
-            || false,
+            |_, _| false,
         )
         .unwrap();
         e.encode_file_gpu_cancellable(
@@ -6087,7 +6654,7 @@ mod tests {
             EncodeDirection::Decode,
             "\\sparse.b64",
             "\\sparse.back",
-            || false,
+            |_, _| false,
         )
         .unwrap();
         assert_eq!(e.read("\\sparse.back", 0, size as usize).unwrap(), raw);

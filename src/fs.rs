@@ -2,13 +2,20 @@
 //!
 //! WinFsp dispatches callbacks from a pool of kernel-managed threads. We use
 //! `FineGuard` so independent callbacks may enter concurrently; shared engine
-//! state remains protected by `Mutex`, which also serialises the single CUDA
-//! stream until the engine grows finer region locks.
+//! state is protected by an `RwLock`. Metadata-only callbacks (stat, directory
+//! enumeration, security queries) take it shared and so run concurrently with
+//! each other; anything that mutates state or touches the single CUDA stream
+//! takes it exclusively, which is what still serialises data I/O until the
+//! engine grows finer region locks.
+//!
+//! Long-running jobs must not hold the exclusive guard for their whole
+//! duration -- that freezes every callback on the volume -- so the job
+//! executors below split their work and re-acquire the lock at each boundary.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread::{self, JoinHandle};
 
 use anyhow::Context as _;
@@ -138,7 +145,7 @@ impl OpenFile {
 
 /// The WinFsp filesystem context.
 pub struct VramDiskFs {
-    engine: Arc<Mutex<StorageEngine>>,
+    engine: Arc<RwLock<StorageEngine>>,
     jobs: Arc<JobRegistry>,
     job_worker: JobWorkerHandle,
     label: String,
@@ -153,7 +160,7 @@ impl VramDiskFs {
     pub fn new(engine: StorageEngine, label: impl Into<String>) -> Self {
         let default_security_descriptor =
             security_descriptor_from_sddl(default_security_sddl()).unwrap_or_default();
-        let engine = Arc::new(Mutex::new(engine));
+        let engine = Arc::new(RwLock::new(engine));
         let jobs = Arc::new(JobRegistry::default());
         let job_worker = JobWorkerHandle::spawn(engine.clone(), jobs.clone());
         VramDiskFs {
@@ -169,8 +176,27 @@ impl VramDiskFs {
     /// Lock the engine, recovering the guard if a previous callback poisoned
     /// the mutex by panicking. Keeping the volume alive (and at worst returning
     /// errors) is far better than aborting the whole mount on one bad call.
-    fn engine(&self) -> std::sync::MutexGuard<'_, StorageEngine> {
-        self.engine.lock().unwrap_or_else(|e| e.into_inner())
+    /// Exclusive access, for anything that mutates engine state or touches
+    /// the CUDA stream.
+    fn engine(&self) -> std::sync::RwLockWriteGuard<'_, StorageEngine> {
+        self.engine.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Shared access, for the metadata-only callbacks (stat, directory
+    /// enumeration, security queries, volume info).
+    ///
+    /// Those used to queue behind every other callback on one mutex even
+    /// though they only read the namespace, so listing a large directory
+    /// serialised against every other stat on the volume. They now run
+    /// concurrently with each other; anything touching VRAM or the CUDA
+    /// stream still takes [`Self::engine`] exclusively.
+    ///
+    /// `RwLock` on Windows wraps SRWLOCK, which is not a fair lock, so a
+    /// sustained flood of metadata reads could in principle starve a writer.
+    /// WinFsp dispatches from a bounded thread pool and these callbacks are
+    /// short, so that is not reachable in practice.
+    fn engine_shared(&self) -> std::sync::RwLockReadGuard<'_, StorageEngine> {
+        self.engine.read().unwrap_or_else(|e| e.into_inner())
     }
 
     fn enqueue_job(&self, id: String) {
@@ -222,7 +248,7 @@ struct JobWorkerHandle {
 }
 
 struct JobWorker {
-    engine: Arc<Mutex<StorageEngine>>,
+    engine: Arc<RwLock<StorageEngine>>,
     jobs: Arc<JobRegistry>,
     state: Mutex<JobWorkerState>,
     changed: Condvar,
@@ -237,7 +263,7 @@ struct JobWorkerState {
 }
 
 impl JobWorkerHandle {
-    fn spawn(engine: Arc<Mutex<StorageEngine>>, jobs: Arc<JobRegistry>) -> Self {
+    fn spawn(engine: Arc<RwLock<StorageEngine>>, jobs: Arc<JobRegistry>) -> Self {
         let inner = Arc::new(JobWorker {
             engine,
             jobs,
@@ -537,16 +563,31 @@ enum JobExecutionError {
     Failed(String),
 }
 
+/// Exclusive engine access for a job executor.
 fn lock_shared_engine(
-    engine: &Arc<Mutex<StorageEngine>>,
-) -> std::sync::MutexGuard<'_, StorageEngine> {
-    engine.lock().unwrap_or_else(|e| e.into_inner())
+    engine: &Arc<RwLock<StorageEngine>>,
+) -> std::sync::RwLockWriteGuard<'_, StorageEngine> {
+    engine.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Read-only engine access for a job executor, for the metadata passes
+/// (resolving a job's target paths, sizing files) that precede the real work.
+fn read_shared_engine(
+    engine: &Arc<RwLock<StorageEngine>>,
+) -> std::sync::RwLockReadGuard<'_, StorageEngine> {
+    engine.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Turn an engine failure into a job outcome.
+///
+/// Formats with `Display`, not `Debug`: this string is written verbatim into
+/// `result.json` and shown to the user by the GUI, and `Debug` would surface
+/// the Rust variant name and quoting -- `Cuda("truncated zip local header")`
+/// rather than the sentence the error actually wrote.
 fn map_job_engine_error(prefix: &str, err: EngineError) -> JobExecutionError {
     match err {
         EngineError::Cancelled => JobExecutionError::Cancelled,
-        other => JobExecutionError::Failed(format!("{prefix}: {other:?}")),
+        other => JobExecutionError::Failed(format!("{prefix}: {other}")),
     }
 }
 
@@ -558,7 +599,26 @@ fn check_job_cancelled(id: &str, jobs: &JobRegistry) -> Result<(), JobExecutionE
     }
 }
 
-fn execute_job(id: &str, jobs: &JobRegistry, engine: &Arc<Mutex<StorageEngine>>) {
+/// The callback the engine's long-running jobs poll at their safe points: it
+/// publishes the byte counters into the registry (so `status.json` can drive a
+/// determinate bar and an ETA) and answers whether the job has been asked to
+/// stop.
+///
+/// A `(0, 0)` tick is the engine's documented "no useful counter here" signal,
+/// emitted by pre-flight checks that run before any measurable work. Storing it
+/// would replace a real total published moments earlier with a zero
+/// denominator, so those ticks are skipped and only the cancellation question
+/// is answered.
+fn job_progress_sink<'a>(jobs: &'a JobRegistry, id: &'a str) -> impl FnMut(u64, u64) -> bool + 'a {
+    move |done, total| {
+        if total != 0 {
+            jobs.set_progress(id, done, total);
+        }
+        jobs.cancel_requested(id)
+    }
+}
+
+fn execute_job(id: &str, jobs: &JobRegistry, engine: &Arc<RwLock<StorageEngine>>) {
     let Some(descriptor) = jobs.start(id) else {
         return;
     };
@@ -587,7 +647,7 @@ fn execute_job_descriptor(
     id: &str,
     descriptor: &str,
     jobs: &JobRegistry,
-    engine: &Arc<Mutex<StorageEngine>>,
+    engine: &Arc<RwLock<StorageEngine>>,
 ) -> Result<String, JobExecutionError> {
     let v: serde_json::Value = serde_json::from_str(descriptor)
         .map_err(|e| JobExecutionError::Failed(format!("invalid job descriptor JSON: {e}")))?;
@@ -620,7 +680,7 @@ fn execute_archive_compress_job(
     id: &str,
     descriptor: &serde_json::Value,
     jobs: &JobRegistry,
-    engine: &Arc<Mutex<StorageEngine>>,
+    engine: &Arc<RwLock<StorageEngine>>,
 ) -> Result<String, JobExecutionError> {
     let format_name = descriptor
         .get("format")
@@ -645,7 +705,7 @@ fn execute_archive_compress_job(
     let roots = descriptor_paths(descriptor, "path", "paths").map_err(JobExecutionError::Failed)?;
     let mut targets = BTreeSet::new();
     {
-        let engine = lock_shared_engine(engine);
+        let engine = read_shared_engine(engine);
         for root in roots {
             check_job_cancelled(id, jobs)?;
             collect_hash_targets(&engine, &root, recursive, &mut targets)
@@ -661,7 +721,7 @@ fn execute_archive_compress_job(
     let stats = {
         let mut engine = lock_shared_engine(engine);
         engine
-            .archive_compress_gpu_cancellable(format, &paths, output, || jobs.cancel_requested(id))
+            .archive_compress_gpu_cancellable(format, &paths, output, job_progress_sink(jobs, id))
             .map_err(|e| map_job_engine_error("GPU archive compression failed", e))?
     };
     let throughput = if stats.elapsed_ms == 0 {
@@ -693,7 +753,7 @@ fn execute_archive_extract_job(
     id: &str,
     descriptor: &serde_json::Value,
     jobs: &JobRegistry,
-    engine: &Arc<Mutex<StorageEngine>>,
+    engine: &Arc<RwLock<StorageEngine>>,
 ) -> Result<String, JobExecutionError> {
     let format_name = descriptor
         .get("format")
@@ -720,9 +780,12 @@ fn execute_archive_extract_job(
     let stats = {
         let mut engine = lock_shared_engine(engine);
         engine
-            .archive_extract_gpu_cancellable(format, archive, output_dir, || {
-                jobs.cancel_requested(id)
-            })
+            .archive_extract_gpu_cancellable(
+                format,
+                archive,
+                output_dir,
+                job_progress_sink(jobs, id),
+            )
             .map_err(|e| map_job_engine_error("GPU archive extraction failed", e))?
     };
     let throughput = if stats.elapsed_ms == 0 {
@@ -755,7 +818,7 @@ fn execute_encode_job(
     id: &str,
     descriptor: &serde_json::Value,
     jobs: &JobRegistry,
-    engine: &Arc<Mutex<StorageEngine>>,
+    engine: &Arc<RwLock<StorageEngine>>,
 ) -> Result<String, JobExecutionError> {
     use crate::engine::{EncodeCodec, EncodeDirection};
 
@@ -790,9 +853,13 @@ fn execute_encode_job(
     let stats = {
         let mut engine = lock_shared_engine(engine);
         engine
-            .encode_file_gpu_cancellable(codec, direction, input, output, || {
-                jobs.cancel_requested(id)
-            })
+            .encode_file_gpu_cancellable(
+                codec,
+                direction,
+                input,
+                output,
+                job_progress_sink(jobs, id),
+            )
             .map_err(|e| map_job_engine_error("GPU encode failed", e))?
     };
     let throughput = if stats.elapsed_ms == 0 {
@@ -848,7 +915,7 @@ fn execute_hash_job(
     id: &str,
     descriptor: &serde_json::Value,
     jobs: &JobRegistry,
-    engine: &Arc<Mutex<StorageEngine>>,
+    engine: &Arc<RwLock<StorageEngine>>,
 ) -> Result<String, JobExecutionError> {
     let alg_name = descriptor
         .get("algorithm")
@@ -867,7 +934,7 @@ fn execute_hash_job(
 
     let mut targets = BTreeSet::new();
     {
-        let engine = lock_shared_engine(engine);
+        let engine = read_shared_engine(engine);
         for root in roots {
             check_job_cancelled(id, jobs)?;
             collect_hash_targets(&engine, &root, recursive, &mut targets)
@@ -880,7 +947,10 @@ fn execute_hash_job(
 
     // Route each file to the GPU or CPU path, and total the work up front so
     // the job can report a real percentage rather than only elapsed seconds.
-    let mut gpu_batches: Vec<Vec<(usize, String)>> = Vec::new();
+    // Each entry is (index into `paths`, path, size). The size is carried along
+    // so the progress accounting below never re-takes the engine lock just to
+    // ask how big a file was.
+    let mut gpu_batches: Vec<Vec<(usize, String, u64)>> = Vec::new();
     let mut cpu_files: Vec<(usize, String)> = Vec::new();
     let mut total_bytes = 0u64;
     {
@@ -889,7 +959,7 @@ fn execute_hash_job(
         // calibrated to about 0.1 s of GPU work. That is also what bounds how
         // long a batch holds the engine lock below.
         let budget = engine.gpu_hash_launch_budget().max(1);
-        let mut batch: Vec<(usize, String)> = Vec::new();
+        let mut batch: Vec<(usize, String, u64)> = Vec::new();
         let mut batch_bytes = 0u64;
         for (idx, path) in paths.iter().enumerate() {
             check_job_cancelled(id, jobs)?;
@@ -901,7 +971,7 @@ fn execute_hash_job(
                 .should_hash_on_gpu_routed(path)
                 .map_err(|e| map_job_engine_error("hash routing failed", e))?
             {
-                batch.push((idx, path.clone()));
+                batch.push((idx, path.clone(), size));
                 batch_bytes = batch_bytes.saturating_add(size);
                 if batch_bytes >= budget {
                     gpu_batches.push(std::mem::take(&mut batch));
@@ -922,18 +992,23 @@ fn execute_hash_job(
     // to finish, freezing every other filesystem callback on the volume for
     // its full duration.
     for batch in gpu_batches {
-        let batch_paths: Vec<String> = batch.iter().map(|(_, p)| p.clone()).collect();
+        let batch_paths: Vec<String> = batch.iter().map(|(_, p, _)| p.clone()).collect();
         let batch_digests = {
             let mut engine = lock_shared_engine(engine);
             engine
-                .hash_files_gpu_many_cancellable(&batch_paths, alg, || jobs.cancel_requested(id))
+                // The engine's per-batch counters are deliberately ignored:
+                // this executor owns the job's progress and credits a whole
+                // batch with `advance_progress` once it comes back, so feeding
+                // the batch-local counters to `set_progress` as well would make
+                // the total jump between the batch and the job.
+                .hash_files_gpu_many_cancellable(&batch_paths, alg, |_, _| {
+                    jobs.cancel_requested(id)
+                })
                 .map_err(|e| map_job_engine_error("GPU hash failed", e))?
         };
         let mut done = 0u64;
-        for ((idx, path), digest) in batch.into_iter().zip(batch_digests.into_iter()) {
-            let engine = lock_shared_engine(engine);
-            done = done.saturating_add(engine.file_size(&path).unwrap_or(0));
-            drop(engine);
+        for ((idx, _, size), digest) in batch.into_iter().zip(batch_digests.into_iter()) {
+            done = done.saturating_add(size);
             digests[idx] = digest;
         }
         jobs.advance_progress(id, done);
@@ -966,14 +1041,14 @@ fn execute_hash_job(
 }
 
 fn hash_file_cpu_windowed(
-    engine: &Arc<Mutex<StorageEngine>>,
+    engine: &Arc<RwLock<StorageEngine>>,
     jobs: &JobRegistry,
     id: &str,
     path: &str,
     alg: HashAlgorithm,
 ) -> Result<Vec<u8>, JobExecutionError> {
     let size = {
-        let engine = lock_shared_engine(engine);
+        let engine = read_shared_engine(engine);
         engine
             .file_size(path)
             .map_err(|e| map_job_engine_error("CPU hash failed", e))?
@@ -1000,12 +1075,12 @@ fn hash_file_cpu_windowed(
 }
 
 fn hash_file_cpu_windowed_no_cancel(
-    engine: &Arc<Mutex<StorageEngine>>,
+    engine: &Arc<RwLock<StorageEngine>>,
     path: &str,
     alg: HashAlgorithm,
 ) -> Result<Vec<u8>, EngineError> {
     let size = {
-        let engine = lock_shared_engine(engine);
+        let engine = read_shared_engine(engine);
         engine.file_size(path)?
     };
     let mut hasher = CpuHashState::new(alg);
@@ -1026,7 +1101,7 @@ fn hash_file_cpu_windowed_no_cancel(
 }
 
 fn compute_internal_hash(
-    engine: &Arc<Mutex<StorageEngine>>,
+    engine: &Arc<RwLock<StorageEngine>>,
     path: &str,
     alg: HashAlgorithm,
 ) -> Result<Vec<u8>, EngineError> {
@@ -1232,7 +1307,7 @@ impl FileSystemContext for VramDiskFs {
         _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
         let path = crate::lookup::normalize(&file_name.to_string_lossy());
-        let engine = self.engine();
+        let engine = self.engine_shared();
         if let Some(entry) = internal_api::resolve(&path, &engine) {
             let sd = self.default_security_descriptor()?;
             let copied = write_security_descriptor(&sd, security_descriptor)?;
@@ -1389,7 +1464,7 @@ impl FileSystemContext for VramDiskFs {
             fill_internal_file_info(&internal.entry, Some(len), file_info);
             return Ok(());
         }
-        let engine = self.engine();
+        let engine = self.engine_shared();
         let node = engine
             .get(&context.path())
             .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
@@ -1406,7 +1481,7 @@ impl FileSystemContext for VramDiskFs {
             let sd = self.default_security_descriptor()?;
             return Ok(write_security_descriptor(&sd, security_descriptor)?.size);
         }
-        let engine = self.engine();
+        let engine = self.engine_shared();
         let path = context.path();
         let node = engine.get(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
         let sd = node_security_descriptor(self, node)?;
@@ -1718,7 +1793,7 @@ impl FileSystemContext for VramDiskFs {
             return Ok(());
         }
         if delete_file && context.is_dir {
-            let engine = self.engine();
+            let engine = self.engine_shared();
             if let Some(node) = engine.get(&context.path()) {
                 if !node.children.is_empty() {
                     return Err(STATUS_DIRECTORY_NOT_EMPTY.into());
@@ -1756,7 +1831,7 @@ impl FileSystemContext for VramDiskFs {
     fn get_volume_info(&self, out: &mut VolumeInfo) -> winfsp::Result<()> {
         // Explorer polls this constantly during copies; use the O(1) allocator
         // counters instead of the full namespace walk `stats()` performs.
-        let engine = self.engine();
+        let engine = self.engine_shared();
         let (total, free) = engine.volume_usage();
         out.total_size = total;
         out.free_size = free;
@@ -1852,7 +1927,7 @@ impl FileSystemContext for VramDiskFs {
                         emit_internal("cancel", InternalEntry::JobCancelFile { id: id.clone() })?;
                     }
                     InternalEntry::ChunksRootDir => {
-                        let engine = self.engine();
+                        let engine = self.engine_shared();
                         let entries = engine.table().readdir("\\").map_err(map_lookup_err)?;
                         for (name, child) in entries {
                             if name.eq_ignore_ascii_case(internal_api::DISPLAY_ROOT) {
@@ -1866,7 +1941,7 @@ impl FileSystemContext for VramDiskFs {
                         }
                     }
                     InternalEntry::ChunksDir { target_dir } => {
-                        let engine = self.engine();
+                        let engine = self.engine_shared();
                         let base = if target_dir == "\\" {
                             String::new()
                         } else {
@@ -1893,7 +1968,7 @@ impl FileSystemContext for VramDiskFs {
                         }
                     }
                     InternalEntry::HashAlgDir { alg, target_dir } => {
-                        let engine = self.engine();
+                        let engine = self.engine_shared();
                         let base = if target_dir == "\\" {
                             String::new()
                         } else {
@@ -1927,7 +2002,7 @@ impl FileSystemContext for VramDiskFs {
                     | InternalEntry::HashFile { .. } => {}
                 }
             } else {
-                let engine = self.engine();
+                let engine = self.engine_shared();
                 // Set the entry name as raw UTF-16 *without* a NUL terminator;
                 // WinFsp derives the name length from the entry size.
                 let mut emit = |name: &str, node: &Node| -> winfsp::Result<()> {
@@ -2256,6 +2331,7 @@ mod tests {
         (fs, context)
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn create_preserves_display_case() {
         let _ = preload_winfsp_dll();
@@ -2290,6 +2366,7 @@ mod tests {
         fs.close(context);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn hash_job_hashes_multiple_paths_and_directories() {
         let vram = crate::cuda::Vram::new(0, crate::CHUNK_SIZE * 8).expect("test vram");
@@ -2302,7 +2379,7 @@ mod tests {
             .unwrap();
         raw_engine.write("\\a.txt", 0, b"abc").unwrap();
         raw_engine.write("\\dir\\b.txt", 0, b"hello").unwrap();
-        let engine = Arc::new(Mutex::new(raw_engine));
+        let engine = Arc::new(RwLock::new(raw_engine));
         let jobs = JobRegistry::default();
 
         let result = execute_job_descriptor(
@@ -2323,6 +2400,7 @@ mod tests {
         assert!(result.contains("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn cleanup_deletes_when_winfsp_sets_delete_flag() {
         let (fs, context) = test_fs_with_file("\\victim");
@@ -2330,6 +2408,7 @@ mod tests {
         assert!(fs.engine().get("\\victim").is_none());
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn cleanup_deletes_when_set_delete_marked_pending() {
         let (fs, context) = test_fs_with_file("\\victim");
@@ -2362,6 +2441,7 @@ mod tests {
         VramDiskFs::new(engine, "test")
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn async_worker_reports_running_then_wait_returns_result() {
         let fs = test_fs_with_hash_input();
@@ -2400,6 +2480,7 @@ mod tests {
         assert!(done.result.contains(r#""ok":true"#) || done.result.contains(r#""ok": true"#));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn async_worker_cancels_running_job_at_safe_boundary() {
         let fs = test_fs_with_hash_input();

@@ -141,6 +141,14 @@
             <span class="status-text" id="hash-status" role="status"></span>
             <button type="button" class="btn" id="hash-cancel" data-i18n="cancel">中止</button>
           </div>
+          <div class="job-progress" id="hash-progress" hidden role="progressbar" aria-valuemin="0" aria-valuemax="100" data-i18n-label="progressLabel">
+            <div class="job-progress-bar"><div class="job-progress-fill" id="hash-progress-fill"></div></div>
+            <div class="job-progress-text">
+              <span id="hash-progress-bytes"></span>
+              <span class="job-progress-eta" id="hash-progress-eta"></span>
+              <span id="hash-progress-pct"></span>
+            </div>
+          </div>
           <div id="hash-done" class="status-text" role="status"></div>
         </form>
         <div id="hash-result" class="kv-list"></div>
@@ -208,6 +216,14 @@
             <span class="status-text" id="archive-status" role="status"></span>
             <button type="button" class="btn" id="archive-cancel" data-i18n="cancel">中止</button>
           </div>
+          <div class="job-progress" id="archive-progress" hidden role="progressbar" aria-valuemin="0" aria-valuemax="100" data-i18n-label="progressLabel">
+            <div class="job-progress-bar"><div class="job-progress-fill" id="archive-progress-fill"></div></div>
+            <div class="job-progress-text">
+              <span id="archive-progress-bytes"></span>
+              <span class="job-progress-eta" id="archive-progress-eta"></span>
+              <span id="archive-progress-pct"></span>
+            </div>
+          </div>
           <div id="archive-done" class="status-text" role="status"></div>
         </form>
         <div id="archive-result" class="kv-list"></div>
@@ -253,11 +269,52 @@
             <span class="status-text" id="encode-status" role="status"></span>
             <button type="button" class="btn" id="encode-cancel" data-i18n="cancel">中止</button>
           </div>
+          <div class="job-progress" id="encode-progress" hidden role="progressbar" aria-valuemin="0" aria-valuemax="100" data-i18n-label="progressLabel">
+            <div class="job-progress-bar"><div class="job-progress-fill" id="encode-progress-fill"></div></div>
+            <div class="job-progress-text">
+              <span id="encode-progress-bytes"></span>
+              <span class="job-progress-eta" id="encode-progress-eta"></span>
+              <span id="encode-progress-pct"></span>
+            </div>
+          </div>
           <div id="encode-done" class="status-text" role="status"></div>
         </form>
         <div id="encode-result" class="kv-list"></div>
       </section>
     </main>
+
+    <!-- ============ Teardown prompt (unmount / quit) ============
+         Three outcomes — save to ZIP first, tear down anyway, cancel — so it
+         cannot be a native message dialog (those top out at two buttons). The
+         tray drives it through the "request-teardown" event. -->
+    <div id="teardown-backdrop" class="modal-backdrop" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="teardown-title">
+        <h2 id="teardown-title"></h2>
+        <p id="teardown-body" class="modal-body"></p>
+
+        <div class="modal-actions" id="teardown-actions">
+          <button id="teardown-save" type="button" class="btn btn-primary btn-block"></button>
+          <button id="teardown-discard" type="button" class="btn btn-block"></button>
+          <button id="teardown-cancel" type="button" class="btn btn-block"></button>
+        </div>
+
+        <div class="job-row" id="export-job-row" hidden>
+          <span class="spinner" aria-hidden="true"></span>
+          <span class="status-text" id="export-status" role="status"></span>
+          <button type="button" class="btn" id="export-cancel" data-i18n="cancel">中止</button>
+        </div>
+        <div class="job-progress" id="export-progress" hidden role="progressbar" aria-valuemin="0" aria-valuemax="100" data-i18n-label="progressLabel">
+          <div class="job-progress-bar"><div class="job-progress-fill" id="export-progress-fill"></div></div>
+          <div class="job-progress-text">
+            <span id="export-progress-bytes"></span>
+            <span class="job-progress-eta" id="export-progress-eta"></span>
+            <span id="export-progress-pct"></span>
+          </div>
+        </div>
+        <div id="export-done" class="status-text" role="status"></div>
+        <div id="export-failures" class="kv-list"></div>
+      </div>
+    </div>
 
     <script src="app.js"></script>
   </body>
