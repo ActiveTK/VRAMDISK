@@ -9,6 +9,7 @@
 //! variants.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -312,6 +313,14 @@ pub struct EngineStats {
     pub nvcomp_lz4_available: bool,
 }
 
+/// Public, plain-`u64` snapshot of the engine's activity counters.
+///
+/// This is what `$VRAMDISK\trace.json` and `trace.txt` render (see
+/// [`crate::internal_api`]); it is a value copied out of the live counters by
+/// [`StorageEngine::trace_snapshot`], never the counters themselves. Keeping it
+/// plain means consumers can compare, clone and arithmetic on it freely — the
+/// live side's atomicity is an implementation detail of the private
+/// `TraceCounters` this is copied out of.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineTrace {
     pub read_calls: u64,
@@ -340,6 +349,79 @@ pub struct EngineTrace {
     pub dedup_unique_chunks: u64,
     pub gpu_hash_chunks: u64,
 }
+
+/// Declares the live counter struct that mirrors [`EngineTrace`] field for
+/// field, plus its snapshot/reset.
+///
+/// The two structs are kept in step by the compiler rather than by hand: the
+/// generated `snapshot` builds an `EngineTrace` struct literal, so a field
+/// present in one and missing from the other fails to compile.
+macro_rules! trace_counters {
+    ($($field:ident),+ $(,)?) => {
+        /// Live activity counters, held inside [`StorageEngine`].
+        ///
+        /// These are `AtomicU64` rather than plain `u64` because the shared
+        /// read fast path ([`StorageEngine::read_into_shared`]) runs under an
+        /// `RwLock` *read* guard: several threads are inside the engine at once
+        /// with only `&self`, and they still have to be counted. Counting only
+        /// the exclusive path would make `$VRAMDISK\trace.json` under-report
+        /// every concurrent read, i.e. lie.
+        ///
+        /// `Ordering::Relaxed` is the right ordering throughout: these are pure
+        /// statistics that publish no other memory and order nothing else. The
+        /// only guarantee needed is that no increment is lost, which relaxed
+        /// read-modify-write already gives.
+        #[derive(Debug, Default)]
+        struct TraceCounters {
+            $($field: AtomicU64,)+
+        }
+
+        impl TraceCounters {
+            /// Copy the counters into the plain-`u64` public struct.
+            ///
+            /// The loads are not atomic *as a group*, so a snapshot taken
+            /// while reads are in flight can straddle an in-progress update
+            /// (e.g. `read_calls` already incremented but `raw_read_bytes` not
+            /// yet). That was equally true of the old non-atomic field reads
+            /// under a shared guard, and these are monotonic statistics, so a
+            /// momentarily skewed sample is harmless.
+            fn snapshot(&self) -> EngineTrace {
+                EngineTrace {
+                    $($field: self.$field.load(Ordering::Relaxed),)+
+                }
+            }
+
+            /// Zero every counter. Takes `&self` only because atomics allow it;
+            /// the sole caller ([`StorageEngine::reset_trace`]) holds `&mut`.
+            fn reset(&self) {
+                $(self.$field.store(0, Ordering::Relaxed);)+
+            }
+        }
+    };
+}
+
+trace_counters!(
+    read_calls,
+    write_calls,
+    logical_read_bytes,
+    logical_write_bytes,
+    raw_read_ops,
+    raw_read_bytes,
+    raw_write_ops,
+    raw_write_bytes,
+    compressed_read_chunks,
+    compressed_read_requested_bytes,
+    compressed_read_full_bytes,
+    compress_batches,
+    compress_chunks,
+    compress_raw_fallback_chunks,
+    dedup_hash_chunks,
+    dedup_candidate_chunks,
+    dedup_shared_chunks,
+    dedup_rejected_chunks,
+    dedup_unique_chunks,
+    gpu_hash_chunks,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChunkReport {
@@ -697,7 +779,7 @@ pub struct StorageEngine {
     gpu_hash_launch_budget_override: bool,
     hash_cpu_route_threshold_override: bool,
     gpu_hash_calibration: Option<GpuHashCalibration>,
-    trace: EngineTrace,
+    trace: TraceCounters,
 }
 
 impl StorageEngine {
@@ -750,7 +832,7 @@ impl StorageEngine {
             gpu_hash_launch_budget_override: false,
             hash_cpu_route_threshold_override: false,
             gpu_hash_calibration: None,
-            trace: EngineTrace::default(),
+            trace: TraceCounters::default(),
         })
     }
 
@@ -837,7 +919,7 @@ impl StorageEngine {
     }
 
     pub fn trace_snapshot(&self) -> EngineTrace {
-        self.trace.clone()
+        self.trace.snapshot()
     }
 
     pub fn gpu_hash_launch_budget(&self) -> u64 {
@@ -902,7 +984,7 @@ impl StorageEngine {
 
     #[allow(dead_code)]
     pub fn reset_trace(&mut self) {
-        self.trace = EngineTrace::default();
+        self.trace.reset();
     }
 
     pub fn get(&self, path: &str) -> Option<&Node> {
@@ -1160,7 +1242,9 @@ impl StorageEngine {
             return Ok(false);
         };
         if !self.confirm_candidate(cand, h, incoming)? {
-            self.trace.dedup_rejected_chunks += 1;
+            self.trace
+                .dedup_rejected_chunks
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         }
         self.share_placement(path, lc, cand);
@@ -1202,7 +1286,9 @@ impl StorageEngine {
                 .as_mut()
                 .expect("gpu_hasher present when dedup");
             cuda(hasher.hash_chunks(base, &offsets, &mut out))?;
-            self.trace.gpu_hash_chunks += out.len() as u64;
+            self.trace
+                .gpu_hash_chunks
+                .fetch_add(out.len() as u64, Ordering::Relaxed);
             for (slot, &i) in items.iter().enumerate() {
                 ok[i] = out[slot] == hashes[i];
             }
@@ -1233,17 +1319,23 @@ impl StorageEngine {
         let Some(cand) = self.hash_index.get(&hashes[i]).copied() else {
             return Ok(false);
         };
-        self.trace.dedup_candidate_chunks += 1;
+        self.trace
+            .dedup_candidate_chunks
+            .fetch_add(1, Ordering::Relaxed);
         let ok = match trusted {
             Some(t) => t[i],
             None => self.candidate_matches_bytes(cand, incoming)?,
         };
         if !ok {
-            self.trace.dedup_rejected_chunks += 1;
+            self.trace
+                .dedup_rejected_chunks
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         }
         self.share_placement(path, lc, cand);
-        self.trace.dedup_shared_chunks += 1;
+        self.trace
+            .dedup_shared_chunks
+            .fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
 
@@ -1876,8 +1968,8 @@ impl StorageEngine {
             Some((bytes, codec)) => {
                 let off = self.carena_alloc(bytes.len() as u32)?;
                 cuda(self.vram.write_at(off, &bytes))?;
-                self.trace.compress_batches += 1;
-                self.trace.compress_chunks += 1;
+                self.trace.compress_batches.fetch_add(1, Ordering::Relaxed);
+                self.trace.compress_chunks.fetch_add(1, Ordering::Relaxed);
                 if let Some(p) = old {
                     self.free_placement(p);
                 }
@@ -1903,10 +1995,14 @@ impl StorageEngine {
                     self.alloc.alloc_one().ok_or(EngineError::NoSpace)?
                 };
                 cuda(self.vram.write_at(chunk as u64 * CHUNK_SIZE, full))?;
-                self.trace.raw_write_ops += 1;
-                self.trace.raw_write_bytes += CHUNK_SIZE;
+                self.trace.raw_write_ops.fetch_add(1, Ordering::Relaxed);
+                self.trace
+                    .raw_write_bytes
+                    .fetch_add(CHUNK_SIZE, Ordering::Relaxed);
                 if self.compress {
-                    self.trace.compress_raw_fallback_chunks += 1;
+                    self.trace
+                        .compress_raw_fallback_chunks
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 if let Some(p) = old {
                     self.free_placement(p);
@@ -1966,6 +2062,177 @@ impl StorageEngine {
         Ok(out)
     }
 
+    /// Length in bytes of the maximal run of *physically contiguous* `Raw`
+    /// chunks that starts at logical position `pos`.
+    ///
+    /// This is what turns a large sequential read into one big device-to-host
+    /// transfer instead of one 64 KiB transfer per logical chunk, and it is the
+    /// single biggest factor in read throughput — so both read paths
+    /// ([`read_into`](Self::read_into) and
+    /// [`read_into_shared`](Self::read_into_shared)) call this rather than
+    /// carrying two copies of the walk that could drift apart.
+    ///
+    /// `first_take` is the byte count already claimed for the chunk containing
+    /// `pos` (which may start mid-chunk), and `remaining` is how many bytes of
+    /// the request are still unserved. The run only ever extends across chunk
+    /// boundaries, so a mid-chunk start simply stops the walk unless the first
+    /// span happens to end exactly on a boundary.
+    ///
+    /// Takes `&self`, so it is usable from a shared (`RwLock` read) guard.
+    fn raw_run_bytes(
+        &self,
+        path: &str,
+        pos: u64,
+        first_take: usize,
+        remaining: usize,
+        first_chunk: ChunkId,
+    ) -> usize {
+        let mut run = first_take;
+        let mut prev_chunk = first_chunk;
+        while run < remaining {
+            let next_pos = pos + run as u64;
+            if next_pos % CHUNK_SIZE != 0 {
+                break;
+            }
+            let next_lc = (next_pos / CHUNK_SIZE) as usize;
+            match self.coord(path, next_lc) {
+                Some(Placement::Raw { chunk }) if chunk == prev_chunk + 1 => {
+                    run += (CHUNK_SIZE as usize).min(remaining - run);
+                    prev_chunk = chunk;
+                }
+                _ => break,
+            }
+        }
+        run
+    }
+
+    /// Shared-guard fast path for [`read_into`](Self::read_into): serves a read
+    /// through `&self` when — and only when — nothing about it needs exclusive
+    /// access, so concurrent readers of the volume genuinely run in parallel.
+    ///
+    /// Returns `Ok(Some(n))` when the request was served in full (`n` is the
+    /// same count `read_into` would return), and `Ok(None)` when the caller
+    /// must retry under the exclusive guard. On `Ok(None)` **`buf` has not been
+    /// touched**: the decision is made by a pre-scan of the placement array
+    /// before a single byte is transferred or zeroed, so a fallback can never
+    /// see a half-filled buffer and no caller can mistake a bail-out for a
+    /// short read.
+    ///
+    /// # Why this is sound
+    ///
+    /// Everything the raw/sparse path touches is either immutable behind the
+    /// shared guard or already internally synchronised:
+    ///
+    /// * the namespace ([`LookupTable`]) and each node's `coords` are read-only
+    ///   while any shared guard is held, because every mutation of them goes
+    ///   through a `&mut self` method and therefore the exclusive guard;
+    /// * [`Vram::read_at`] takes `&self` and is thread-safe on its own — its
+    ///   pinned staging buffers live behind an internal `Mutex` and the
+    ///   host-registered path fans out over the per-`Vram` transfer streams,
+    ///   each copy reading a disjoint device range into the caller's own
+    ///   buffer;
+    /// * the trace counters are [`AtomicU64`] (see the private `TraceCounters`),
+    ///   so the read is still counted exactly as the exclusive path counts it.
+    ///
+    /// # Bail-out conditions (`Ok(None)`)
+    ///
+    /// The pre-scan walks every logical chunk the request touches and gives up
+    /// on anything that is not `Placement::Raw` or a sparse hole (`None`):
+    ///
+    /// * **`Placement::Compressed { codec: Codec::Lz4, .. }`** — decompression
+    ///   goes through [`Lz4Codec`], whose nvCOMP scratch and device buffers are
+    ///   mutated per call (`self.codec.as_mut()`), i.e. exclusive by nature.
+    /// * **`Placement::Compressed { codec: Codec::Zstd, .. }`** — the CPU
+    ///   fallback runs through `decompress_blob`, which is `&mut self` for the
+    ///   same reason.
+    ///
+    /// Error cases (`NotFound`, `NotAFile`) and the trivially empty cases are
+    /// resolved here rather than deferred, because they cost nothing and are
+    /// identical under either guard.
+    ///
+    /// **If a new [`Placement`] variant or a new per-read side effect is added,
+    /// it must be added to the bail-out list above unless it is provably safe
+    /// under `&self`.** The pre-scan matches variants exhaustively precisely so
+    /// that a new variant is a compile error here, not a silent data race: keep
+    /// it that way — do not add a catch-all arm.
+    pub fn read_into_shared(
+        &self,
+        path: &str,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> EResult<Option<usize>> {
+        let node = self.table.get(path).ok_or(LookupError::NotFound)?;
+        if node.is_dir {
+            return Err(EngineError::NotAFile);
+        }
+        let size = node.size;
+        if offset >= size || buf.is_empty() {
+            return Ok(Some(0));
+        }
+        let n = ((size - offset).min(buf.len() as u64)) as usize;
+
+        // Pre-scan: decide before writing anything. `coords` may be shorter
+        // than the file's logical chunk count (a sparse tail), and a missing
+        // entry means the same as `None` — a hole — exactly as `coord` treats
+        // it.
+        let first_lc = (offset / CHUNK_SIZE) as usize;
+        let last_lc = ((offset + n as u64 - 1) / CHUNK_SIZE) as usize;
+        for lc in first_lc..=last_lc {
+            match node.coords.get(lc).copied().flatten() {
+                None | Some(Placement::Raw { .. }) => {}
+                Some(Placement::Compressed { .. }) => return Ok(None),
+            }
+        }
+
+        let out = &mut buf[..n];
+        self.trace.read_calls.fetch_add(1, Ordering::Relaxed);
+        self.trace
+            .logical_read_bytes
+            .fetch_add(n as u64, Ordering::Relaxed);
+
+        let mut done = 0usize;
+        let mut pos = offset;
+        while done < n {
+            let lc = (pos / CHUNK_SIZE) as usize;
+            let in_off = pos % CHUNK_SIZE;
+            let take = ((CHUNK_SIZE - in_off) as usize).min(n - done);
+            match node.coords.get(lc).copied().flatten() {
+                None => {
+                    // Sparse hole: the caller's buffer is not pre-zeroed.
+                    out[done..done + take].fill(0);
+                    done += take;
+                    pos += take as u64;
+                }
+                Some(Placement::Raw { chunk }) => {
+                    let phys = chunk as u64 * CHUNK_SIZE + in_off;
+                    let run_take = self.raw_run_bytes(path, pos, take, n - done, chunk);
+                    self.trace.raw_read_ops.fetch_add(1, Ordering::Relaxed);
+                    self.trace
+                        .raw_read_bytes
+                        .fetch_add(run_take as u64, Ordering::Relaxed);
+                    cuda(self.vram.read_at(phys, &mut out[done..done + run_take]))?;
+                    done += run_take;
+                    pos += run_take as u64;
+                }
+                // Unreachable: the pre-scan already returned `Ok(None)` for
+                // every compressed placement, and nothing can change the
+                // placement array while this shared borrow is alive. It is
+                // still handled explicitly (rather than with a catch-all) so
+                // that adding a `Placement` variant breaks the build in both
+                // matches. An error — not `Ok(None)` — because bytes have
+                // already been written into `buf` by this point, and `Ok(None)`
+                // promises the opposite.
+                Some(Placement::Compressed { .. }) => {
+                    return Err(EngineError::Internal(format!(
+                        "shared read reached a compressed placement at logical chunk {lc} of \
+                         {path} after the pre-scan accepted it"
+                    )))
+                }
+            }
+        }
+        Ok(Some(n))
+    }
+
     /// Read up to `buf.len()` bytes at `offset` directly into `buf`, returning
     /// the number of bytes written (`min(buf.len(), size - offset)`).
     ///
@@ -1989,8 +2256,10 @@ impl StorageEngine {
         }
         let n = ((size - offset).min(buf.len() as u64)) as usize;
         let out = &mut buf[..n];
-        self.trace.read_calls += 1;
-        self.trace.logical_read_bytes += n as u64;
+        self.trace.read_calls.fetch_add(1, Ordering::Relaxed);
+        self.trace
+            .logical_read_bytes
+            .fetch_add(n as u64, Ordering::Relaxed);
 
         // LZ4-compressed chunks touched by this read are gathered and decompressed
         // in batched nvCOMP calls reading the packed blobs straight from the VRAM
@@ -2021,25 +2290,11 @@ impl StorageEngine {
                 }
                 Some(Placement::Raw { chunk }) => {
                     let phys = chunk as u64 * CHUNK_SIZE + in_off;
-                    let mut run_take = take;
-                    let mut prev_chunk = chunk;
-                    while done + run_take < n {
-                        let next_pos = pos + run_take as u64;
-                        if next_pos % CHUNK_SIZE != 0 {
-                            break;
-                        }
-                        let next_lc = (next_pos / CHUNK_SIZE) as usize;
-                        let next_take = (CHUNK_SIZE as usize).min(n - done - run_take);
-                        match self.coord(path, next_lc) {
-                            Some(Placement::Raw { chunk }) if chunk == prev_chunk + 1 => {
-                                run_take += next_take;
-                                prev_chunk = chunk;
-                            }
-                            _ => break,
-                        }
-                    }
-                    self.trace.raw_read_ops += 1;
-                    self.trace.raw_read_bytes += run_take as u64;
+                    let run_take = self.raw_run_bytes(path, pos, take, n - done, chunk);
+                    self.trace.raw_read_ops.fetch_add(1, Ordering::Relaxed);
+                    self.trace
+                        .raw_read_bytes
+                        .fetch_add(run_take as u64, Ordering::Relaxed);
                     cuda(self.vram.read_at(phys, &mut out[done..done + run_take]))?;
                     done += run_take;
                     pos += run_take as u64;
@@ -2058,9 +2313,15 @@ impl StorageEngine {
                         off,
                         len: clen,
                     });
-                    self.trace.compressed_read_chunks += 1;
-                    self.trace.compressed_read_requested_bytes += take as u64;
-                    self.trace.compressed_read_full_bytes += CHUNK_SIZE;
+                    self.trace
+                        .compressed_read_chunks
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.trace
+                        .compressed_read_requested_bytes
+                        .fetch_add(take as u64, Ordering::Relaxed);
+                    self.trace
+                        .compressed_read_full_bytes
+                        .fetch_add(CHUNK_SIZE, Ordering::Relaxed);
                 }
                 Some(Placement::Compressed {
                     offset: off,
@@ -2119,8 +2380,10 @@ impl StorageEngine {
             .checked_add(data.len() as u64)
             .ok_or(EngineError::NoSpace)?;
         self.ensure_logical_len(path, end)?;
-        self.trace.write_calls += 1;
-        self.trace.logical_write_bytes += data.len() as u64;
+        self.trace.write_calls.fetch_add(1, Ordering::Relaxed);
+        self.trace
+            .logical_write_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
 
         // Compress-only mode with nvCOMP available: compress the run of full
         // chunks in this write as one batched GPU call instead of one launch per
@@ -2222,7 +2485,9 @@ impl StorageEngine {
                 self.set_coord(dst_path, dst_lc, p);
             }
             done += full_chunks as u64 * CHUNK_SIZE;
-            self.trace.dedup_shared_chunks += full_chunks as u64;
+            self.trace
+                .dedup_shared_chunks
+                .fetch_add(full_chunks as u64, Ordering::Relaxed);
         }
 
         if done < n {
@@ -2290,7 +2555,9 @@ impl StorageEngine {
             return self.write_dedup_full_chunks_gpu_staged(path, lc0, data);
         }
         let hashes = fnv1a_chunks(data);
-        self.trace.dedup_hash_chunks += n as u64;
+        self.trace
+            .dedup_hash_chunks
+            .fetch_add(n as u64, Ordering::Relaxed);
 
         // `--dedup-trust-hash` only: confirm the whole batch up front with one
         // GPU re-hash launch. The default byte-verifying mode confirms inside
@@ -2319,8 +2586,10 @@ impl StorageEngine {
                 self.vram
                     .write_at_async(chunk as u64 * CHUNK_SIZE, incoming),
             )?;
-            self.trace.raw_write_ops += 1;
-            self.trace.raw_write_bytes += CHUNK_SIZE;
+            self.trace.raw_write_ops.fetch_add(1, Ordering::Relaxed);
+            self.trace
+                .raw_write_bytes
+                .fetch_add(CHUNK_SIZE, Ordering::Relaxed);
             wrote = true;
             if !matches!(old, Some(Placement::Raw { chunk: c }) if c == chunk) {
                 if let Some(old) = old {
@@ -2329,7 +2598,9 @@ impl StorageEngine {
             }
             self.set_coord(path, lc, Some(Placement::Raw { chunk }));
             indexed_writes.push((chunk, hashes[i]));
-            self.trace.dedup_unique_chunks += 1;
+            self.trace
+                .dedup_unique_chunks
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         if wrote {
@@ -2362,8 +2633,10 @@ impl StorageEngine {
                 self.vram
                     .write_at(start as u64 * CHUNK_SIZE, &data[data_off..data_off + bytes]),
             )?;
-            self.trace.raw_write_ops += 1;
-            self.trace.raw_write_bytes += bytes as u64;
+            self.trace.raw_write_ops.fetch_add(1, Ordering::Relaxed);
+            self.trace
+                .raw_write_bytes
+                .fetch_add(bytes as u64, Ordering::Relaxed);
             for k in 0..got {
                 let chunk = start + k as u32;
                 self.refcount[chunk as usize] = 1;
@@ -2381,8 +2654,12 @@ impl StorageEngine {
             .as_mut()
             .expect("gpu_hasher present when dedup");
         cuda(hasher.hash_chunks(base, &offsets, &mut hashes))?;
-        self.trace.gpu_hash_chunks += hashes.len() as u64;
-        self.trace.dedup_unique_chunks += hashes.len() as u64;
+        self.trace
+            .gpu_hash_chunks
+            .fetch_add(hashes.len() as u64, Ordering::Relaxed);
+        self.trace
+            .dedup_unique_chunks
+            .fetch_add(hashes.len() as u64, Ordering::Relaxed);
         for (chunk, h) in chunks.into_iter().zip(hashes.into_iter()) {
             self.index_insert(chunk, h);
         }
@@ -2438,8 +2715,10 @@ impl StorageEngine {
                         self.vram
                             .write_at(start as u64 * cs, &data[data_off..data_off + bytes]),
                     )?;
-                    self.trace.raw_write_ops += 1;
-                    self.trace.raw_write_bytes += bytes as u64;
+                    self.trace.raw_write_ops.fetch_add(1, Ordering::Relaxed);
+                    self.trace
+                        .raw_write_bytes
+                        .fetch_add(bytes as u64, Ordering::Relaxed);
                     for k in 0..count {
                         self.set_coord(
                             path,
@@ -2468,8 +2747,10 @@ impl StorageEngine {
                         self.vram
                             .write_at(chunk as u64 * cs, &data[data_off..data_off + bytes]),
                     )?;
-                    self.trace.raw_write_ops += 1;
-                    self.trace.raw_write_bytes += bytes as u64;
+                    self.trace.raw_write_ops.fetch_add(1, Ordering::Relaxed);
+                    self.trace
+                        .raw_write_bytes
+                        .fetch_add(bytes as u64, Ordering::Relaxed);
                     j += count;
                 }
                 Some(Placement::Compressed { .. }) => {
@@ -2567,7 +2848,9 @@ impl StorageEngine {
                     let full = &group[k * cs as usize..(k + 1) * cs as usize];
                     let old = self.coord(path, lc);
                     self.write_raw_compress_fallback(path, lc, full, old, None)?;
-                    self.trace.compress_raw_fallback_chunks += 1;
+                    self.trace
+                        .compress_raw_fallback_chunks
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 j += m;
                 continue;
@@ -2580,8 +2863,10 @@ impl StorageEngine {
                 let slots: Vec<u64> = (0..m).map(|k| codec.comp_slot_ptr(k)).collect();
                 (sizes, slots)
             };
-            self.trace.compress_batches += 1;
-            self.trace.compress_chunks += m as u64;
+            self.trace.compress_batches.fetch_add(1, Ordering::Relaxed);
+            self.trace
+                .compress_chunks
+                .fetch_add(m as u64, Ordering::Relaxed);
 
             for k in 0..m {
                 let lc = lc0 + j + k;
@@ -2606,7 +2891,9 @@ impl StorageEngine {
                     }
                     None => {
                         self.write_raw_compress_fallback(path, lc, full, old, None)?;
-                        self.trace.compress_raw_fallback_chunks += 1;
+                        self.trace
+                            .compress_raw_fallback_chunks
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -2664,7 +2951,9 @@ impl StorageEngine {
             let g0 = mid_off + j * cs as usize;
             let group = &data[g0..g0 + m * cs as usize];
             let hashes = fnv1a_chunks(group);
-            self.trace.dedup_hash_chunks += m as u64;
+            self.trace
+                .dedup_hash_chunks
+                .fetch_add(m as u64, Ordering::Relaxed);
 
             // `--dedup-trust-hash` only: one batched GPU re-hash confirms the
             // whole group. Byte verification instead compares each candidate's
@@ -2698,8 +2987,12 @@ impl StorageEngine {
                         old,
                         Some(h),
                     )?;
-                    self.trace.compress_raw_fallback_chunks += 1;
-                    self.trace.dedup_unique_chunks += 1;
+                    self.trace
+                        .compress_raw_fallback_chunks
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.trace
+                        .dedup_unique_chunks
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 // `miss_buf` is dropped at the end of this iteration, but the
                 // fallback writes above were enqueued async *from* it — flush
@@ -2716,8 +3009,10 @@ impl StorageEngine {
                 let slots: Vec<u64> = (0..miss_count).map(|k| codec.comp_slot_ptr(k)).collect();
                 (sizes, slots)
             };
-            self.trace.compress_batches += 1;
-            self.trace.compress_chunks += miss_count as u64;
+            self.trace.compress_batches.fetch_add(1, Ordering::Relaxed);
+            self.trace
+                .compress_chunks
+                .fetch_add(miss_count as u64, Ordering::Relaxed);
 
             for (slot, &(_i, lc, old, h)) in misses.iter().enumerate() {
                 let s = slot * cs as usize;
@@ -2739,10 +3034,14 @@ impl StorageEngine {
                     }
                     None => {
                         self.write_raw_compress_fallback(path, lc, full, old, Some(h))?;
-                        self.trace.compress_raw_fallback_chunks += 1;
+                        self.trace
+                            .compress_raw_fallback_chunks
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                self.trace.dedup_unique_chunks += 1;
+                self.trace
+                    .dedup_unique_chunks
+                    .fetch_add(1, Ordering::Relaxed);
             }
             // Flush the arena copies and any raw-fallback writes enqueued from
             // this iteration's `miss_buf` before it is dropped/reused.
@@ -2778,8 +3077,10 @@ impl StorageEngine {
             _ => self.alloc.alloc_one().ok_or(EngineError::NoSpace)?,
         };
         cuda(self.vram.write_at_async(chunk as u64 * CHUNK_SIZE, full))?;
-        self.trace.raw_write_ops += 1;
-        self.trace.raw_write_bytes += CHUNK_SIZE;
+        self.trace.raw_write_ops.fetch_add(1, Ordering::Relaxed);
+        self.trace
+            .raw_write_bytes
+            .fetch_add(CHUNK_SIZE, Ordering::Relaxed);
         if !matches!(old, Some(Placement::Raw { chunk: c }) if c == chunk) {
             if let Some(p) = old {
                 self.free_placement(p);
@@ -2871,8 +3172,10 @@ impl StorageEngine {
             } else {
                 cuda(self.vram.write_at(base + in_off, sub))?;
             }
-            self.trace.raw_write_ops += 1;
-            self.trace.raw_write_bytes += sub.len() as u64;
+            self.trace.raw_write_ops.fetch_add(1, Ordering::Relaxed);
+            self.trace
+                .raw_write_bytes
+                .fetch_add(sub.len() as u64, Ordering::Relaxed);
             if fresh {
                 self.set_coord(path, lc, Some(Placement::Raw { chunk }));
             }
@@ -2883,8 +3186,10 @@ impl StorageEngine {
         // chunk is left out of the dedup index until it is next fully written.
         let chunk = self.make_exclusive(path, lc)?;
         cuda(self.vram.write_at(chunk as u64 * CHUNK_SIZE + in_off, sub))?;
-        self.trace.raw_write_ops += 1;
-        self.trace.raw_write_bytes += sub.len() as u64;
+        self.trace.raw_write_ops.fetch_add(1, Ordering::Relaxed);
+        self.trace
+            .raw_write_bytes
+            .fetch_add(sub.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -3295,8 +3600,10 @@ impl StorageEngine {
             .checked_add(data.len() as u64)
             .ok_or(EngineError::NoSpace)?;
         self.ensure_logical_len(path, end)?;
-        self.trace.write_calls += 1;
-        self.trace.logical_write_bytes += data.len() as u64;
+        self.trace.write_calls.fetch_add(1, Ordering::Relaxed);
+        self.trace
+            .logical_write_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
 
         let mut done = 0usize;
         let mut pos = offset;
@@ -3344,8 +3651,10 @@ impl StorageEngine {
         } else {
             cuda(self.vram.write_at(base + in_off, sub))?;
         }
-        self.trace.raw_write_ops += 1;
-        self.trace.raw_write_bytes += sub.len() as u64;
+        self.trace.raw_write_ops.fetch_add(1, Ordering::Relaxed);
+        self.trace
+            .raw_write_bytes
+            .fetch_add(sub.len() as u64, Ordering::Relaxed);
         if fresh {
             self.set_coord(path, lc, Some(Placement::Raw { chunk }));
         }
@@ -6250,9 +6559,10 @@ mod tests {
             b,
             "\\b must be untouched by the rejected share"
         );
-        assert_eq!(e.trace.dedup_rejected_chunks, 1);
+        assert_eq!(e.trace_snapshot().dedup_rejected_chunks, 1);
         assert_eq!(
-            e.trace.dedup_shared_chunks, 0,
+            e.trace_snapshot().dedup_shared_chunks,
+            0,
             "a rejected candidate must not be counted as shared"
         );
 
@@ -6291,8 +6601,8 @@ mod tests {
             "forged collision aliased \\c onto \\b's blob"
         );
         assert_eq!(e.read("\\b", 0, CHUNK_SIZE as usize).unwrap(), b);
-        assert_eq!(e.trace.dedup_rejected_chunks, 1);
-        assert_eq!(e.trace.dedup_shared_chunks, 0);
+        assert_eq!(e.trace_snapshot().dedup_rejected_chunks, 1);
+        assert_eq!(e.trace_snapshot().dedup_shared_chunks, 0);
     }
 
     #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
@@ -6354,8 +6664,8 @@ mod tests {
             Some(b_place),
             "trust-hash mode must share on the hash alone"
         );
-        assert_eq!(e.trace.dedup_shared_chunks, 1);
-        assert_eq!(e.trace.dedup_rejected_chunks, 0);
+        assert_eq!(e.trace_snapshot().dedup_shared_chunks, 1);
+        assert_eq!(e.trace_snapshot().dedup_rejected_chunks, 0);
         // ...and the flag really did cost correctness: \c reads \b's bytes.
         assert_eq!(e.read("\\c", 0, CHUNK_SIZE as usize).unwrap(), b);
 
@@ -6364,7 +6674,7 @@ mod tests {
         e.table_mut().create_file("\\d", 0).unwrap();
         e.write("\\d", 0, &a).unwrap();
         assert_eq!(e.read("\\d", 0, CHUNK_SIZE as usize).unwrap(), a);
-        assert_eq!(e.trace.dedup_rejected_chunks, 1);
+        assert_eq!(e.trace_snapshot().dedup_rejected_chunks, 1);
     }
 
     #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
@@ -6384,7 +6694,7 @@ mod tests {
             let after_first = e.used_chunks();
             assert_eq!(after_first, 4, "fixture should occupy four chunks");
 
-            let rehashes_before = e.trace.gpu_hash_chunks;
+            let rehashes_before = e.trace_snapshot().gpu_hash_chunks;
             e.write("\\f2", 0, &data).unwrap();
 
             assert_eq!(
@@ -6392,8 +6702,8 @@ mod tests {
                 after_first,
                 "batched duplicate write consumed extra chunks (verify={verify})"
             );
-            assert_eq!(e.trace.dedup_shared_chunks, 4);
-            assert_eq!(e.trace.dedup_rejected_chunks, 0);
+            assert_eq!(e.trace_snapshot().dedup_shared_chunks, 4);
+            assert_eq!(e.trace_snapshot().dedup_rejected_chunks, 0);
             assert_eq!(e.read("\\f1", 0, data.len()).unwrap(), data);
             assert_eq!(e.read("\\f2", 0, data.len()).unwrap(), data);
 
@@ -6403,7 +6713,7 @@ mod tests {
 
             // The two modes confirm by different means: only trust-hash runs
             // the batched GPU re-hash over the candidates.
-            let rehashed = e.trace.gpu_hash_chunks - rehashes_before;
+            let rehashed = e.trace_snapshot().gpu_hash_chunks - rehashes_before;
             if verify {
                 assert_eq!(rehashed, 0, "byte verification must not re-hash");
             } else {
@@ -6669,5 +6979,305 @@ mod tests {
             .map(|(name, _)| name.to_string())
             .collect();
         assert!(leftovers.is_empty(), "staging temp leaked: {leftovers:?}");
+    }
+
+    // ---- shared-guard read fast path ---------------------------------------
+
+    /// Position-derived byte pattern.
+    ///
+    /// Every offset gets a different value with a long period, so a read that
+    /// returns the right *number* of bytes from the wrong *place* (a shifted
+    /// run, a swapped chunk, a stale staging buffer from another thread) fails
+    /// the comparison. A constant fill would not catch any of those.
+    fn pattern_byte(i: usize) -> u8 {
+        ((i.wrapping_mul(131).wrapping_add(i / 977)) % 251) as u8
+    }
+
+    /// Create `path` of exactly `size` bytes, write `spans` into it, and return
+    /// the bytes the whole file must read back as. Everything outside `spans`
+    /// stays a sparse hole (or an unwritten part of a partially written chunk),
+    /// so the fixture deliberately mixes raw runs with holes.
+    fn mixed_raw_sparse_file(
+        e: &mut StorageEngine,
+        path: &str,
+        size: u64,
+        spans: &[(u64, usize)],
+    ) -> Vec<u8> {
+        e.table_mut().create_file(path, 0).unwrap();
+        e.set_size(path, size).unwrap();
+        let mut expected = vec![0u8; size as usize];
+        for &(off, len) in spans {
+            let data: Vec<u8> = (0..len).map(|j| pattern_byte(off as usize + j)).collect();
+            e.write(path, off, &data).unwrap();
+            expected[off as usize..off as usize + len].copy_from_slice(&data);
+        }
+        expected
+    }
+
+    /// The shared path must be indistinguishable from the exclusive one for
+    /// every raw/sparse read shape: inside one chunk, across several chunks,
+    /// across sparse holes, clamped at EOF, past EOF, and empty.
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn shared_read_matches_exclusive_read() {
+        let mut e = engine(16, false);
+        let path = "\\mixed";
+        let size = CHUNK_SIZE * 6 + 1234;
+        let expected = mixed_raw_sparse_file(
+            &mut e,
+            path,
+            size,
+            &[
+                (100, 5000),                               // partial chunk 0
+                (CHUNK_SIZE * 2, CHUNK_SIZE as usize * 2), // chunks 2..3, contiguous run
+                (CHUNK_SIZE * 5 + 77, 4096),               // partial chunk 5
+                (CHUNK_SIZE * 6, 1234),                    // tail chunk 6
+            ],
+        );
+        // chunks 1 and 4 were never written and stay sparse.
+        assert!(e.coord(path, 1).is_none(), "fixture must contain a hole");
+        assert!(e.coord(path, 4).is_none(), "fixture must contain a hole");
+
+        let cases: &[(u64, usize)] = &[
+            (0, 0),                                        // zero length
+            (0, 64),                                       // start of a raw chunk
+            (200, 10),                                     // inside one raw chunk
+            (5200, 300),                                   // inside chunk 0, past the written span
+            (CHUNK_SIZE + 10, 50),                         // inside a sparse hole
+            (0, CHUNK_SIZE as usize * 4),                  // raw, hole, raw, raw
+            (CHUNK_SIZE * 3 + 5, CHUNK_SIZE as usize * 3), // crosses the hole at chunk 4
+            (CHUNK_SIZE - 7, 14),                          // straddles a chunk boundary
+            (0, size as usize),                            // the whole file
+            (0, size as usize + 4096),                     // clamped at EOF
+            (size - 10, 100),                              // clamped at EOF from inside the tail
+            (size, 16),                                    // exactly at EOF
+            (size + CHUNK_SIZE * 10, 16),                  // far past EOF
+        ];
+
+        for &(off, len) in cases {
+            let mut shared = vec![0xA5u8; len];
+            let got = e
+                .read_into_shared(path, off, &mut shared)
+                .unwrap_or_else(|e| panic!("shared read off={off} len={len}: {e:?}"))
+                .unwrap_or_else(|| panic!("raw/sparse read off={off} len={len} must not bail out"));
+
+            let mut exclusive = vec![0x5Au8; len];
+            let want = e.read_into(path, off, &mut exclusive).unwrap();
+
+            assert_eq!(got, want, "byte count differs (off={off} len={len})");
+            assert_eq!(
+                &shared[..got],
+                &exclusive[..want],
+                "shared and exclusive reads differ (off={off} len={len})"
+            );
+            let lo = off.min(size) as usize;
+            assert_eq!(
+                &shared[..got],
+                &expected[lo..lo + got],
+                "shared read returned the wrong bytes (off={off} len={len})"
+            );
+            assert!(
+                shared[got..].iter().all(|&b| b == 0xA5),
+                "shared read wrote past the {got} bytes it reported (off={off} len={len})"
+            );
+        }
+    }
+
+    /// `$VRAMDISK\trace.json` must not start lying once reads stop taking the
+    /// exclusive guard, so the shared path has to move exactly the counters the
+    /// exclusive path would have moved, by exactly the same amounts.
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn shared_read_traces_identically_to_exclusive_read() {
+        let mut e = engine(16, false);
+        let path = "\\traced";
+        let size = CHUNK_SIZE * 5 + 99;
+        mixed_raw_sparse_file(
+            &mut e,
+            path,
+            size,
+            &[(0, CHUNK_SIZE as usize * 2), (CHUNK_SIZE * 4, 8192)],
+        );
+
+        let mut buf = vec![0u8; size as usize];
+
+        e.reset_trace();
+        e.read_into_shared(path, 0, &mut buf).unwrap().unwrap();
+        let shared = e.trace_snapshot();
+
+        e.reset_trace();
+        e.read_into(path, 0, &mut buf).unwrap();
+        let exclusive = e.trace_snapshot();
+
+        assert_eq!(shared, exclusive);
+        assert_eq!(shared.read_calls, 1);
+        assert_eq!(shared.logical_read_bytes, size);
+        assert!(shared.raw_read_bytes > 0, "fixture must exercise raw reads");
+    }
+
+    /// A compressed placement needs the nvCOMP codec's device scratch, which is
+    /// mutated per call, so the shared path must decline — and it must decline
+    /// having written nothing, since the caller's buffer is about to be reused
+    /// verbatim by the exclusive retry.
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn shared_read_bails_out_on_compressed_placement() {
+        let mut e = engine_compress(8);
+        let path = "\\compressible";
+        e.table_mut().create_file(path, 0).unwrap();
+        let data = vec![b'Q'; CHUNK_SIZE as usize * 2];
+        e.write(path, 0, &data).unwrap();
+        assert!(
+            matches!(e.coord(path, 0), Some(Placement::Compressed { .. })),
+            "fixture must actually be stored compressed"
+        );
+
+        e.reset_trace();
+        let mut buf = vec![0x5Au8; data.len()];
+        assert_eq!(e.read_into_shared(path, 0, &mut buf).unwrap(), None);
+        assert!(
+            buf.iter().all(|&b| b == 0x5A),
+            "a bail-out must leave the caller's buffer untouched"
+        );
+        assert_eq!(
+            e.trace_snapshot(),
+            EngineTrace::default(),
+            "a read that was not served must not be counted as one"
+        );
+
+        // A partially compressed read must bail too, not serve the raw prefix.
+        e.table_mut().create_file("\\partial", 0).unwrap();
+        e.set_size("\\partial", CHUNK_SIZE * 3).unwrap();
+        e.write(
+            "\\partial",
+            CHUNK_SIZE * 2,
+            &vec![b'Q'; CHUNK_SIZE as usize],
+        )
+        .unwrap();
+        let mut buf = vec![0x5Au8; (CHUNK_SIZE * 3) as usize];
+        assert_eq!(e.read_into_shared("\\partial", 0, &mut buf).unwrap(), None);
+        assert!(buf.iter().all(|&b| b == 0x5A));
+
+        // The exclusive fallback still serves what the shared path declined.
+        let n = e.read_into(path, 0, &mut buf[..data.len()]).unwrap();
+        assert_eq!(&buf[..n], &data[..]);
+    }
+
+    /// The bail-out keys on the *placement*, not on whether the volume has
+    /// compression enabled: a sparse hole on a compressing engine is still a
+    /// hole and still serviceable through a shared guard.
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn shared_read_serves_sparse_data_on_a_compressing_engine() {
+        let mut e = engine_compress(8);
+        let path = "\\holes";
+        e.table_mut().create_file(path, 0).unwrap();
+        e.set_size(path, CHUNK_SIZE * 3).unwrap();
+        let mut buf = vec![0xFFu8; (CHUNK_SIZE * 3) as usize];
+        let n = e
+            .read_into_shared(path, 0, &mut buf)
+            .unwrap()
+            .expect("an all-sparse file needs no exclusive access");
+        assert_eq!(n, (CHUNK_SIZE * 3) as usize);
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "sparse holes must read as zeros"
+        );
+    }
+
+    /// The point of the whole exercise: many threads inside the engine at once,
+    /// each holding only a shared guard, each getting its own bytes back.
+    ///
+    /// The reads deliberately overlap in the device ranges they touch and in
+    /// the sizes they use, so they contend for `Vram`'s pinned staging buffers
+    /// and its transfer streams. A shared-state bug in the read path — a
+    /// staging buffer handed to two threads, a stream synchronised by the wrong
+    /// one — shows up here as bytes from another thread's request.
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn shared_read_is_correct_under_concurrent_readers() {
+        use std::sync::{Arc, Barrier, RwLock};
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 24;
+
+        let mut e = engine(64, false);
+        let path = "\\concurrent";
+        let size = CHUNK_SIZE * 24 + 4096;
+        // Two long raw runs with sparse holes between them, so the coalescing
+        // walk has something to coalesce and something to stop at.
+        let expected = mixed_raw_sparse_file(
+            &mut e,
+            path,
+            size,
+            &[
+                (0, CHUNK_SIZE as usize * 8),
+                (CHUNK_SIZE * 10, CHUNK_SIZE as usize * 6),
+                (CHUNK_SIZE * 20 + 512, CHUNK_SIZE as usize * 4),
+            ],
+        );
+
+        e.reset_trace();
+        let engine = Arc::new(RwLock::new(e));
+        let expected = Arc::new(expected);
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for t in 0..THREADS {
+            let engine = Arc::clone(&engine);
+            let expected = Arc::clone(&expected);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for i in 0..ITERS {
+                    let off = ((t * 7919 + i * 4093) as u64 * 512) % size;
+                    let len = ((t + i) % 5 + 1) * (CHUNK_SIZE as usize / 2) + 333;
+                    let mut buf = vec![0xA5u8; len];
+
+                    let guard = engine.read().expect("engine read guard");
+                    let got = guard
+                        .read_into_shared(path, off, &mut buf)
+                        .expect("shared read failed")
+                        .expect("a raw/sparse file must never bail out");
+                    drop(guard);
+
+                    assert_eq!(
+                        got,
+                        ((size - off) as usize).min(len),
+                        "thread {t} iter {i}: wrong length for off={off} len={len}"
+                    );
+                    let want = &expected[off as usize..off as usize + got];
+                    if buf[..got] != *want {
+                        let bad = buf[..got]
+                            .iter()
+                            .zip(want)
+                            .position(|(a, b)| a != b)
+                            .expect("slices differ");
+                        panic!(
+                            "thread {t} iter {i}: off={off} len={len} byte {bad} is {:#04x}, \
+                             expected {:#04x}",
+                            buf[bad], want[bad]
+                        );
+                    }
+                    assert!(
+                        buf[got..].iter().all(|&b| b == 0xA5),
+                        "thread {t} iter {i}: wrote past the {got} reported bytes"
+                    );
+                }
+            }));
+        }
+
+        for (t, h) in handles.into_iter().enumerate() {
+            h.join()
+                .unwrap_or_else(|_| panic!("reader thread {t} panicked"));
+        }
+
+        // Every read is still accounted for, from every thread.
+        let trace = engine.read().unwrap().trace_snapshot();
+        assert_eq!(trace.read_calls, (THREADS * ITERS) as u64);
+        assert!(
+            trace.raw_read_ops > 0 && trace.logical_read_bytes > 0,
+            "concurrent shared reads must still land in the trace counters"
+        );
     }
 }

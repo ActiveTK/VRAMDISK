@@ -427,15 +427,28 @@ lock を手放す境界では、並行 writer によって window / batch 間で
 
 engine は `RwLock` で保護する。メタデータのみを読む callback（stat、
 ディレクトリ列挙、security 照会、volume 情報）は shared guard を取り、互いに
-並行して走る。状態を変更するもの、および唯一の CUDA stream に触れるものは
-exclusive guard を取り、これが現状データ I/O を直列化している。
+並行して走る。状態を変更するものは exclusive guard を取る。
+
+`read` callback はまず shared guard で `StorageEngine::read_into_shared` を
+試す。要求が触れる論理チャンクがすべて `Raw` またはスパース穴であれば、
+`Vram::read_at`（`&self` かつ内部で同期済み）だけで応答できるため、読み取りは
+互いに並行して走る。圧縮 placement を 1 つでも含む場合は、事前走査の段階で
+`Ok(None)` を返す（出力バッファには一切書き込まない）。呼び出し側は shared
+guard を解放してから exclusive guard を取り直し、ファイルを解決し直して
+`read_into` で再実行する。`RwLock` は再入不可であり、両方を同時に保持すると
+自スレッドで deadlock するため、この解放は必須である。
+
+trace カウンタは `AtomicU64` であり、shared guard 上の読み取りも exclusive
+path と同一に計上される（`trace_snapshot()` は従来通り plain `u64` の
+`EngineTrace` を返す）。
 
 Windows の `RwLock` は SRWLOCK であり fair ではないため、理屈の上では読み手が
 書き手を待たせ続け得る。WinFsp の dispatch thread 数は有界で、これらの callback
 は短時間で終わるため、実際には到達しない。
 
 より細かい粒度（ファイル単位・領域単位の lock と複数 CUDA stream の併用）は
-未実装である。read/write callback は依然として exclusive guard 上で直列化される。
+未実装である。write callback、および圧縮データを含む read は依然として
+exclusive guard 上で直列化される。
 
 ### open handle と rename
 

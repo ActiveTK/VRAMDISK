@@ -5,8 +5,14 @@
 //! state is protected by an `RwLock`. Metadata-only callbacks (stat, directory
 //! enumeration, security queries) take it shared and so run concurrently with
 //! each other; anything that mutates state or touches the single CUDA stream
-//! takes it exclusively, which is what still serialises data I/O until the
-//! engine grows finer region locks.
+//! takes it exclusively.
+//!
+//! `read` is the one data-path callback that can also run shared: raw and
+//! sparse placements are served by `StorageEngine::read_into_shared` under a
+//! read guard, so concurrent reads of an uncompressed volume overlap. It falls
+//! back to the exclusive guard when the request needs decompression. Writes
+//! (and reads of compressed data) still serialise until the engine grows finer
+//! region locks and more than one CUDA stream.
 //!
 //! Long-running jobs must not hold the exclusive guard for their whole
 //! duration -- that freezes every callback on the volume -- so the job
@@ -183,13 +189,15 @@ impl VramDiskFs {
     }
 
     /// Shared access, for the metadata-only callbacks (stat, directory
-    /// enumeration, security queries, volume info).
+    /// enumeration, security queries, volume info) and for the raw/sparse read
+    /// fast path.
     ///
-    /// Those used to queue behind every other callback on one mutex even
-    /// though they only read the namespace, so listing a large directory
-    /// serialised against every other stat on the volume. They now run
-    /// concurrently with each other; anything touching VRAM or the CUDA
-    /// stream still takes [`Self::engine`] exclusively.
+    /// The metadata callbacks used to queue behind every other callback on one
+    /// mutex even though they only read the namespace, so listing a large
+    /// directory serialised against every other stat on the volume. `read`
+    /// joins them whenever [`StorageEngine::read_into_shared`] can serve the
+    /// request; anything that mutates engine state, and any read that needs the
+    /// decompression codec, still takes [`Self::engine`] exclusively.
     ///
     /// `RwLock` on Windows wraps SRWLOCK, which is not a fair lock, so a
     /// sustained flood of metadata reads could in principle starve a writer.
@@ -1536,15 +1544,40 @@ impl FileSystemContext for VramDiskFs {
             buffer[..n].copy_from_slice(&data[off..off + n]);
             return Ok(n as u32);
         }
-        let mut engine = self.engine();
         let path = context.path();
+        // Fast path: raw and sparse data can be served through a shared guard,
+        // so concurrent reads of the volume actually run concurrently instead
+        // of queueing behind each other. `read_into_shared` yields `Ok(None)`
+        // (having written nothing) whenever the request needs exclusive access
+        // — today, any compressed placement in range.
+        //
+        // The shared guard must be released before taking the exclusive one:
+        // `RwLock` is not reentrant, so upgrading in place would deadlock the
+        // thread against itself. Hence the inner scope.
+        {
+            let engine = self.engine_shared();
+            let size = engine.get(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?.size;
+            if offset >= size {
+                return Err(STATUS_END_OF_FILE.into());
+            }
+            // Read straight into WinFsp's output buffer: the device-to-host
+            // copy lands in the final destination with no intermediate Vec
+            // allocation and no second memcpy back into `buffer`.
+            if let Some(n) = engine
+                .read_into_shared(&path, offset, buffer)
+                .map_err(map_engine_err)?
+            {
+                return Ok(n as u32);
+            }
+        }
+        // Fallback. The file is re-resolved from scratch under the exclusive
+        // guard rather than carrying size or placement state across the gap: a
+        // writer may have run in between, so anything observed above is stale.
+        let mut engine = self.engine();
         let size = engine.get(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?.size;
         if offset >= size {
             return Err(STATUS_END_OF_FILE.into());
         }
-        // Read straight into WinFsp's output buffer: the device-to-host copy
-        // lands in the final destination with no intermediate Vec allocation
-        // and no second memcpy back into `buffer`.
         let n = engine
             .read_into(&path, offset, buffer)
             .map_err(map_engine_err)?;

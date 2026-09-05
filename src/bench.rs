@@ -51,6 +51,7 @@ pub fn run(device: usize, vram_size: u64) -> Result<()> {
 
     bench_vram(device, vram_size)?;
     bench_engine(device, vram_size)?;
+    bench_engine_concurrent_read(device)?;
     bench_engine_dedup(device)?;
     bench_engine_compress(device)?;
     bench_compression(device)?;
@@ -475,6 +476,147 @@ fn bench_engine(device: usize, vram_size: u64) -> Result<()> {
     }
     println!();
     Ok(())
+}
+
+// ─── [2b] Concurrent read throughput ────────────────────────────────────────
+
+/// How much of the volume's read throughput was being lost to the engine lock.
+///
+/// Both columns run the *same* work — `THREADS` threads reading disjoint
+/// stripes of one raw file, in lockstep behind a barrier — and differ only in
+/// which guard they take:
+///
+/// * `shared`: an `RwLock` read guard plus `read_into_shared`, so the threads
+///   are inside the engine simultaneously and overlap their device-to-host
+///   copies across `Vram`'s transfer streams;
+/// * `exclusive`: an `RwLock` write guard plus `read_into`, which is what every
+///   read did before the fast path existed — one reader at a time.
+///
+/// The reported figure is aggregate throughput: total bytes moved by all
+/// threads divided by the wall time from the barrier to the last join.
+///
+/// The rows vary the per-call block size, because that — not the file size —
+/// decides how much there is to win. `Vram::read_at` already fans a *single*
+/// large transfer out over all of its transfer streams, so one reader with a
+/// big block already keeps the link busy and concurrency mostly buys back the
+/// serial work around the copy (the host-register/unregister pair, the
+/// placement walk, the default-stream fence). Below the optimized-transfer
+/// threshold the copy goes down the shared default stream instead, where there
+/// is nothing to overlap at all — so the small-block row is expected to sit at
+/// roughly 1.00x, and it is kept in the table precisely to show that the win
+/// comes from real transfer overlap and not from measurement noise.
+fn bench_engine_concurrent_read(device: usize) -> Result<()> {
+    use std::sync::RwLock;
+
+    const THREADS: usize = 8;
+    const SIZE: u64 = 256 * 1024 * 1024;
+    const BLOCKS: &[usize] = &[64 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024];
+
+    println!(
+        "[2b] Concurrent Read Throughput  ({THREADS} threads, {}, avg of {RUNS} runs)",
+        format_size(SIZE)
+    );
+    println!(
+        "    {:<12} {:>16} {:>16} {:>10}",
+        "Block", "Exclusive", "Shared", "Speedup"
+    );
+    println!("    {}", "─".repeat(58));
+
+    let vram = match Vram::new(device, SIZE + 4 * CHUNK_SIZE) {
+        Ok(v) => v,
+        Err(_) => {
+            println!("    (skipped: cannot allocate VRAM)\n");
+            return Ok(());
+        }
+    };
+    let mut engine = StorageEngine::new(vram, false, false)?;
+    engine.table_mut().create_file("\\bench", 0).unwrap();
+    let data: Vec<u8> = (0..SIZE as usize).map(|i| i as u8).collect();
+    engine
+        .write("\\bench", 0, &data)
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    drop(data);
+    let engine = Arc::new(RwLock::new(engine));
+
+    for &block in BLOCKS {
+        // Warm-up: prime the CUDA context binding on every worker thread and
+        // the pinned staging buffers, so the first timed run isn't paying for
+        // one-off setup.
+        concurrent_read_pass(&engine, SIZE, THREADS, block, true)?;
+        concurrent_read_pass(&engine, SIZE, THREADS, block, false)?;
+
+        let mut shared = Vec::with_capacity(RUNS);
+        let mut exclusive = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            exclusive.push(concurrent_read_pass(&engine, SIZE, THREADS, block, false)?);
+            shared.push(concurrent_read_pass(&engine, SIZE, THREADS, block, true)?);
+        }
+
+        let ex = avg(&exclusive);
+        let sh = avg(&shared);
+        println!(
+            "    {:<12} {:>16} {:>16} {:>10}",
+            format_size(block as u64),
+            throughput(SIZE, ex),
+            throughput(SIZE, sh),
+            format!("{:.2}x", ex.as_secs_f64() / sh.as_secs_f64()),
+        );
+    }
+    println!();
+    Ok(())
+}
+
+/// One pass: `threads` workers read disjoint stripes of `\bench` totalling
+/// `size` bytes and the wall time of the whole pass is returned.
+///
+/// `shared` selects the guard, which is the only difference between the two
+/// columns of [`bench_engine_concurrent_read`].
+fn concurrent_read_pass(
+    engine: &Arc<std::sync::RwLock<StorageEngine>>,
+    size: u64,
+    threads: usize,
+    block: usize,
+    shared: bool,
+) -> Result<Duration> {
+    let stripe = size.div_ceil(threads as u64);
+    let barrier = Arc::new(Barrier::new(threads + 1));
+    let mut handles = Vec::with_capacity(threads);
+
+    for t in 0..threads {
+        let engine = Arc::clone(engine);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let start = t as u64 * stripe;
+            let end = (start + stripe).min(size);
+            let mut buf = vec![0u8; block];
+            barrier.wait();
+            let mut off = start;
+            while off < end {
+                let take = ((end - off) as usize).min(block);
+                if shared {
+                    let guard = engine.read().expect("engine read guard");
+                    guard
+                        .read_into_shared("\\bench", off, &mut buf[..take])
+                        .expect("shared read")
+                        .expect("raw file must take the shared path");
+                } else {
+                    let mut guard = engine.write().expect("engine write guard");
+                    guard
+                        .read_into("\\bench", off, &mut buf[..take])
+                        .expect("exclusive read");
+                }
+                off += take as u64;
+            }
+        }));
+    }
+
+    barrier.wait();
+    let t = Instant::now();
+    for h in handles {
+        h.join()
+            .map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
+    }
+    Ok(t.elapsed())
 }
 
 // ─── [2a] Deduplicated storage engine throughput ────────────────────────────

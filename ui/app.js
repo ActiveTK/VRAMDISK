@@ -78,7 +78,6 @@ const I18N = {
     noCudaOption: "CUDA デバイスが見つかりません",
     noGpuError:
       "NVIDIA GPU と CUDA ドライバが見つかりません。ドライバを更新して再起動してください。",
-    sizeDefaultHint: "空欄で {0}",
     sizePlaceholder: "既定",
     sizeInvalid: "サイズが不正です",
     sizeTooBig: "サイズが GPU の VRAM 容量 ({0}) を超えています",
@@ -109,8 +108,6 @@ const I18N = {
     exportFail: "保存できません: {0}",
     exportPartial: "{0} 件を保存できませんでした。データを失わないよう、そのままにしました。",
     exportMoreFailures: "ほか {0} 件",
-    badgeCompress: "圧縮",
-    badgeDedup: "共有",
     usageUsed: "使用 {0} / {1}",
     interrupted: "アンマウントされたため中断しました",
     jobStatusFail: "失敗: ジョブの状態を確認できません",
@@ -200,7 +197,6 @@ const I18N = {
     noCudaOption: "No CUDA device found",
     noGpuError:
       "No NVIDIA GPU / CUDA driver found. Update the driver and restart.",
-    sizeDefaultHint: "Leave empty for {0}",
     sizePlaceholder: "default",
     sizeInvalid: "Invalid size",
     sizeTooBig: "Size exceeds the GPU's VRAM ({0})",
@@ -231,8 +227,6 @@ const I18N = {
     exportFail: "Could not save: {0}",
     exportPartial: "{0} item(s) could not be saved, so nothing was discarded.",
     exportMoreFailures: "{0} more",
-    badgeCompress: "compressed",
-    badgeDedup: "dedup",
     usageUsed: "{0} of {1} used",
     interrupted: "Interrupted by unmount",
     jobStatusFail: "Failed: cannot read the job's status",
@@ -303,7 +297,6 @@ function applyLanguage() {
     node.setAttribute("aria-label", t(node.dataset.i18nLabel));
   }
   el("size-value").placeholder = t("sizePlaceholder");
-  updateSizeHint();
   applyNvcompAvailability(nvcompOk);
   setArchiveMode(archiveMode());
   setEncodeDirection(encodeDirection(), { keepOutput: true });
@@ -431,7 +424,6 @@ async function loadDevices() {
     const match = Array.from(sel.options).find((o) => o.value === String(saved.device));
     if (match) sel.value = String(saved.device);
   }
-  updateSizeHint();
   validateSizeField();
 }
 
@@ -457,13 +449,6 @@ async function loadFreeDrives() {
   } else if (drives.includes("R:")) {
     sel.value = "R:";
   }
-}
-
-function updateSizeHint() {
-  const sel = el("device");
-  const opt = sel.options[sel.selectedIndex];
-  const def = opt && opt.dataset.default ? Number(opt.dataset.default) : null;
-  el("size-default-hint").textContent = def ? t("sizeDefaultHint", formatSize(def)) : "";
 }
 
 // Re-checks the size field against the selected GPU's total VRAM whenever
@@ -586,7 +571,6 @@ function applyCliOverrides(ov) {
     const value = String(ov.device);
     if (Array.from(el("device").options).some((o) => o.value === value)) {
       el("device").value = value;
-      updateSizeHint();
     }
   }
 }
@@ -782,10 +766,7 @@ function renderMountedHead(status) {
   drive.classList.toggle("long", status.mount_point.length > 5);
   const name = gpuName(status.device);
   const gpuLabel = name ? name : `GPU ${status.device}`;
-  el("mounted-sub").textContent =
-    `${gpuLabel} · ${formatSize(status.size)}` +
-    (status.compress ? ` · ${t("badgeCompress")}` : "") +
-    (status.dedup ? ` · ${t("badgeDedup")}` : "");
+  el("mounted-sub").textContent = `${gpuLabel} · ${formatSize(status.size)}`;
 }
 
 function renderStats(stats) {
@@ -1238,7 +1219,6 @@ async function boot() {
     if (ev.key === "Escape" && !el("teardown-backdrop").hidden) closeTeardown();
   });
   el("device").addEventListener("change", () => {
-    updateSizeHint();
     validateSizeField();
   });
   el("size-value").addEventListener("input", validateSizeField);

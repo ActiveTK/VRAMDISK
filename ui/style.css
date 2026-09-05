@@ -29,6 +29,13 @@
   box-sizing: border-box;
 }
 
+/* The `hidden` attribute must always win over any element's own `display`
+   rule (e.g. `.job-row { display: flex }`) -- author rules otherwise beat the
+   UA stylesheet's [hidden]{display:none} regardless of specificity. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   height: 100%;
