@@ -194,7 +194,7 @@ impl Vram {
     /// kernel to address the buffer directly without a separate cudarc view.
     pub fn buf_device_ptr(&self) -> u64 {
         let (ptr, _guard) = self.buf.device_ptr(&self.stream);
-        ptr as u64
+        ptr
     }
 
     /// Bind the primary context to the calling thread. Required before any

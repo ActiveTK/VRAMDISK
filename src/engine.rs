@@ -48,13 +48,14 @@ pub(crate) const CPU_HASH_WINDOW_BYTES: usize = 32 * 1024 * 1024;
 ///   - launch budget targets ~100 ms per kernel to stay well below Windows TDR
 ///   - CPU routing threshold targets ~250 ms, above which a single stream is
 ///     better left to SHA-NI/AVX2 on CPU
+///
 /// Hard clamps keep behavior stable on unusually slow/fast devices.
-const GPU_HASH_CALIBRATION_BYTES: u64 = 1 * 1024 * 1024;
+const GPU_HASH_CALIBRATION_BYTES: u64 = 1_048_576; // 1 MiB
 const GPU_HASH_LAUNCH_TARGET_SECS: f64 = 0.10;
 const GPU_HASH_ROUTE_TARGET_SECS: f64 = 0.25;
 const GPU_HASH_LAUNCH_BUDGET_MIN_BYTES: u64 = 4 * 1024 * 1024;
 const GPU_HASH_LAUNCH_BUDGET_MAX_BYTES: u64 = 512 * 1024 * 1024;
-const GPU_HASH_ROUTE_THRESHOLD_MIN_BYTES: u64 = 1 * 1024 * 1024;
+const GPU_HASH_ROUTE_THRESHOLD_MIN_BYTES: u64 = 1_048_576; // 1 MiB
 const GPU_HASH_ROUTE_THRESHOLD_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -87,8 +88,9 @@ fn calibration_from_throughput(
     sample_elapsed_secs: f64,
     throughput_bytes_per_sec: f64,
 ) -> GpuHashCalibration {
-    let launch_budget_bytes =
-        clamp_gpu_hash_launch_budget((throughput_bytes_per_sec * GPU_HASH_LAUNCH_TARGET_SECS) as u64);
+    let launch_budget_bytes = clamp_gpu_hash_launch_budget(
+        (throughput_bytes_per_sec * GPU_HASH_LAUNCH_TARGET_SECS) as u64,
+    );
     let cpu_route_threshold_bytes = clamp_hash_cpu_route_threshold(
         (throughput_bytes_per_sec * GPU_HASH_ROUTE_TARGET_SECS) as u64,
     );
@@ -164,17 +166,52 @@ fn group_looks_incompressible(group: &[u8], chunks: usize) -> bool {
     high_entropy == seen.len()
 }
 
+/// Everything `StorageEngine` can fail with.
+///
+/// The taxonomy exists so the WinFsp layer can pick an `NTSTATUS` and the Jobs
+/// API can pick a message without inspecting the error string: the variant
+/// alone says whether the caller handed us bad data (`InvalidInput`), asked for
+/// something this build deliberately does not do (`Unsupported`), hit a
+/// resource wall (`NoSpace` / `OutOfVram`), or tripped over an engine bug
+/// (`Internal`). Only genuine driver and kernel failures are `Cuda`.
 #[derive(Debug)]
 pub enum EngineError {
+    /// Namespace lookup failure (missing path, wrong node type, ...).
     Lookup(LookupError),
-    /// No free chunk available.
+    /// No free physical chunk: the volume is full.
     NoSpace,
+    /// Ran out of VRAM part-way through a job, with actionable advice.
+    ///
+    /// Distinct from `NoSpace` because a job can exhaust VRAM while staging
+    /// temporary buffers even on a volume that is not itself full, and the
+    /// remedy the user needs to hear differs.
+    OutOfVram(String),
     /// Operation expected a file but found a directory.
     NotAFile,
     /// Cooperative cancellation requested by the caller.
     Cancelled,
-    /// Underlying CUDA failure.
-    Cuda(#[allow(dead_code)] String),
+    /// Underlying CUDA driver or kernel failure.
+    ///
+    /// Produced only by [`cuda`], which wraps a real `cuda`/nvCOMP result. A
+    /// parse or validation failure must never land here: users read "CUDA
+    /// error" as "my GPU is broken", which sends them debugging the wrong
+    /// thing.
+    Cuda(String),
+    /// Caller-supplied data or parameters were malformed.
+    ///
+    /// Covers archive framing that does not parse, non-ASCII/non-UTF-8 paths,
+    /// bad base64/hex, and values that overflow an on-disk field. Retrying
+    /// will not help; the input has to change.
+    InvalidInput(String),
+    /// A well-formed request the engine deliberately cannot serve
+    /// (missing nvCOMP, unimplemented placement, ...).
+    ///
+    /// The input is fine — this build or this mount configuration simply has
+    /// no path for it, so the message names the missing capability.
+    Unsupported(String),
+    /// An engine invariant was violated — internally stored data did not
+    /// round-trip. Indicates a bug or memory corruption, not bad input.
+    Internal(String),
 }
 
 impl From<LookupError> for EngineError {
@@ -182,6 +219,39 @@ impl From<LookupError> for EngineError {
         EngineError::Lookup(e)
     }
 }
+
+impl std::fmt::Display for EngineError {
+    /// One clean English line per error, with no variant name and no Rust
+    /// quoting, because these strings are surfaced verbatim in `result.json`
+    /// and in the GUI. `InvalidInput` and `Unsupported` messages are already
+    /// written as complete sentences, so they render bare; the others get the
+    /// minimum prefix needed to make the sentence stand on its own.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // `LookupError` lives in a module that has no `Display` of its
+            // own, so the human phrasing is spelled out here rather than
+            // leaking `NotADirectory`-style Debug output to the user.
+            EngineError::Lookup(e) => match e {
+                LookupError::NotFound => f.write_str("path not found"),
+                LookupError::AlreadyExists => f.write_str("path already exists"),
+                LookupError::NotADirectory => f.write_str("path is not a directory"),
+                LookupError::IsADirectory => f.write_str("path is a directory"),
+                LookupError::NotEmpty => f.write_str("directory is not empty"),
+                LookupError::InvalidName => f.write_str("invalid path name"),
+            },
+            EngineError::NoSpace => f.write_str("no free space left on the VRAM disk"),
+            EngineError::OutOfVram(msg) => f.write_str(msg),
+            EngineError::NotAFile => f.write_str("path is not a file"),
+            EngineError::Cancelled => f.write_str("cancelled"),
+            EngineError::Cuda(msg) => write!(f, "CUDA error: {msg}"),
+            EngineError::InvalidInput(msg) => f.write_str(msg),
+            EngineError::Unsupported(msg) => f.write_str(msg),
+            EngineError::Internal(msg) => write!(f, "internal error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
 
 pub type EResult<T> = Result<T, EngineError>;
 
@@ -194,7 +264,7 @@ fn cancelled<T>() -> EResult<T> {
 }
 
 fn archive_vram_exhausted(detail: &str) -> EngineError {
-    EngineError::Cuda(format!(
+    EngineError::OutOfVram(format!(
         "archive job needs more free VRAM to {detail}; free space, use a larger mount, or retry on an uncompressed mount"
     ))
 }
@@ -377,7 +447,7 @@ pub struct EncodeJobStats {
 /// padding is legal. Returns the 1–3 decoded bytes.
 fn decode_base64_quad(quad: &[u8]) -> EResult<Vec<u8>> {
     if quad.len() != 4 {
-        return Err(EngineError::Cuda("truncated base64 group".into()));
+        return Err(EngineError::InvalidInput("truncated base64 group".into()));
     }
     fn val(c: u8) -> EResult<u32> {
         match c {
@@ -386,7 +456,7 @@ fn decode_base64_quad(quad: &[u8]) -> EResult<Vec<u8>> {
             b'0'..=b'9' => Ok((c - b'0') as u32 + 52),
             b'+' => Ok(62),
             b'/' => Ok(63),
-            _ => Err(EngineError::Cuda(format!(
+            _ => Err(EngineError::InvalidInput(format!(
                 "invalid base64 character 0x{c:02x}"
             ))),
         }
@@ -394,7 +464,7 @@ fn decode_base64_quad(quad: &[u8]) -> EResult<Vec<u8>> {
     let pads = match (quad[2], quad[3]) {
         (b'=', b'=') => 2,
         (b'=', _) => {
-            return Err(EngineError::Cuda(
+            return Err(EngineError::InvalidInput(
                 "invalid base64 padding: '=' may only end the data".into(),
             ))
         }
@@ -1069,18 +1139,17 @@ impl StorageEngine {
         let full = match codec {
             Codec::Lz4 => {
                 let lz4 = self.codec.as_mut().ok_or_else(|| {
-                    EngineError::Cuda("LZ4 chunk without nvCOMP codec".into())
+                    EngineError::Unsupported("LZ4 chunk without nvCOMP codec".into())
                 })?;
                 cuda(lz4.decompress(&buf, CHUNK_SIZE as usize))?
             }
-            Codec::Zstd => {
-                zstd::decode_all(buf.as_slice()).map_err(|e| EngineError::Cuda(e.to_string()))?
-            }
+            Codec::Zstd => zstd::decode_all(buf.as_slice())
+                .map_err(|e| EngineError::Internal(e.to_string()))?,
         };
         // Consumers slice/overwrite the result as a full chunk; a short or
         // oversized decode would panic or spill into a neighbouring chunk.
         if full.len() != CHUNK_SIZE as usize {
-            return Err(EngineError::Cuda(format!(
+            return Err(EngineError::Internal(format!(
                 "compressed blob decoded to {} bytes, expected {CHUNK_SIZE}",
                 full.len()
             )));
@@ -1177,8 +1246,7 @@ impl StorageEngine {
         Ok(node.coords.iter().all(|placement| {
             matches!(
                 placement,
-                None
-                    | Some(Placement::Raw { .. })
+                None | Some(Placement::Raw { .. })
                     | Some(Placement::Compressed {
                         codec: Codec::Lz4,
                         ..
@@ -1318,7 +1386,7 @@ impl StorageEngine {
                             Some(Placement::Compressed {
                                 codec: Codec::Zstd, ..
                             }) => {
-                                return Err(EngineError::Cuda(
+                                return Err(EngineError::Unsupported(
                                     "GPU-only hash is unavailable for CPU zstd fallback chunks"
                                         .into(),
                                 ));
@@ -1329,7 +1397,7 @@ impl StorageEngine {
 
                     let vram_base = self.vram_base;
                     let codec = self.codec.as_mut().ok_or_else(|| {
-                        EngineError::Cuda("LZ4 chunk without nvCOMP codec".into())
+                        EngineError::Unsupported("LZ4 chunk without nvCOMP codec".into())
                     })?;
                     cuda(codec.decompress_from_arena_dev(vram_base, &blobs))?;
 
@@ -1346,7 +1414,7 @@ impl StorageEngine {
                 Some(Placement::Compressed {
                     codec: Codec::Zstd, ..
                 }) => {
-                    return Err(EngineError::Cuda(
+                    return Err(EngineError::Unsupported(
                         "GPU-only hash is unavailable for CPU zstd fallback chunks".into(),
                     ));
                 }
@@ -1745,7 +1813,7 @@ impl StorageEngine {
                 .expect("nvCOMP codec present for Lz4 placements");
             let pieces = cuda(codec.decompress_from_arena_slices(base, &requests))?;
             if pieces.len() != pending.len() {
-                return Err(EngineError::Cuda(format!(
+                return Err(EngineError::Internal(format!(
                     "decompress returned {} pieces for {} requests",
                     pieces.len(),
                     pending.len()
@@ -2166,7 +2234,7 @@ impl StorageEngine {
                     j += count;
                 }
                 Some(Placement::Compressed { .. }) => {
-                    return Err(EngineError::Cuda(
+                    return Err(EngineError::Internal(
                         "compressed placement in raw writer".into(),
                     ));
                 }
@@ -2588,7 +2656,9 @@ impl StorageEngine {
             let (chunk, fresh) = match existing {
                 Some(Placement::Raw { chunk }) => (chunk, false),
                 Some(Placement::Compressed { .. }) => {
-                    return Err(EngineError::Cuda("compressed write not implemented".into()));
+                    return Err(EngineError::Unsupported(
+                        "compressed write not implemented".into(),
+                    ));
                 }
                 None => (self.alloc_chunk()?, true),
             };
@@ -2860,7 +2930,12 @@ impl StorageEngine {
             let start = Instant::now();
             let archive = crate::lookup::normalize(archive);
             if format == NvcompFrameCodec::Deflate {
-                return self.archive_zip_extract_gpu(&archive, output_dir, start, &mut should_cancel);
+                return self.archive_zip_extract_gpu(
+                    &archive,
+                    output_dir,
+                    start,
+                    &mut should_cancel,
+                );
             }
             let archive_size = {
                 let node = self.table.get(&archive).ok_or(LookupError::NotFound)?;
@@ -2918,14 +2993,15 @@ impl StorageEngine {
                 }
                 let hdr = self.read(&tmp, pos, 512)?;
                 if hdr.len() < 512 {
-                    return Err(EngineError::Cuda("truncated tar header".into()));
+                    return Err(EngineError::InvalidInput("truncated tar header".into()));
                 }
                 if hdr.iter().all(|&b| b == 0) {
                     break;
                 }
                 let name_end = hdr[..100].iter().position(|&b| b == 0).unwrap_or(100);
-                let name = std::str::from_utf8(&hdr[..name_end])
-                    .map_err(|e| EngineError::Cuda(format!("invalid tar path UTF-8: {e}")))?;
+                let name = std::str::from_utf8(&hdr[..name_end]).map_err(|e| {
+                    EngineError::InvalidInput(format!("invalid tar path UTF-8: {e}"))
+                })?;
                 let size = parse_tar_octal(&hdr[124..136])?;
                 let out_path = join_archive_output(&out_base, name)?;
                 self.ensure_parent_dirs(&out_path)?;
@@ -3023,7 +3099,7 @@ impl StorageEngine {
         let (chunk, fresh) = match existing {
             Some(Placement::Raw { chunk }) => (chunk, false),
             Some(Placement::Compressed { .. }) => {
-                return Err(EngineError::Cuda(
+                return Err(EngineError::Internal(
                     "archive internal raw stream unexpectedly contains compressed placement".into(),
                 ));
             }
@@ -3094,7 +3170,7 @@ impl StorageEngine {
                     let slot_ptrs = {
                         let vram_base = self.vram_base;
                         let codec = self.codec.as_mut().ok_or_else(|| {
-                            EngineError::Cuda(
+                            EngineError::Unsupported(
                                 "archive job found an LZ4-compressed source chunk but nvCOMP LZ4 is unavailable".into(),
                             )
                         })?;
@@ -3263,7 +3339,7 @@ impl StorageEngine {
                     let slot_ptrs = {
                         let vram_base = self.vram_base;
                         let codec = self.codec.as_mut().ok_or_else(|| {
-                            EngineError::Cuda(
+                            EngineError::Unsupported(
                                 "archive job found an LZ4-compressed source chunk but nvCOMP LZ4 is unavailable".into(),
                             )
                         })?;
@@ -3357,9 +3433,10 @@ impl StorageEngine {
         let tail = len % CHUNK_SIZE;
         if tail != 0 {
             let last = start as u64 + chunks as u64 - 1;
-            cuda(self
-                .vram
-                .zero_at(last * CHUNK_SIZE + tail, CHUNK_SIZE - tail))?;
+            cuda(
+                self.vram
+                    .zero_at(last * CHUNK_SIZE + tail, CHUNK_SIZE - tail),
+            )?;
         }
         self.set_size(path, len)
     }
@@ -3390,7 +3467,9 @@ impl StorageEngine {
             }
             let name = path.trim_start_matches('\\').replace('\\', "/");
             if !name.is_ascii() {
-                return Err(EngineError::Cuda(format!("zip path must be ASCII: {name}")));
+                return Err(EngineError::InvalidInput(format!(
+                    "zip path must be ASCII: {name}"
+                )));
             }
             let crc = self.crc32_file_gpu(&path, size, should_cancel)?;
             planned.push((path, name, size, 0u64, crc));
@@ -3569,13 +3648,15 @@ impl StorageEngine {
                 break;
             }
             if sig != 0x0403_4b50 {
-                return Err(EngineError::Cuda(format!(
+                return Err(EngineError::InvalidInput(format!(
                     "unsupported zip signature {sig:08x} at {pos}"
                 )));
             }
             let hdr = self.read(archive, pos, 30)?;
             if hdr.len() < 30 {
-                return Err(EngineError::Cuda("truncated zip local header".into()));
+                return Err(EngineError::InvalidInput(
+                    "truncated zip local header".into(),
+                ));
             }
             let method = read_u16_le(&hdr[8..10]);
             let comp32 = read_u32_le(&hdr[18..22]);
@@ -3586,15 +3667,18 @@ impl StorageEngine {
             let extra = self.read(
                 archive,
                 pos + 30 + name_len,
-                usize::try_from(extra_len)
-                    .map_err(|_| EngineError::Cuda("zip extra length exceeds usize".into()))?,
+                usize::try_from(extra_len).map_err(|_| {
+                    EngineError::InvalidInput("zip extra length exceeds usize".into())
+                })?,
             )?;
             if name_bytes.len() as u64 != name_len || extra.len() as u64 != extra_len {
-                return Err(EngineError::Cuda("truncated zip local header fields".into()));
+                return Err(EngineError::InvalidInput(
+                    "truncated zip local header fields".into(),
+                ));
             }
             let (uncomp_size, comp_size) = zip_sizes_from_local_extra(uncomp32, comp32, &extra)?;
             let name = std::str::from_utf8(&name_bytes)
-                .map_err(|e| EngineError::Cuda(format!("invalid zip path UTF-8: {e}")))?;
+                .map_err(|e| EngineError::InvalidInput(format!("invalid zip path UTF-8: {e}")))?;
             let data_pos = pos + 30 + name_len + extra_len;
             let out_path = join_archive_output(&out_base, name)?;
             self.ensure_parent_dirs(&out_path)?;
@@ -3616,24 +3700,26 @@ impl StorageEngine {
                             archive, data_pos, comp_size, &out_path,
                         )?;
                         if written != uncomp_size {
-                            return Err(EngineError::Cuda(format!(
+                            return Err(EngineError::InvalidInput(format!(
                                 "zip stored-deflate size mismatch: expected {uncomp_size}, got {written}"
                             )));
                         }
                     } else {
                         self.extract_deflate_payload(
                             &mut deflate_codec,
-                            archive,
-                            data_pos,
-                            comp_size,
-                            &out_path,
-                            0,
-                            uncomp_size,
+                            PayloadSpan {
+                                src_path: archive,
+                                src_offset: data_pos,
+                                comp_len: comp_size,
+                                dst_path: &out_path,
+                                dst_offset: 0,
+                                out_len: uncomp_size,
+                            },
                         )?;
                     }
                 }
                 _ => {
-                    return Err(EngineError::Cuda(format!(
+                    return Err(EngineError::Unsupported(format!(
                         "unsupported zip compression method: {method}"
                     )));
                 }
@@ -3710,7 +3796,9 @@ impl StorageEngine {
     fn clear_zip_deflate_bfinal(&mut self, path: &str, offset: u64) -> EResult<()> {
         let mut b = self.read(path, offset, 1)?;
         if b.len() != 1 {
-            return Err(EngineError::Cuda("truncated deflate payload".into()));
+            return Err(EngineError::InvalidInput(
+                "truncated deflate payload".into(),
+            ));
         }
         b[0] &= !1;
         self.write_raw_internal(path, offset, &b)?;
@@ -3720,7 +3808,9 @@ impl StorageEngine {
     fn set_zip_deflate_bfinal(&mut self, path: &str, offset: u64) -> EResult<()> {
         let mut b = self.read(path, offset, 1)?;
         if b.len() != 1 {
-            return Err(EngineError::Cuda("truncated deflate payload".into()));
+            return Err(EngineError::InvalidInput(
+                "truncated deflate payload".into(),
+            ));
         }
         b[0] |= 1;
         self.write_raw_internal(path, offset, &b)?;
@@ -3764,7 +3854,7 @@ impl StorageEngine {
             }
         }
         if out_pos != out_len {
-            return Err(EngineError::Cuda(
+            return Err(EngineError::InvalidInput(
                 "ZIP Deflate chunk table ended early".into(),
             ));
         }
@@ -3803,12 +3893,12 @@ impl StorageEngine {
             // Build segments into a caller-owned struct, then release its temp
             // chunks whether or not the build or the kernel update succeeded.
             let mut materialized = ArchiveMaterializedSegments::default();
-            let built =
-                self.archive_crc32_segments(path, offset + done, take, &mut materialized);
+            let built = self.archive_crc32_segments(path, offset + done, take, &mut materialized);
             let update = built.and_then(|_| {
-                cuda(self
-                    .api_kernel()?
-                    .update_crc32_many(std::slice::from_ref(&materialized.segs)))
+                cuda(
+                    self.api_kernel()?
+                        .update_crc32_many(std::slice::from_ref(&materialized.segs)),
+                )
             });
             self.release_temp_chunks(std::mem::take(&mut materialized.temp_chunks));
             update?;
@@ -3825,16 +3915,18 @@ impl StorageEngine {
             Some(Placement::Raw { chunk }) => {
                 Ok(self.vram_base + chunk as u64 * CHUNK_SIZE + in_off)
             }
-            Some(Placement::Compressed { .. }) => Err(EngineError::Cuda(
+            Some(Placement::Compressed { .. }) => Err(EngineError::Unsupported(
                 "archive codec input currently requires raw placement".into(),
             )),
-            None => Err(EngineError::Cuda("archive codec input is sparse".into())),
+            None => Err(EngineError::Unsupported(
+                "archive codec input is sparse".into(),
+            )),
         }
     }
 
     fn raw_output_ptr(&mut self, path: &str, offset: u64, len: u64) -> EResult<u64> {
         if len > CHUNK_SIZE - (offset % CHUNK_SIZE) {
-            return Err(EngineError::Cuda(
+            return Err(EngineError::Unsupported(
                 "archive codec output slice crosses a chunk boundary".into(),
             ));
         }
@@ -3867,7 +3959,7 @@ impl StorageEngine {
                     kind: 0,
                 }),
                 Some(Placement::Compressed { .. }) => {
-                    return Err(EngineError::Cuda(
+                    return Err(EngineError::Unsupported(
                         "GPU batch hash currently requires raw/sparse placements".into(),
                     ));
                 }
@@ -3880,28 +3972,23 @@ impl StorageEngine {
     fn extract_deflate_payload(
         &mut self,
         codec: &mut NvcompBatchedCodec,
-        src_path: &str,
-        src_offset: u64,
-        comp_len: u64,
-        dst_path: &str,
-        dst_offset: u64,
-        out_len: u64,
+        span: PayloadSpan<'_>,
     ) -> EResult<()> {
         let tmp = format!(
             "\\.__vramdisk_deflate_src_{}",
             crate::lookup::now_filetime()
         );
         self.create_or_truncate_file(&tmp)?;
-        self.allocate_raw_file(&tmp, comp_len)?;
-        self.copy_file_payload_raw(src_path, src_offset, &tmp, 0, comp_len)?;
-        let src_ptr = self.contiguous_file_ptr(&tmp, comp_len)?;
-        let dst_ptr = if dst_offset == 0 {
-            self.allocate_raw_file(dst_path, out_len)?;
-            self.contiguous_file_ptr(dst_path, out_len)?
+        self.allocate_raw_file(&tmp, span.comp_len)?;
+        self.copy_file_payload_raw(span.src_path, span.src_offset, &tmp, 0, span.comp_len)?;
+        let src_ptr = self.contiguous_file_ptr(&tmp, span.comp_len)?;
+        let dst_ptr = if span.dst_offset == 0 {
+            self.allocate_raw_file(span.dst_path, span.out_len)?;
+            self.contiguous_file_ptr(span.dst_path, span.out_len)?
         } else {
-            self.raw_output_ptr(dst_path, dst_offset, out_len)?
+            self.raw_output_ptr(span.dst_path, span.dst_offset, span.out_len)?
         };
-        cuda(codec.decompress_device(&[src_ptr], &[comp_len], &[dst_ptr], &[out_len]))?;
+        cuda(codec.decompress_device(&[src_ptr], &[span.comp_len], &[dst_ptr], &[span.out_len]))?;
         let _ = self.remove(&tmp);
         Ok(())
     }
@@ -3909,20 +3996,15 @@ impl StorageEngine {
     fn extract_lz4_payload(
         &mut self,
         codec: &mut NvcompBatchedCodec,
-        src_path: &str,
-        src_offset: u64,
-        comp_len: u64,
-        dst_path: &str,
-        dst_offset: u64,
-        out_len: u64,
+        span: PayloadSpan<'_>,
     ) -> EResult<()> {
         let tmp = format!("\\.__vramdisk_lz4_src_{}", crate::lookup::now_filetime());
         self.create_or_truncate_file(&tmp)?;
-        self.allocate_raw_file(&tmp, comp_len)?;
-        self.copy_file_payload_raw(src_path, src_offset, &tmp, 0, comp_len)?;
-        let src_ptr = self.contiguous_file_ptr(&tmp, comp_len)?;
-        let dst_ptr = self.raw_output_ptr(dst_path, dst_offset, out_len)?;
-        cuda(codec.decompress_device(&[src_ptr], &[comp_len], &[dst_ptr], &[out_len]))?;
+        self.allocate_raw_file(&tmp, span.comp_len)?;
+        self.copy_file_payload_raw(span.src_path, span.src_offset, &tmp, 0, span.comp_len)?;
+        let src_ptr = self.contiguous_file_ptr(&tmp, span.comp_len)?;
+        let dst_ptr = self.raw_output_ptr(span.dst_path, span.dst_offset, span.out_len)?;
+        cuda(codec.decompress_device(&[src_ptr], &[span.comp_len], &[dst_ptr], &[span.out_len]))?;
         let _ = self.remove(&tmp);
         Ok(())
     }
@@ -4009,29 +4091,33 @@ impl StorageEngine {
         while src_pos < archive_size {
             let hdr = self.read(archive, src_pos, 10)?;
             if hdr.len() != 10 || hdr[0] != 0x1f || hdr[1] != 0x8b || hdr[2] != 8 {
-                return Err(EngineError::Cuda("unsupported gzip header".into()));
+                return Err(EngineError::InvalidInput("unsupported gzip header".into()));
             }
             if hdr[3] & 4 == 0 {
-                return Err(EngineError::Cuda(
+                return Err(EngineError::Unsupported(
                     "gzip member is missing VRAMDISK compressed-size extra field".into(),
                 ));
             }
             src_pos += 10;
             let xlen_buf = self.read(archive, src_pos, 2)?;
             if xlen_buf.len() < 2 {
-                return Err(EngineError::Cuda("truncated gzip extra length".into()));
+                return Err(EngineError::InvalidInput(
+                    "truncated gzip extra length".into(),
+                ));
             }
             let xlen = read_u16_le(&xlen_buf) as u64;
             src_pos += 2;
             let extra = self.read(archive, src_pos, xlen as usize)?;
             if extra.len() as u64 != xlen {
-                return Err(EngineError::Cuda("truncated gzip extra field".into()));
+                return Err(EngineError::InvalidInput(
+                    "truncated gzip extra field".into(),
+                ));
             }
             src_pos += xlen;
             let comp_len = gzip_extra_comp_len(&extra)?;
             let trailer_pos = src_pos + comp_len;
             if trailer_pos + 8 > archive_size {
-                return Err(EngineError::Cuda("truncated gzip member".into()));
+                return Err(EngineError::InvalidInput("truncated gzip member".into()));
             }
             let trailer = self.read(archive, trailer_pos, 8)?;
             let expected_crc = read_u32_le(&trailer[0..4]);
@@ -4039,17 +4125,19 @@ impl StorageEngine {
             if expected_size > 0 {
                 self.extract_deflate_payload(
                     &mut codec,
-                    archive,
-                    src_pos,
-                    comp_len,
-                    dst_path,
-                    out_pos,
-                    expected_size,
+                    PayloadSpan {
+                        src_path: archive,
+                        src_offset: src_pos,
+                        comp_len,
+                        dst_path,
+                        dst_offset: out_pos,
+                        out_len: expected_size,
+                    },
                 )?;
             }
             let actual_crc = self.crc32_range_gpu(dst_path, out_pos, expected_size)?;
             if actual_crc != expected_crc {
-                return Err(EngineError::Cuda("gzip CRC32 mismatch".into()));
+                return Err(EngineError::InvalidInput("gzip CRC32 mismatch".into()));
             }
             out_pos += expected_size;
             src_pos = trailer_pos + 8;
@@ -4120,13 +4208,20 @@ impl StorageEngine {
     ) -> EResult<u64> {
         let header = self.read(archive, 0, 15)?;
         if header.len() != 15 || read_u32_le(&header[0..4]) != 0x184d_2204 {
-            return Err(EngineError::Cuda("unsupported LZ4 frame header".into()));
+            return Err(EngineError::InvalidInput(
+                "unsupported LZ4 frame header".into(),
+            ));
         }
+        // A frame that does not carry a content size, or that uses a block size
+        // other than 64 KiB, is a perfectly valid LZ4 frame that this extractor
+        // simply cannot drive -- not a malformed one.
         if header[4] != 0x68 || header[5] != 0x40 {
-            return Err(EngineError::Cuda("unsupported LZ4 frame flags".into()));
+            return Err(EngineError::Unsupported(
+                "LZ4 frame must declare a content size and use 64 KiB blocks".into(),
+            ));
         }
         if lz4_header_checksum(&header[4..14]) != header[14] {
-            return Err(EngineError::Cuda(
+            return Err(EngineError::InvalidInput(
                 "LZ4 frame header checksum mismatch".into(),
             ));
         }
@@ -4148,23 +4243,37 @@ impl StorageEngine {
             let block_len = (marker & 0x7fff_ffff) as u64;
             let out_len = (total - out_pos).min(CHUNK_SIZE);
             if src_pos + block_len > archive_size {
-                return Err(EngineError::Cuda("truncated LZ4 frame block".into()));
+                return Err(EngineError::InvalidInput(
+                    "truncated LZ4 frame block".into(),
+                ));
             }
             if uncompressed {
                 if block_len != out_len {
-                    return Err(EngineError::Cuda("LZ4 raw block size mismatch".into()));
+                    return Err(EngineError::InvalidInput(
+                        "LZ4 raw block size mismatch".into(),
+                    ));
                 }
                 self.copy_file_payload_raw(archive, src_pos, dst_path, out_pos, out_len)?;
             } else {
                 self.extract_lz4_payload(
-                    &mut codec, archive, src_pos, block_len, dst_path, out_pos, out_len,
+                    &mut codec,
+                    PayloadSpan {
+                        src_path: archive,
+                        src_offset: src_pos,
+                        comp_len: block_len,
+                        dst_path,
+                        dst_offset: out_pos,
+                        out_len,
+                    },
                 )?;
             }
             src_pos += block_len;
             out_pos += out_len;
         }
         if out_pos != total {
-            return Err(EngineError::Cuda("LZ4 frame content size mismatch".into()));
+            return Err(EngineError::InvalidInput(
+                "LZ4 frame content size mismatch".into(),
+            ));
         }
         self.set_size(dst_path, total)?;
         Ok(total)
@@ -4218,21 +4327,25 @@ impl StorageEngine {
         while src_pos < end {
             let hdr = self.read(src_path, src_pos, 5)?;
             if hdr.len() != 5 {
-                return Err(EngineError::Cuda("truncated stored deflate block".into()));
+                return Err(EngineError::InvalidInput(
+                    "truncated stored deflate block".into(),
+                ));
             }
             if hdr[0] & 0b0000_0110 != 0 {
-                return Err(EngineError::Cuda(
+                return Err(EngineError::InvalidInput(
                     "expected a stored deflate block in ZIP fallback".into(),
                 ));
             }
             let len = u16::from_le_bytes([hdr[1], hdr[2]]) as u64;
             let nlen = u16::from_le_bytes([hdr[3], hdr[4]]);
             if nlen != !(len as u16) {
-                return Err(EngineError::Cuda("invalid stored deflate LEN/NLEN".into()));
+                return Err(EngineError::InvalidInput(
+                    "invalid stored deflate LEN/NLEN".into(),
+                ));
             }
             src_pos += 5;
             if src_pos + len > end {
-                return Err(EngineError::Cuda(
+                return Err(EngineError::InvalidInput(
                     "stored deflate block exceeds stream".into(),
                 ));
             }
@@ -4244,7 +4357,7 @@ impl StorageEngine {
             }
         }
         if src_pos != end {
-            return Err(EngineError::Cuda(
+            return Err(EngineError::InvalidInput(
                 "stored deflate stream length mismatch".into(),
             ));
         }
@@ -4254,7 +4367,7 @@ impl StorageEngine {
     fn ensure_raw_output_chunk(&mut self, path: &str, lc: usize) -> EResult<ChunkId> {
         match self.coord(path, lc) {
             Some(Placement::Raw { chunk }) => Ok(chunk),
-            Some(Placement::Compressed { .. }) => Err(EngineError::Cuda(
+            Some(Placement::Compressed { .. }) => Err(EngineError::Internal(
                 "archive output unexpectedly contains compressed placement".into(),
             )),
             None => {
@@ -4274,26 +4387,34 @@ impl StorageEngine {
         let first = match self.coord(path, 0) {
             Some(Placement::Raw { chunk }) => chunk,
             Some(Placement::Compressed { .. }) => {
-                return Err(EngineError::Cuda(
+                return Err(EngineError::Unsupported(
                     "archive temp stream must be raw and contiguous".into(),
                 ));
             }
-            None => return Err(EngineError::Cuda("archive temp stream is sparse".into())),
+            None => {
+                return Err(EngineError::Unsupported(
+                    "archive temp stream is sparse".into(),
+                ))
+            }
         };
         for lc in 0..chunks {
             match self.coord(path, lc) {
                 Some(Placement::Raw { chunk }) if chunk == first + lc as u32 => {}
                 Some(Placement::Raw { .. }) => {
-                    return Err(EngineError::Cuda(
+                    return Err(EngineError::Unsupported(
                         "archive temp stream is not physically contiguous".into(),
                     ));
                 }
                 Some(Placement::Compressed { .. }) => {
-                    return Err(EngineError::Cuda(
+                    return Err(EngineError::Unsupported(
                         "archive temp stream must be raw and contiguous".into(),
                     ));
                 }
-                None => return Err(EngineError::Cuda("archive temp stream is sparse".into())),
+                None => {
+                    return Err(EngineError::Unsupported(
+                        "archive temp stream is sparse".into(),
+                    ))
+                }
             }
         }
         Ok(self.vram_base + first as u64 * CHUNK_SIZE)
@@ -4357,7 +4478,7 @@ impl StorageEngine {
         let input = crate::lookup::normalize(input);
         let output = crate::lookup::normalize(output);
         if input == output {
-            return Err(EngineError::Cuda(
+            return Err(EngineError::InvalidInput(
                 "encode input and output must be different files".into(),
             ));
         }
@@ -4426,40 +4547,38 @@ impl StorageEngine {
         };
 
         // Validate decode alignment and work out the exact output length.
-        let (gpu_in_len, out_len, tail_host): (u64, u64, Option<Vec<u8>>) =
-            match (codec, direction) {
-                (EncodeCodec::Base64, EncodeDirection::Encode) => {
-                    (m, m.div_ceil(3) * 4, None)
+        let (gpu_in_len, out_len, tail_host): (u64, u64, Option<Vec<u8>>) = match (codec, direction)
+        {
+            (EncodeCodec::Base64, EncodeDirection::Encode) => (m, m.div_ceil(3) * 4, None),
+            (EncodeCodec::Hex, EncodeDirection::Encode) => (m, m * 2, None),
+            (EncodeCodec::Hex, EncodeDirection::Decode) => {
+                if m % 2 != 0 {
+                    return Err(EngineError::InvalidInput(
+                        "hex decode requires an even number of hex digits".into(),
+                    ));
                 }
-                (EncodeCodec::Hex, EncodeDirection::Encode) => (m, m * 2, None),
-                (EncodeCodec::Hex, EncodeDirection::Decode) => {
-                    if m % 2 != 0 {
-                        return Err(EngineError::Cuda(
-                            "hex decode requires an even number of hex digits".into(),
-                        ));
-                    }
-                    (m, m / 2, None)
-                }
-                (EncodeCodec::Base64, EncodeDirection::Decode) => {
-                    if m % 4 != 0 {
-                        return Err(EngineError::Cuda(
-                            "base64 decode requires input length to be a multiple of 4 \
+                (m, m / 2, None)
+            }
+            (EncodeCodec::Base64, EncodeDirection::Decode) => {
+                if m % 4 != 0 {
+                    return Err(EngineError::InvalidInput(
+                        "base64 decode requires input length to be a multiple of 4 \
                              (single-line base64 without embedded line breaks)"
-                                .into(),
-                        ));
-                    }
-                    if m == 0 {
-                        (0, 0, None)
-                    } else {
-                        // Decode the final (possibly '='-padded) group on the
-                        // host; the GPU handles only full non-padded groups.
-                        let last = self.read(input, m - 4, 4)?;
-                        let tail = decode_base64_quad(&last)?;
-                        let out_len = (m / 4 - 1) * 3 + tail.len() as u64;
-                        (m - 4, out_len, Some(tail))
-                    }
+                            .into(),
+                    ));
                 }
-            };
+                if m == 0 {
+                    (0, 0, None)
+                } else {
+                    // Decode the final (possibly '='-padded) group on the
+                    // host; the GPU handles only full non-padded groups.
+                    let last = self.read(input, m - 4, 4)?;
+                    let tail = decode_base64_quad(&last)?;
+                    let out_len = (m / 4 - 1) * 3 + tail.len() as u64;
+                    (m - 4, out_len, Some(tail))
+                }
+            }
+        };
 
         self.create_or_truncate_file(output)?;
         *output_created = true;
@@ -4482,10 +4601,7 @@ impl StorageEngine {
             .min(max_in_stage / unit_lcm * unit_lcm)
             .max(unit_lcm);
         let out_stage = in_stage / in_unit * out_unit;
-        let staging = format!(
-            "\\.__vramdisk_encode_tmp_{}",
-            crate::lookup::now_filetime()
-        );
+        let staging = format!("\\.__vramdisk_encode_tmp_{}", crate::lookup::now_filetime());
         self.create_or_truncate_file(&staging)?;
         self.allocate_raw_file(&staging, in_stage + out_stage)
             .map_err(|err| match err {
@@ -4554,6 +4670,30 @@ impl StorageEngine {
     }
 }
 
+/// One compressed archive payload: where its bytes live now and where the
+/// decompressed bytes must land.
+///
+/// `extract_deflate_payload` and `extract_lz4_payload` both need two
+/// `(path, offset, length)` triples, and passing six positional values meant a
+/// transposed source/destination pair would still compile and would quietly
+/// corrupt the extraction. Naming the fields makes that class of mistake
+/// visible at the call site.
+struct PayloadSpan<'a> {
+    /// File holding the compressed bytes.
+    src_path: &'a str,
+    /// Byte offset of the payload within `src_path`.
+    src_offset: u64,
+    /// Compressed length, i.e. how many bytes to feed the codec.
+    comp_len: u64,
+    /// File the plaintext is written to.
+    dst_path: &'a str,
+    /// Byte offset within `dst_path` to write at. Zero additionally means the
+    /// whole destination may be (re)allocated as one contiguous raw run.
+    dst_offset: u64,
+    /// Expected decompressed length; the codec is told to produce exactly this.
+    out_len: u64,
+}
+
 struct ZipCentralEntry {
     crc: u32,
     size: u64,
@@ -4568,12 +4708,12 @@ fn pad512(n: u64) -> u64 {
 
 fn tar_header(path: &str, size: u64) -> EResult<[u8; 512]> {
     if path.is_empty() || path.len() > 100 {
-        return Err(EngineError::Cuda(format!(
+        return Err(EngineError::InvalidInput(format!(
             "tar path must be 1..100 ASCII bytes for current GPU archive writer: {path}"
         )));
     }
     if !path.is_ascii() {
-        return Err(EngineError::Cuda(format!(
+        return Err(EngineError::InvalidInput(format!(
             "tar path must be ASCII for current GPU archive writer: {path}"
         )));
     }
@@ -4615,9 +4755,9 @@ fn parse_tar_octal(src: &[u8]) -> EResult<u64> {
         .filter(|&b| b != 0)
         .collect::<Vec<_>>();
     let text = std::str::from_utf8(&s)
-        .map_err(|e| EngineError::Cuda(format!("invalid tar octal field: {e}")))?;
+        .map_err(|e| EngineError::InvalidInput(format!("invalid tar octal field: {e}")))?;
     u64::from_str_radix(text.trim(), 8)
-        .map_err(|e| EngineError::Cuda(format!("invalid tar octal value: {e}")))
+        .map_err(|e| EngineError::InvalidInput(format!("invalid tar octal value: {e}")))
 }
 
 /// Join an archive entry name onto the extraction base, rejecting `.`/`..`
@@ -4626,7 +4766,7 @@ fn parse_tar_octal(src: &[u8]) -> EResult<u64> {
 fn join_archive_output(base: &str, name: &str) -> EResult<String> {
     let clean = name.trim_start_matches('/').replace('/', "\\");
     if clean.split('\\').any(|comp| comp == "." || comp == "..") {
-        return Err(EngineError::Cuda(format!(
+        return Err(EngineError::InvalidInput(format!(
             "refusing archive entry with unsafe path component: {name}"
         )));
     }
@@ -4645,7 +4785,9 @@ fn gzip_extra_comp_len(extra: &[u8]) -> EResult<u64> {
         let len = read_u16_le(&extra[pos + 2..pos + 4]) as usize;
         pos += 4;
         if pos + len > extra.len() {
-            return Err(EngineError::Cuda("invalid gzip extra length".into()));
+            return Err(EngineError::InvalidInput(
+                "invalid gzip extra length".into(),
+            ));
         }
         if si1 == b'G' && si2 == b'S' && len == 8 {
             let mut bytes = [0u8; 8];
@@ -4654,7 +4796,7 @@ fn gzip_extra_comp_len(extra: &[u8]) -> EResult<u64> {
         }
         pos += len;
     }
-    Err(EngineError::Cuda(
+    Err(EngineError::Unsupported(
         "gzip member is missing VRAMDISK compressed-size subfield".into(),
     ))
 }
@@ -4705,18 +4847,22 @@ fn zip_sizes_from_local_extra(uncomp32: u32, comp32: u32, extra: &[u8]) -> EResu
         let len = read_u16_le(&extra[pos + 2..pos + 4]) as usize;
         pos += 4;
         if pos + len > extra.len() {
-            return Err(EngineError::Cuda("invalid ZIP extra field length".into()));
+            return Err(EngineError::InvalidInput(
+                "invalid ZIP extra field length".into(),
+            ));
         }
         if tag == 0x0001 {
             let field = &extra[pos..pos + len];
             if field.len() < 16 {
-                return Err(EngineError::Cuda("truncated ZIP64 size extra field".into()));
+                return Err(EngineError::InvalidInput(
+                    "truncated ZIP64 size extra field".into(),
+                ));
             }
             return Ok((read_u64_le(&field[0..8]), read_u64_le(&field[8..16])));
         }
         pos += len;
     }
-    Err(EngineError::Cuda(
+    Err(EngineError::InvalidInput(
         "ZIP entry uses 0xffffffff sizes without ZIP64 extra field".into(),
     ))
 }
@@ -4729,21 +4875,25 @@ fn zip_deflate_chunks_from_extra(extra: &[u8]) -> EResult<Option<Vec<u64>>> {
         let len = read_u16_le(&extra[pos + 2..pos + 4]) as usize;
         pos += 4;
         if pos + len > extra.len() {
-            return Err(EngineError::Cuda("invalid ZIP extra field length".into()));
+            return Err(EngineError::InvalidInput(
+                "invalid ZIP extra field length".into(),
+            ));
         }
         if tag == 0x4753 {
             if len < 8 || (len - 8) % 8 != 0 {
-                return Err(EngineError::Cuda("invalid VRAMDISK ZIP chunk table".into()));
+                return Err(EngineError::InvalidInput(
+                    "invalid VRAMDISK ZIP chunk table".into(),
+                ));
             }
             let start = read_u32_le(&extra[pos..pos + 4]) as usize;
             let count = read_u32_le(&extra[pos + 4..pos + 8]) as usize;
             if count != (len - 8) / 8 {
-                return Err(EngineError::Cuda(
+                return Err(EngineError::InvalidInput(
                     "VRAMDISK ZIP chunk table count mismatch".into(),
                 ));
             }
             if sizes.len() < start {
-                return Err(EngineError::Cuda(
+                return Err(EngineError::InvalidInput(
                     "VRAMDISK ZIP chunk table has a gap".into(),
                 ));
             }
@@ -4865,12 +5015,12 @@ fn read_u64_le(src: &[u8]) -> u64 {
 }
 
 fn u16_checked(v: usize, what: &str) -> EResult<u16> {
-    u16::try_from(v).map_err(|_| EngineError::Cuda(format!("{what} exceeds u16")))
+    u16::try_from(v).map_err(|_| EngineError::InvalidInput(format!("{what} exceeds u16")))
 }
 
 #[allow(dead_code)]
 fn u32_checked(v: u64, what: &str) -> EResult<u32> {
-    u32::try_from(v).map_err(|_| EngineError::Cuda(format!("{what} exceeds u32")))
+    u32::try_from(v).map_err(|_| EngineError::InvalidInput(format!("{what} exceeds u32")))
 }
 
 fn stored_deflate_len(len: u64) -> u64 {
@@ -4947,14 +5097,12 @@ mod tests {
         originals
     }
 
-    fn assert_archive_tree(
-        e: &mut StorageEngine,
-        base: &str,
-        originals: &[(String, Vec<u8>)],
-    ) {
+    fn assert_archive_tree(e: &mut StorageEngine, base: &str, originals: &[(String, Vec<u8>)]) {
         for (path, expected) in originals {
             let rel = path.trim_start_matches('\\');
-            let got = e.read(&format!("{base}\\{rel}"), 0, expected.len()).unwrap();
+            let got = e
+                .read(&format!("{base}\\{rel}"), 0, expected.len())
+                .unwrap();
             assert_eq!(got, *expected, "archive roundtrip mismatch for {path}");
         }
     }
@@ -4970,7 +5118,10 @@ mod tests {
 
     fn force_file_zstd_compressed(e: &mut StorageEngine, path: &str) {
         let size = e.get(path).unwrap().size;
-        assert!(size <= CHUNK_SIZE, "test fixture expects a single archive chunk");
+        assert!(
+            size <= CHUNK_SIZE,
+            "test fixture expects a single archive chunk"
+        );
         let original = e.read(path, 0, size as usize).unwrap();
         for lc in 0..logical_chunks(size) {
             let chunk_start = lc * CHUNK_SIZE as usize;
@@ -5055,7 +5206,11 @@ mod tests {
         assert_first_chunk_codec(&e, "\\data\\b.bin", Codec::Lz4);
         let paths: Vec<String> = originals.iter().map(|(path, _)| path.clone()).collect();
         for (codec, archive, out_dir) in [
-            (NvcompFrameCodec::Zstd, "\\lz4-src.tar.zst", "\\lz4-zstd-out"),
+            (
+                NvcompFrameCodec::Zstd,
+                "\\lz4-src.tar.zst",
+                "\\lz4-zstd-out",
+            ),
             (NvcompFrameCodec::Deflate, "\\lz4-src.zip", "\\lz4-zip-out"),
         ] {
             e.archive_compress_gpu(codec, &paths, archive).unwrap();
@@ -5074,8 +5229,16 @@ mod tests {
         assert_first_chunk_codec(&e, "\\data\\b.bin", Codec::Zstd);
         let paths: Vec<String> = originals.iter().map(|(path, _)| path.clone()).collect();
         for (codec, archive, out_dir) in [
-            (NvcompFrameCodec::Zstd, "\\zstd-src.tar.zst", "\\zstd-zstd-out"),
-            (NvcompFrameCodec::Deflate, "\\zstd-src.zip", "\\zstd-zip-out"),
+            (
+                NvcompFrameCodec::Zstd,
+                "\\zstd-src.tar.zst",
+                "\\zstd-zstd-out",
+            ),
+            (
+                NvcompFrameCodec::Deflate,
+                "\\zstd-src.zip",
+                "\\zstd-zip-out",
+            ),
         ] {
             e.archive_compress_gpu(codec, &paths, archive).unwrap();
             e.archive_extract_gpu(codec, archive, out_dir).unwrap();
@@ -5276,14 +5439,19 @@ mod tests {
             let gpu = e.hash_file_gpu(path, alg).unwrap();
             let reference = hash_reference(alg, &data);
             assert_eq!(cpu, gpu, "CPU/GPU digest mismatch for {}", alg.name());
-            assert_eq!(cpu, reference, "reference digest mismatch for {}", alg.name());
+            assert_eq!(
+                cpu,
+                reference,
+                "reference digest mismatch for {}",
+                alg.name()
+            );
         }
     }
 
     #[test]
     fn routed_large_file_hash_uses_cpu_and_matches_rustcrypto() {
         let mut e = engine(16, false);
-        e.hash_cpu_route_threshold = 1 * 1024 * 1024;
+        e.hash_cpu_route_threshold = 1_048_576; // 1 MiB
         e.hash_cpu_route_threshold_override = true;
 
         let path = "\\large-hash";
@@ -5727,7 +5895,8 @@ mod tests {
         e.table_mut().create_file("\\a", 0).unwrap();
         e.table_mut().create_file("\\b", 0).unwrap();
         e.write("\\a", 0, &vec![1u8; CHUNK_SIZE as usize]).unwrap();
-        e.write("\\b", 0, &vec![2u8; CHUNK_SIZE as usize * 2]).unwrap();
+        e.write("\\b", 0, &vec![2u8; CHUNK_SIZE as usize * 2])
+            .unwrap();
         assert_eq!(e.used_chunks(), 3);
         // The editor save pattern: write temp, rename over the original. The
         // replaced file's two chunks must be freed, not leaked.

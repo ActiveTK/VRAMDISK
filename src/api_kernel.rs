@@ -705,7 +705,9 @@ impl ApiKernel {
             units <= (u32::MAX as u64) * THREADS as u64,
             "transcode launch too large: {units} units"
         );
-        self.ctx.bind_to_thread().context("bind ctx for transcode")?;
+        self.ctx
+            .bind_to_thread()
+            .context("bind ctx for transcode")?;
         let zero = [0u32; 1];
         self.stream.memcpy_htod(&zero, &mut self.status_d)?;
         let status_ptr = ptr_u32(&self.status_d, &self.stream);
@@ -1322,6 +1324,10 @@ mod tests {
         let src = api_cuda_source();
         assert!(!src.contains(CRC32_TABLE_MARKER), "marker left in source");
         assert!(src.contains("0x77073096u,"), "table entry missing");
-        assert_eq!(src.matches("0x2d02ef8du,").count(), 1, "table entry missing");
+        assert_eq!(
+            src.matches("0x2d02ef8du,").count(),
+            1,
+            "table entry missing"
+        );
     }
 }

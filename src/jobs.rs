@@ -40,6 +40,22 @@ impl JobState {
     }
 }
 
+/// How far along a running job is, in bytes.
+///
+/// Jobs here routinely move tens of gigabytes, and an elapsed-seconds counter
+/// tells the user nothing about whether to keep waiting. Executors publish
+/// this as they go so `status.json` can drive a determinate progress bar.
+///
+/// `total_bytes` is the executor's best estimate at the time it was set and
+/// may be revised upward mid-job; consumers must treat `done_bytes` as
+/// possibly exceeding a stale `total_bytes` rather than assuming a ratio of
+/// at most 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobProgress {
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct JobSnapshot {
     pub id: String,
@@ -49,6 +65,7 @@ pub struct JobSnapshot {
     pub descriptor: String,
     pub result: String,
     pub error: Option<String>,
+    pub progress: Option<JobProgress>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +97,7 @@ struct JobRecord {
     result: String,
     error: Option<String>,
     cancel_requested: bool,
+    progress: Option<JobProgress>,
 }
 
 impl JobRegistry {
@@ -119,6 +137,7 @@ impl JobRegistry {
                 result: "{}\r\n".to_string(),
                 error: None,
                 cancel_requested: false,
+                progress: None,
             },
         );
         self.changed.notify_all();
@@ -207,6 +226,60 @@ impl JobRegistry {
         true
     }
 
+    /// Publish how far a running job has got.
+    ///
+    /// Deliberately does NOT signal `changed`: progress ticks arrive once per
+    /// staging pass, and waking every `wait` caller for each one would be pure
+    /// overhead — waiters only care about the terminal transition, which still
+    /// notifies. A tick on a job that has already finished (a late update from
+    /// an executor unwinding) is ignored so a terminal snapshot cannot be
+    /// dragged backwards.
+    pub fn set_progress(&self, id: &str, done_bytes: u64, total_bytes: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(job) = inner.jobs.get_mut(id) else {
+            return;
+        };
+        if job.state.is_terminal() {
+            return;
+        }
+        job.progress = Some(JobProgress {
+            done_bytes,
+            total_bytes,
+        });
+        job.updated_at_ms = now_ms();
+    }
+
+    /// Advance a job's completed-byte count by `delta`, keeping the total it
+    /// was last given. Convenient for executors that stream work in passes and
+    /// only know the increment they just finished.
+    pub fn advance_progress(&self, id: &str, delta: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(job) = inner.jobs.get_mut(id) else {
+            return;
+        };
+        if job.state.is_terminal() {
+            return;
+        }
+        let current = job.progress.unwrap_or(JobProgress {
+            done_bytes: 0,
+            total_bytes: 0,
+        });
+        job.progress = Some(JobProgress {
+            done_bytes: current.done_bytes.saturating_add(delta),
+            total_bytes: current.total_bytes,
+        });
+        job.updated_at_ms = now_ms();
+    }
+
+    pub fn progress(&self, id: &str) -> Option<JobProgress> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .jobs
+            .get(id)
+            .and_then(|job| job.progress)
+    }
+
     pub fn cancel_requested(&self, id: &str) -> bool {
         self.inner
             .lock()
@@ -288,6 +361,15 @@ impl JobRegistry {
     fn finish(&self, id: &str, state: JobState, result: String, error: Option<String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(job) = inner.jobs.get_mut(id) {
+            // A job that succeeded processed everything it set out to, so snap
+            // the counter to the total: without this the last partial pass
+            // leaves a terminal status.json reporting e.g. 97%, which reads as
+            // "it stopped early" rather than "it finished".
+            if state == JobState::Succeeded {
+                if let Some(progress) = job.progress.as_mut() {
+                    progress.done_bytes = progress.total_bytes;
+                }
+            }
             job.state = state;
             job.result = result;
             job.error = error;
@@ -316,6 +398,7 @@ pub fn status_json(job: &JobSnapshot) -> String {
             "  \"terminal\": {},\r\n",
             "  \"submitted_at_ms\": {},\r\n",
             "  \"updated_at_ms\": {},\r\n",
+            "  \"progress\": {},\r\n",
             "  \"error\": {}\r\n",
             "}}\r\n"
         ),
@@ -324,8 +407,22 @@ pub fn status_json(job: &JobSnapshot) -> String {
         job.state.is_terminal(),
         job.submitted_at_ms,
         job.updated_at_ms,
+        progress_json(job.progress),
         json_string_or_null(job.error.as_deref()),
     )
+}
+
+/// Render a job's byte counters, or `null` for an executor that has not
+/// reported any. Consumers must handle the `null` case: not every job kind
+/// can know its total up front.
+fn progress_json(progress: Option<JobProgress>) -> String {
+    match progress {
+        Some(p) => format!(
+            "{{\"done_bytes\": {}, \"total_bytes\": {}}}",
+            p.done_bytes, p.total_bytes
+        ),
+        None => "null".to_string(),
+    }
 }
 
 fn snapshot(id: &str, job: &JobRecord) -> JobSnapshot {
@@ -337,6 +434,7 @@ fn snapshot(id: &str, job: &JobRecord) -> JobSnapshot {
         descriptor: job.descriptor.clone(),
         result: job.result.clone(),
         error: job.error.clone(),
+        progress: job.progress,
     }
 }
 
@@ -431,7 +529,8 @@ mod tests {
     fn cancelling_running_job_sets_request_until_worker_finishes() {
         let jobs = JobRegistry::default();
         jobs.reserve("job3").unwrap();
-        jobs.complete_submission("job3", br#"{"op":"hash"}"#).unwrap();
+        jobs.complete_submission("job3", br#"{"op":"hash"}"#)
+            .unwrap();
         assert!(jobs.start("job3").is_some());
 
         assert!(jobs.cancel("job3"));
@@ -443,5 +542,63 @@ mod tests {
         let snap = jobs.wait("job3").unwrap();
         assert_eq!(snap.state, JobState::Cancelled);
         assert!(snap.result.contains(JOB_CANCELLED_MESSAGE));
+    }
+
+    #[test]
+    fn progress_is_null_until_an_executor_reports() {
+        let jobs = JobRegistry::default();
+        jobs.reserve("job4").unwrap();
+        jobs.complete_submission("job4", br#"{"op":"encode"}"#)
+            .unwrap();
+        assert!(jobs.start("job4").is_some());
+
+        let snap = jobs.snapshot("job4").unwrap();
+        assert_eq!(snap.progress, None);
+        assert!(status_json(&snap).contains("\"progress\": null"));
+
+        jobs.set_progress("job4", 0, 4096);
+        jobs.advance_progress("job4", 1024);
+        let snap = jobs.snapshot("job4").unwrap();
+        assert_eq!(
+            snap.progress,
+            Some(JobProgress {
+                done_bytes: 1024,
+                total_bytes: 4096,
+            })
+        );
+        assert!(status_json(&snap)
+            .contains("\"progress\": {\"done_bytes\": 1024, \"total_bytes\": 4096}"));
+    }
+
+    #[test]
+    fn succeeding_snaps_progress_to_the_total() {
+        // A final partial pass must not leave a finished job reporting 97%.
+        let jobs = JobRegistry::default();
+        jobs.reserve("job5").unwrap();
+        jobs.complete_submission("job5", br#"{"op":"hash"}"#)
+            .unwrap();
+        assert!(jobs.start("job5").is_some());
+        jobs.set_progress("job5", 900, 1000);
+
+        jobs.succeed("job5", result_json("job5", &JobState::Succeeded, None));
+        let snap = jobs.snapshot("job5").unwrap();
+        assert_eq!(snap.progress.unwrap().done_bytes, 1000);
+    }
+
+    #[test]
+    fn progress_updates_after_a_job_is_terminal_are_ignored() {
+        // An executor unwinding after cancellation must not drag a terminal
+        // job's counters backwards.
+        let jobs = JobRegistry::default();
+        jobs.reserve("job6").unwrap();
+        jobs.complete_submission("job6", br#"{"op":"hash"}"#)
+            .unwrap();
+        assert!(jobs.start("job6").is_some());
+        jobs.set_progress("job6", 500, 1000);
+        jobs.finish_cancelled("job6");
+
+        jobs.set_progress("job6", 0, 0);
+        jobs.advance_progress("job6", 123);
+        assert_eq!(jobs.progress("job6").unwrap().done_bytes, 500);
     }
 }

@@ -242,10 +242,10 @@ mod tests {
 
         // Distinct content per chunk.
         let mut expected = vec![0u64; chunks];
-        for c in 0..chunks {
+        for (c, slot) in expected.iter_mut().enumerate() {
             let data: Vec<u8> = (0..cs).map(|i| ((i + c * 7) as u8) ^ (c as u8)).collect();
             vram.write_at(c as u64 * CHUNK_SIZE, &data).unwrap();
-            expected[c] = fnv1a_ref(&data);
+            *slot = fnv1a_ref(&data);
         }
 
         let mut hasher = GpuHasher::new(&vram).unwrap();

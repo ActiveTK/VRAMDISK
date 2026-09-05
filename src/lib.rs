@@ -118,7 +118,11 @@ mod tests {
         for vram in [0u64, 1, 4096, 256 * 1024 * 1024, 1024 * 1024 * 1024] {
             let size = default_size(vram);
             assert!(size <= vram, "default_size({vram}) = {size} exceeds VRAM");
-            assert_eq!(size % CHUNK_SIZE, 0, "default_size({vram}) not chunk-aligned");
+            assert_eq!(
+                size % CHUNK_SIZE,
+                0,
+                "default_size({vram}) not chunk-aligned"
+            );
         }
     }
 }

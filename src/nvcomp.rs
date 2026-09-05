@@ -991,7 +991,7 @@ impl Lz4Codec {
     pub fn uncomp_slot_ptr(&self, i: usize) -> u64 {
         let cs = CHUNK_SIZE as usize;
         let (ptr, _guard) = self.d_in.device_ptr(&self.stream);
-        ptr as u64 + (i * cs) as u64
+        ptr + (i * cs) as u64
     }
 
     /// Compress `m` (≤ BATCH) contiguous chunks and *leave the results on the

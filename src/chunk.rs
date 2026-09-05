@@ -31,7 +31,7 @@ impl ChunkAllocator {
         };
         // Mark padding bits (beyond `total`) in the last word as used so they
         // are never handed out.
-        let rem = (total % 64) as u32;
+        let rem = total % 64;
         if rem != 0 {
             let last = words - 1;
             let valid_mask = (1u64 << rem) - 1;

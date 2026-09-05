@@ -550,15 +550,11 @@ fn chunks_json(engine: &StorageEngine, target_file: &str) -> Result<String, Engi
                 content_hash,
             } => {
                 out.push_str("      \"kind\": \"raw\",\r\n");
+                out.push_str(&format!("      \"physical_chunk\": {physical_chunk},\r\n"));
                 out.push_str(&format!(
-                    "      \"physical_chunk\": {},\r\n",
-                    physical_chunk
+                    "      \"physical_offset\": {physical_offset},\r\n"
                 ));
-                out.push_str(&format!(
-                    "      \"physical_offset\": {},\r\n",
-                    physical_offset
-                ));
-                out.push_str(&format!("      \"refcount\": {},\r\n", refcount));
+                out.push_str(&format!("      \"refcount\": {refcount},\r\n"));
                 out.push_str(&format!("      \"shared\": {},\r\n", *refcount > 1));
                 out.push_str(&format!(
                     "      \"content_hash\": {}\r\n",
@@ -573,10 +569,10 @@ fn chunks_json(engine: &StorageEngine, target_file: &str) -> Result<String, Engi
                 content_hash,
             } => {
                 out.push_str("      \"kind\": \"compressed\",\r\n");
-                out.push_str(&format!("      \"offset\": {},\r\n", offset));
-                out.push_str(&format!("      \"len\": {},\r\n", len));
+                out.push_str(&format!("      \"offset\": {offset},\r\n"));
+                out.push_str(&format!("      \"len\": {len},\r\n"));
                 out.push_str(&format!("      \"codec\": \"{}\",\r\n", codec_name(*codec)));
-                out.push_str(&format!("      \"refcount\": {},\r\n", refcount));
+                out.push_str(&format!("      \"refcount\": {refcount},\r\n"));
                 out.push_str(&format!("      \"shared\": {},\r\n", *refcount > 1));
                 out.push_str(&format!(
                     "      \"content_hash\": {}\r\n",

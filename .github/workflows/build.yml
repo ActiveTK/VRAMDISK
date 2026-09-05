@@ -12,6 +12,15 @@ name: build
 # There's only one binary: vramdisk.exe is both the GUI (default launch) and
 # the CLI (`vramdisk.exe cli ...` / `vramdisk.exe benchmark ...`), so building
 # it here covers both.
+#
+# Alongside the build there's a `lint` gate: `cargo clippy --all-targets
+# -- -D warnings` over the root crate (the storage engine — the GUI crate in
+# src-tauri/ is a thin shell around it). `--all-targets` means the GPU-only
+# unit tests are *type-checked and linted* here even though they are never
+# run, which is exactly the coverage we can get without a device. It's a
+# separate job so a lint regression and a build break report independently,
+# and so the two run in parallel; it repeats the msvc/libclang setup because
+# linting the root crate still runs winfsp-sys's bindgen build script.
 
 on:
   push:
@@ -58,3 +67,39 @@ jobs:
           name: vramdisk
           path: src-tauri/target/release/vramdisk.exe
           if-no-files-found: error
+
+  lint:
+    name: Clippy (root crate)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `profile: minimal` is this action's default and omits clippy, so ask
+      # for it explicitly.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      # Same reason as the build job: winfsp-sys's bindgen runs during
+      # `cargo clippy` too, and needs MSVC's CRT headers plus libclang.
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate libclang
+        shell: pwsh
+        run: |
+          $cand = "$env:ProgramFiles\LLVM\bin"
+          if (-not (Test-Path "$cand\libclang.dll")) {
+            throw "libclang.dll not found at $cand (expected preinstalled on windows-latest)"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$cand"
+
+      # Warnings are denied so lint debt can't accumulate silently. Run from
+      # the repo root — that's the root crate; src-tauri/ is covered by the
+      # build job above.
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings

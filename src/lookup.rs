@@ -130,9 +130,20 @@ impl LookupTable {
         self.nodes.contains_key(&normalize(path))
     }
 
+    /// Number of nodes in the table, root included. Test-only: the running
+    /// engine tracks its own counters and never asks the table for a count.
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Whether the table holds no nodes at all. Always `false` in practice —
+    /// `new()` seeds the root and `remove` refuses to delete it — but clippy
+    /// requires the pair, and it keeps the collection-like surface honest.
+    #[cfg(test)]
+    #[allow(dead_code)] // paired with `len()` for API completeness; no test needs it yet
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Create a file at `path`. Parent must exist and be a directory.

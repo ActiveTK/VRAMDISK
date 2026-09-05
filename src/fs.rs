@@ -13,13 +13,13 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::Context as _;
 use windows::Win32::Foundation::{
-    LocalFree, HANDLE, HLOCAL, STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL,
-    STATUS_END_OF_FILE, STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_INVALID_PARAMETER, STATUS_INVALID_SECURITY_DESCR, STATUS_NOT_A_DIRECTORY,
-    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+    LocalFree, HANDLE, HLOCAL, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_DIRECTORY_NOT_EMPTY,
+    STATUS_DISK_FULL, STATUS_END_OF_FILE, STATUS_FILE_IS_A_DIRECTORY,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_INVALID_SECURITY_DESCR,
+    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR};
 use windows::Win32::Storage::FileSystem::{
@@ -55,7 +55,13 @@ const FILE_ATTRIBUTE_SYSTEM: u32 = 0x04;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
 const INTERNAL_ATTRIBUTES: u32 =
     FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
-const DEFAULT_SECURITY_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
+/// DACL used when the current user's SID cannot be determined.
+///
+/// Granting `WD` (Everyone) full access is deliberately permissive: a volume
+/// nobody can open is worse than a permissive one, and the only way to reach
+/// this is a failing token query, which in practice does not happen. Callers
+/// warn on stderr when they fall back to it.
+const FALLBACK_SECURITY_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
 const FSCTL_DUPLICATE_EXTENTS_TO_FILE: u32 = 0x0009_8344;
 
 /// Per-open-handle state stored by WinFsp (boxed behind a pointer).
@@ -146,7 +152,7 @@ pub struct VramDiskFs {
 impl VramDiskFs {
     pub fn new(engine: StorageEngine, label: impl Into<String>) -> Self {
         let default_security_descriptor =
-            security_descriptor_from_sddl(DEFAULT_SECURITY_SDDL).unwrap_or_default();
+            security_descriptor_from_sddl(default_security_sddl()).unwrap_or_default();
         let engine = Arc::new(Mutex::new(engine));
         let jobs = Arc::new(JobRegistry::default());
         let job_worker = JobWorkerHandle::spawn(engine.clone(), jobs.clone());
@@ -188,7 +194,7 @@ impl VramDiskFs {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if cached.is_empty() {
-            *cached = security_descriptor_from_sddl(DEFAULT_SECURITY_SDDL)?;
+            *cached = security_descriptor_from_sddl(default_security_sddl())?;
         }
         Ok(cached.clone())
     }
@@ -273,7 +279,12 @@ impl JobWorkerHandle {
             let queued: Vec<String> = state.queue.drain(..).collect();
             let current = state.current.clone();
             self.inner.changed.notify_all();
-            let handle = self.inner.join.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let handle = self
+                .inner
+                .join
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
             (queued, current, handle)
         };
 
@@ -322,12 +333,22 @@ impl JobWorker {
 }
 
 /// Map engine/lookup errors to NTSTATUS.
+///
+/// The engine's error taxonomy is richer than what a WinFsp callback can say,
+/// so each variant is mapped to the status whose standard meaning is closest —
+/// this is what Explorer and the Win32 layer turn into a message for the user,
+/// and a wrong choice here produces a badly misleading one.
 fn map_engine_err(e: EngineError) -> winfsp::FspError {
     match e {
         EngineError::Lookup(l) => map_lookup_err(l),
-        EngineError::NoSpace => STATUS_DISK_FULL.into(),
+        EngineError::NoSpace | EngineError::OutOfVram(_) => STATUS_DISK_FULL.into(),
         EngineError::NotAFile => STATUS_FILE_IS_A_DIRECTORY.into(),
         EngineError::Cancelled => STATUS_ACCESS_DENIED.into(),
+        EngineError::InvalidInput(_) => STATUS_INVALID_PARAMETER.into(),
+        EngineError::Unsupported(_) => STATUS_INVALID_DEVICE_REQUEST.into(),
+        // Our own stored data failed to round-trip: report a data error rather
+        // than something that reads as a permissions or argument problem.
+        EngineError::Internal(_) => STATUS_DATA_ERROR.into(),
         EngineError::Cuda(_) => STATUS_ACCESS_DENIED.into(),
     }
 }
@@ -570,14 +591,9 @@ fn execute_job_descriptor(
 ) -> Result<String, JobExecutionError> {
     let v: serde_json::Value = serde_json::from_str(descriptor)
         .map_err(|e| JobExecutionError::Failed(format!("invalid job descriptor JSON: {e}")))?;
-    let op = v
-        .get("op")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            JobExecutionError::Failed(
-                "job descriptor must contain string field \"op\"".to_string(),
-            )
-        })?;
+    let op = v.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
+        JobExecutionError::Failed("job descriptor must contain string field \"op\"".to_string())
+    })?;
     match op {
         "noop" => Ok(serde_json::json!({
             "id": id,
@@ -611,10 +627,9 @@ fn execute_archive_compress_job(
         .or_else(|| descriptor.get("codec"))
         .and_then(|v| v.as_str())
         .unwrap_or("tar.zst");
-    let format = NvcompFrameCodec::parse(format_name)
-        .ok_or_else(|| {
-            JobExecutionError::Failed(format!("unsupported archive format: {format_name}"))
-        })?;
+    let format = NvcompFrameCodec::parse(format_name).ok_or_else(|| {
+        JobExecutionError::Failed(format!("unsupported archive format: {format_name}"))
+    })?;
     let output = descriptor
         .get("output")
         .or_else(|| descriptor.get("destination"))
@@ -627,8 +642,7 @@ fn execute_archive_compress_job(
         .get("recursive")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let roots = descriptor_paths(descriptor, "path", "paths")
-        .map_err(JobExecutionError::Failed)?;
+    let roots = descriptor_paths(descriptor, "path", "paths").map_err(JobExecutionError::Failed)?;
     let mut targets = BTreeSet::new();
     {
         let engine = lock_shared_engine(engine);
@@ -686,19 +700,16 @@ fn execute_archive_extract_job(
         .or_else(|| descriptor.get("codec"))
         .and_then(|v| v.as_str())
         .unwrap_or("tar.zst");
-    let format = NvcompFrameCodec::parse(format_name)
-        .ok_or_else(|| {
-            JobExecutionError::Failed(format!("unsupported archive format: {format_name}"))
-        })?;
+    let format = NvcompFrameCodec::parse(format_name).ok_or_else(|| {
+        JobExecutionError::Failed(format!("unsupported archive format: {format_name}"))
+    })?;
     let archive = descriptor
         .get("archive")
         .or_else(|| descriptor.get("input"))
         .or_else(|| descriptor.get("path"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            JobExecutionError::Failed(
-                "archive.extract job requires archive/input/path".to_string(),
-            )
+            JobExecutionError::Failed("archive.extract job requires archive/input/path".to_string())
         })?;
     let output_dir = descriptor
         .get("output_dir")
@@ -844,17 +855,15 @@ fn execute_hash_job(
         .or_else(|| descriptor.get("alg"))
         .and_then(|v| v.as_str())
         .unwrap_or("sha256");
-    let alg = HashAlgorithm::parse(alg_name)
-        .ok_or_else(|| {
-            JobExecutionError::Failed(format!("unsupported hash algorithm: {alg_name}"))
-        })?;
+    let alg = HashAlgorithm::parse(alg_name).ok_or_else(|| {
+        JobExecutionError::Failed(format!("unsupported hash algorithm: {alg_name}"))
+    })?;
     let recursive = descriptor
         .get("recursive")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let roots = descriptor_paths(descriptor, "path", "paths")
-        .map_err(JobExecutionError::Failed)?;
+    let roots = descriptor_paths(descriptor, "path", "paths").map_err(JobExecutionError::Failed)?;
 
     let mut targets = BTreeSet::new();
     {
@@ -868,41 +877,70 @@ fn execute_hash_job(
 
     let paths: Vec<String> = targets.into_iter().collect();
     let mut digests = vec![Vec::new(); paths.len()];
-    let mut gpu_paths = Vec::new();
-    let mut gpu_indices = Vec::new();
-    let mut cpu_paths = Vec::new();
-    let mut cpu_indices = Vec::new();
+
+    // Route each file to the GPU or CPU path, and total the work up front so
+    // the job can report a real percentage rather than only elapsed seconds.
+    let mut gpu_batches: Vec<Vec<(usize, String)>> = Vec::new();
+    let mut cpu_files: Vec<(usize, String)> = Vec::new();
+    let mut total_bytes = 0u64;
     {
         let mut engine = lock_shared_engine(engine);
+        // One batch is sized to the engine's GPU hash launch budget, which is
+        // calibrated to about 0.1 s of GPU work. That is also what bounds how
+        // long a batch holds the engine lock below.
+        let budget = engine.gpu_hash_launch_budget().max(1);
+        let mut batch: Vec<(usize, String)> = Vec::new();
+        let mut batch_bytes = 0u64;
         for (idx, path) in paths.iter().enumerate() {
             check_job_cancelled(id, jobs)?;
+            let size = engine
+                .file_size(path)
+                .map_err(|e| map_job_engine_error("hash routing failed", e))?;
+            total_bytes = total_bytes.saturating_add(size);
             if engine
                 .should_hash_on_gpu_routed(path)
                 .map_err(|e| map_job_engine_error("hash routing failed", e))?
             {
-                gpu_indices.push(idx);
-                gpu_paths.push(path.clone());
+                batch.push((idx, path.clone()));
+                batch_bytes = batch_bytes.saturating_add(size);
+                if batch_bytes >= budget {
+                    gpu_batches.push(std::mem::take(&mut batch));
+                    batch_bytes = 0;
+                }
             } else {
-                cpu_indices.push(idx);
-                cpu_paths.push(path.clone());
+                cpu_files.push((idx, path.clone()));
             }
         }
-    }
-
-    if !gpu_paths.is_empty() {
-        let gpu_digests = {
-            let mut engine = lock_shared_engine(engine);
-            engine
-                .hash_files_gpu_many_cancellable(&gpu_paths, alg, || jobs.cancel_requested(id))
-                .map_err(|e| map_job_engine_error("GPU hash failed", e))?
-        };
-        for (idx, digest) in gpu_indices.into_iter().zip(gpu_digests.into_iter()) {
-            digests[idx] = digest;
+        if !batch.is_empty() {
+            gpu_batches.push(batch);
         }
     }
+    jobs.set_progress(id, 0, total_bytes);
 
-    for (idx, path) in cpu_indices.into_iter().zip(cpu_paths.iter()) {
-        digests[idx] = hash_file_cpu_windowed(engine, jobs, id, path, alg)?;
+    // Hash a batch at a time, taking the engine lock per batch instead of once
+    // for the whole job: a hash over a large tree used to hold the lock start
+    // to finish, freezing every other filesystem callback on the volume for
+    // its full duration.
+    for batch in gpu_batches {
+        let batch_paths: Vec<String> = batch.iter().map(|(_, p)| p.clone()).collect();
+        let batch_digests = {
+            let mut engine = lock_shared_engine(engine);
+            engine
+                .hash_files_gpu_many_cancellable(&batch_paths, alg, || jobs.cancel_requested(id))
+                .map_err(|e| map_job_engine_error("GPU hash failed", e))?
+        };
+        let mut done = 0u64;
+        for ((idx, path), digest) in batch.into_iter().zip(batch_digests.into_iter()) {
+            let engine = lock_shared_engine(engine);
+            done = done.saturating_add(engine.file_size(&path).unwrap_or(0));
+            drop(engine);
+            digests[idx] = digest;
+        }
+        jobs.advance_progress(id, done);
+    }
+
+    for (idx, path) in cpu_files {
+        digests[idx] = hash_file_cpu_windowed(engine, jobs, id, &path, alg)?;
     }
 
     let mut files = Vec::with_capacity(paths.len());
@@ -956,6 +994,7 @@ fn hash_file_cpu_windowed(
         // windows, which is acceptable here to keep filesystem callbacks responsive.
         hasher.update(&chunk);
         offset += take as u64;
+        jobs.advance_progress(id, take as u64);
     }
     Ok(hasher.finalize())
 }
@@ -1043,6 +1082,75 @@ fn collect_hash_targets(
 
 struct FileSecurityCopy {
     size: u64,
+}
+
+/// The security descriptor applied to nodes that carry no explicit one of
+/// their own, and to the `$VRAMDISK` virtual nodes.
+///
+/// This is a personal scratch volume, so its intended audience is the account
+/// that mounted it, plus SYSTEM and the local Administrators group — the two
+/// principals that could take ownership regardless, and which the GUI needs in
+/// order to manage a mount it started elevated. Everyone (`WD`) used to be
+/// granted full access here, which meant that on a machine with more than one
+/// signed-in account — a shared workstation, a terminal server, a box running
+/// services under other identities — anything written to the disk was readable
+/// by all of them. Scoping the ACE to the mounting user's SID closes that
+/// without changing anything for the single-user case.
+///
+/// Computed once: the process token cannot change identity underneath us.
+fn default_security_sddl() -> &'static str {
+    static SDDL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SDDL.get_or_init(|| match current_user_sid_string() {
+        Some(sid) => format!("O:{sid}G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{sid})"),
+        None => {
+            eprintln!(
+                "vramdisk: could not read this process's user SID; falling back to a volume                  DACL that grants Everyone full access"
+            );
+            FALLBACK_SECURITY_SDDL.to_string()
+        }
+    })
+}
+
+/// The current process token's user SID in string (`S-1-5-21-...`) form, ready
+/// to splice into an SDDL string. `None` if the token cannot be queried.
+fn current_user_sid_string() -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return None;
+        }
+        let sid = (|| {
+            // The sizing call is expected to fail with ERROR_INSUFFICIENT_BUFFER;
+            // all we want from it is `needed`.
+            let mut needed = 0u32;
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+            if needed == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; needed as usize];
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buf.as_mut_ptr().cast()),
+                needed,
+                &mut needed,
+            )
+            .ok()?;
+            let user = &*buf.as_ptr().cast::<TOKEN_USER>();
+            let mut raw = PWSTR::null();
+            ConvertSidToStringSidW(user.User.Sid, &mut raw).ok()?;
+            let text = raw.to_string().ok();
+            let _ = LocalFree(Some(HLOCAL(raw.0.cast())));
+            text
+        })();
+        let _ = CloseHandle(token);
+        sid
+    }
 }
 
 fn security_descriptor_from_sddl(sddl: &str) -> winfsp::Result<Vec<u8>> {
@@ -1190,8 +1298,8 @@ impl FileSystemContext for VramDiskFs {
                 ));
             } else if let InternalEntry::HashFile { alg, target_file } = &entry {
                 drop(engine);
-                let digest =
-                    compute_internal_hash(&self.engine, target_file, *alg).map_err(map_engine_err)?;
+                let digest = compute_internal_hash(&self.engine, target_file, *alg)
+                    .map_err(map_engine_err)?;
                 let content = format!("{}\r\n", digest_hex(&digest)).into_bytes();
                 fill_internal_file_info(&entry, Some(content.len() as u64), file_info.as_mut());
                 return Ok(OpenFile::new_internal(
@@ -2098,19 +2206,13 @@ pub fn run(engine: StorageEngine, mount_point: &str, label: &str) -> anyhow::Res
     // attached console) is ignored so the mount stays up until the process is
     // killed; WinFsp tears the volume down on process exit either way.
     use std::io::BufRead;
-    let stdin = std::io::stdin();
     let mut line = String::new();
-    loop {
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => {
-                // EOF: park forever; rely on Ctrl-C / kill to stop.
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(3600));
-                }
-            }
-            Ok(_) => break,
-            Err(_) => break,
+    if let Ok(0) = std::io::stdin().lock().read_line(&mut line) {
+        // EOF (no console attached): park forever and rely on Ctrl-C, a kill,
+        // or the tray "unmount" to stop us. Returning here instead would tear
+        // the volume down the instant a detached process started.
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
         }
     }
 
@@ -2126,7 +2228,7 @@ mod tests {
 
     #[test]
     fn default_security_descriptor_is_self_relative() {
-        let sd = security_descriptor_from_sddl(DEFAULT_SECURITY_SDDL).unwrap();
+        let sd = security_descriptor_from_sddl(default_security_sddl()).unwrap();
         assert!(sd.len() >= 20);
         let reported = unsafe {
             GetSecurityDescriptorLength(PSECURITY_DESCRIPTOR(sd.as_ptr() as *mut c_void))
@@ -2194,7 +2296,10 @@ mod tests {
         let mut raw_engine = StorageEngine::new(vram, false, false).expect("engine");
         raw_engine.table_mut().create_file("\\a.txt", 0).unwrap();
         raw_engine.table_mut().create_dir("\\dir", 0).unwrap();
-        raw_engine.table_mut().create_file("\\dir\\b.txt", 0).unwrap();
+        raw_engine
+            .table_mut()
+            .create_file("\\dir\\b.txt", 0)
+            .unwrap();
         raw_engine.write("\\a.txt", 0, b"abc").unwrap();
         raw_engine.write("\\dir\\b.txt", 0, b"hello").unwrap();
         let engine = Arc::new(Mutex::new(raw_engine));
@@ -2243,8 +2348,7 @@ mod tests {
             }
             assert!(
                 Instant::now() <= deadline,
-                "timed out waiting for job {id} to reach {:?}",
-                expected
+                "timed out waiting for job {id} to reach {expected:?}"
             );
             std::thread::sleep(Duration::from_millis(10));
         }

@@ -47,7 +47,7 @@ pub fn run(device: usize, vram_size: u64) -> Result<()> {
         format_size(total_vram)
     );
     println!("  vram   : {}", format_size(vram_size));
-    println!("  runs   : {} per measurement\n", RUNS);
+    println!("  runs   : {RUNS} per measurement\n");
 
     bench_vram(device, vram_size)?;
     bench_engine(device, vram_size)?;
@@ -372,10 +372,7 @@ fn throughput(bytes: u64, elapsed: Duration) -> String {
 // ─── [1] Raw VRAM bandwidth ───────────────────────────────────────────────────
 
 fn bench_vram(device: usize, vram_size: u64) -> Result<()> {
-    println!(
-        "[1] Raw VRAM Bandwidth  (host↔device memcpy, avg of {} runs)",
-        RUNS
-    );
+    println!("[1] Raw VRAM Bandwidth  (host↔device memcpy, avg of {RUNS} runs)");
     println!(
         "    {:<12} {:>16} {:>16}",
         "Size", "Write (H→D)", "Read (D→H)"
@@ -419,15 +416,12 @@ fn bench_vram(device: usize, vram_size: u64) -> Result<()> {
 // ─── [2] Storage engine throughput ───────────────────────────────────────────
 
 fn bench_engine(device: usize, vram_size: u64) -> Result<()> {
-    println!(
-        "[2] Storage Engine Throughput  (no compress, no dedup, avg of {} runs)",
-        RUNS
-    );
+    println!("[2] Storage Engine Throughput  (no compress, no dedup, avg of {RUNS} runs)");
     println!("    {:<12} {:>16} {:>16}", "File size", "Write", "Read");
     println!("    {}", "─".repeat(48));
 
     let test_sizes: &[u64] = &[
-        1 * 1024 * 1024,
+        1024 * 1024, // 1 MiB
         16 * 1024 * 1024,
         64 * 1024 * 1024,
         256 * 1024 * 1024,
@@ -486,10 +480,7 @@ fn bench_engine(device: usize, vram_size: u64) -> Result<()> {
 // ─── [2a] Deduplicated storage engine throughput ────────────────────────────
 
 fn bench_engine_dedup(device: usize) -> Result<()> {
-    println!(
-        "[2a] Dedup Engine Throughput  (--dedup, avg of {} runs)",
-        RUNS
-    );
+    println!("[2a] Dedup Engine Throughput  (--dedup, avg of {RUNS} runs)");
 
     let size = 64 * 1024 * 1024u64;
     let vram = match Vram::new(device, size + 4 * CHUNK_SIZE) {
@@ -549,8 +540,7 @@ fn bench_engine_dedup(device: usize) -> Result<()> {
 
 fn bench_engine_compress(device: usize) -> Result<()> {
     println!(
-        "[2b] Compressed Engine Throughput  (--compress, compressible data, avg of {} runs)",
-        RUNS
+        "[2b] Compressed Engine Throughput  (--compress, compressible data, avg of {RUNS} runs)"
     );
 
     // Allocate a context buffer; compressible data uses little of it, and the
@@ -637,10 +627,7 @@ fn bench_compression(device: usize) -> Result<()> {
     // Extra scratch for nvCOMP internal buffers.
     let scratch_vram = (CHUNKS as u64 + 16) * CHUNK_SIZE;
 
-    println!(
-        "[3] Compression  ({} × 64 KiB chunks per run, avg of {} runs)",
-        CHUNKS, RUNS
-    );
+    println!("[3] Compression  ({CHUNKS} × 64 KiB chunks per run, avg of {RUNS} runs)");
 
     for (label, data) in &[
         (
@@ -772,8 +759,7 @@ fn bench_hash(device: usize) -> Result<()> {
     let total_bytes = CHUNK_SIZE * CHUNKS as u64;
 
     println!(
-        "[4] GPU FNV-1a Hash  (dedup path, {} × 64 KiB chunks per run, avg of {} runs)",
-        CHUNKS, RUNS
+        "[4] GPU FNV-1a Hash  (dedup path, {CHUNKS} × 64 KiB chunks per run, avg of {RUNS} runs)"
     );
 
     let vram_size = total_bytes + CHUNK_SIZE;
