@@ -2,7 +2,7 @@
 
 VRAMDISK is an app that mounts your GPU's VRAM as a Windows drive through its own file system.
 
-<img width="928" height="472" alt="image" src="https://github.com/user-attachments/assets/677a0817-f60f-4a86-bed0-a275abfb7a69" />
+<img width="928" height="472" alt="image" src="https://github.com/user-attachments/assets/42a44f7e-3a8c-4ab4-a85b-dad7a1769782" />
 
 Data is stored in VRAM in an object-storage-like layout, so the GPU's massive parallelism can be used to compress files, compute hashes, and encode files directly on the GPU.
 
@@ -24,9 +24,9 @@ Requirements: Windows (10 || 11) && NVIDIA GPU: > Maxwell (sm_50, CUDA 12.8)
 
 First, download and install WinFsp from [here](https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi).
 
-### Step 2. Download `vramdisk.exe`
+### Step 2. Download the app
 
-Get the desktop app `vramdisk.exe` from [Releases](../../releases). It is a standalone executable with no installer. Just copy it somewhere and run it.
+Get `vramdisk.zip` from [Releases](../../releases) and extract it.
 
 ### Step 3. Mount a VRAM disk
 
@@ -43,6 +43,20 @@ Installing the nvCOMP runtime DLL lets you compress files on the GPU (the "Compr
 You can get nvCOMP here:
 
 https://developer.nvidia.com/nvcomp-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local
+
+## Installation errors
+
+### "The code execution cannot proceed because VCRUNTIME140.dll was not found"
+
+Install the Microsoft Visual C++ Redistributable (VC++ runtime) from:
+
+https://aka.ms/vc14/vc_redist.x64.exe
+
+### "Could not find the WebView2 Runtime"
+
+Install the WebView2 runtime from the link below. The Evergreen Standalone Installer is fine.
+
+https://developer.microsoft.com/en-us/microsoft-edge/webview2?form=MA13LH#download
 
 ## Building
 
@@ -61,4 +75,4 @@ For the detailed internals, feed [DEV.md](DEV.md) to an LLM.
 This program is released under The MIT License.
 
 (c) 2026 ActiveTK.
-https://github.com/ActiveTK/gff/blob/master/LICENSE
+https://github.com/ActiveTK/VRAMDISK/blob/main/LICENSE
