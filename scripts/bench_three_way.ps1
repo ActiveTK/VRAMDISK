@@ -373,6 +373,26 @@ function Measure-Target([string]$root, [string]$name, [bool]$gpuNative) {
     $ops = @()
     if ($gpuNative) {
         $rel = "\vdbench\seq.dat"
+
+        # Warm the GPU before timing anything. Two separate costs land on the
+        # first jobs otherwise, and neither is what this table reports:
+        #
+        #   * the first job of the process waits out NVRTC (~5 s), which a
+        #     mount's background thread starts but cannot finish before a
+        #     benchmark that begins writing immediately reaches its first job;
+        #   * everything up to here is host<->device copies, which run on the
+        #     copy engines and leave the SMs idle, so the card is in a low clock
+        #     state and the first few kernels run at roughly a fifth of speed.
+        #     Measured decay across successive searches of the same 2 GiB file:
+        #     95, 90, 90, 34, 11, 11 ms.
+        #
+        # Three untimed runs cover both. The CPU column gets the same courtesy:
+        # its first of three runs warms the JIT and the file cache, and the
+        # minimum discards it.
+        for ($i = 0; $i -lt 3; $i++) {
+            $null = Time-VramJob $root @{ op = "search"; pattern = "XXRAREMARKERXX"; paths = @($rel); max_offsets = 4 }
+        }
+
         $best = [double]::MaxValue; $matches = 0; $engineMs = 0
         for ($i = 0; $i -lt 3; $i++) {
             $t = Time-VramJob $root @{ op = "search"; pattern = "XXRAREMARKERXX"; paths = @($rel); max_offsets = 4 }
