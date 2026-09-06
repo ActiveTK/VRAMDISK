@@ -13,6 +13,7 @@
 pub mod api_kernel;
 pub mod arena;
 pub mod bench;
+pub mod cdm_bench;
 pub mod chunk;
 pub mod cli;
 pub mod cli_run;

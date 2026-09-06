@@ -390,6 +390,11 @@ fn dispatch_cli_mode(argv: &[String]) {
         return;
     };
     let mode = first.to_ascii_lowercase();
+    // CrystalDiskMark back end: a patched CDM launches this with DiskSpd-style
+    // flags and reads the throughput out of the exit code (see cdm_bench).
+    if mode == "cdm-bench" {
+        std::process::exit(vramdisk::cdm_bench::run(argv[1..].to_vec()));
+    }
     if mode != "cli" && mode != "benchmark" {
         return;
     }
