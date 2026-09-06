@@ -291,6 +291,14 @@ impl ManagerState {
                         ));
                     }
                 }
+                // The engine has no language, so it reports this one in English
+                // by a known constant; swap in the localised wording here.
+                if e.to_string() == vramdisk::fs::WINFSP_DRIVER_NOT_LOADED {
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        crate::tr(lang, "err_winfsp_driver_not_loaded")
+                    ));
+                }
                 return Err(e);
             }
         };

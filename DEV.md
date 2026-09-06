@@ -535,6 +535,14 @@ WinFsp のホストプロセスを `TerminateProcess`（タスクマネージャ
 あることを確認してから `unload` / `load` する。ImDisk など別ドライバのものは
 影響を受けない。
 
+`unload` だけで止めると WinFsp のカーネルドライバが一切いなくなり、以降の
+マウントは全て `STATUS_NO_SUCH_DEVICE`（`0xC000000E` / HRESULT `0xD000000E`）で
+失敗する。生の NTSTATUS だけでは原因が分からないので、`mount()` はこのコードを
+判定して「ドライバが読み込まれていない。昇格して `fsptool-x64.exe load` を実行
+すること（再起動は不要）」と案内する。GUI 側は
+`vramdisk::fs::WINFSP_DRIVER_NOT_LOADED` との一致で検出し、翻訳済みの文言
+（`err_winfsp_driver_not_loaded`）に差し替える。
+
 ### WinFsp DLL 解決
 
 WinFsp は delay-load し、実行時にインストール先レジストリまたは既定パスから

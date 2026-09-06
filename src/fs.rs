@@ -2459,16 +2459,53 @@ fn volume_params() -> VolumeParams {
     vp
 }
 
+/// `STATUS_NO_SUCH_DEVICE`, and the HRESULT form of it that WinFsp also hands back.
+const STATUS_NO_SUCH_DEVICE: i32 = 0xC000_000Eu32 as i32;
+const HRESULT_NO_SUCH_DEVICE: i32 = 0xD000_000Eu32 as i32;
+
+/// WinFsp's user-mode DLL answers "no such device" when its kernel driver is not
+/// loaded -- the DLL and the installation are fine, there is simply nothing
+/// listening on `\Device\WinFsp.Disk`. That happens after `fsptool unload`, which
+/// is exactly what one runs to clear an orphaned mount point, so it is a state a
+/// user can easily be left in. The bare NTSTATUS says none of that.
+fn winfsp_driver_not_loaded(e: &windows::core::Error) -> bool {
+    matches!(e.code().0, STATUS_NO_SUCH_DEVICE | HRESULT_NO_SUCH_DEVICE)
+}
+
+/// The exact text `mount` fails with in that case. Public so a front end can
+/// recognise it and show its own translated wording instead.
+pub const WINFSP_DRIVER_NOT_LOADED: &str = r#"the WinFsp kernel driver is not loaded.
+
+WinFsp itself is installed -- its DLL answered -- but the file system driver is
+not running, so there is no device to attach a volume to. `fsptool unload` leaves
+the machine in this state, and nothing reloads the driver on its own.
+
+From an ELEVATED prompt:
+
+    "C:\Program Files (x86)\WinFsp\bin\fsptool-x64.exe" load
+
+No reboot is needed. `fsptool-x64.exe lsvol` should then run without error."#;
+
 pub fn mount(engine: StorageEngine, mount: &str, label: &str) -> anyhow::Result<MountedVramDisk> {
     preload_winfsp_dll().context("could not locate/load WinFsp (is it installed?)")?;
     let init = winfsp::winfsp_init().context("WinFsp init failed (is WinFsp installed?)")?;
 
     let fs = VramDiskFs::new(engine, label);
     let job_worker = fs.job_worker();
-    let mut host = VramDiskHost::new(volume_params(), fs)
-        .map_err(|e| anyhow::anyhow!("failed to create WinFsp host: {e:?}"))?;
-    host.mount(mount)
-        .map_err(|e| anyhow::anyhow!("failed to mount at {mount}: {e:?}"))?;
+    let mut host = VramDiskHost::new(volume_params(), fs).map_err(|e| {
+        if winfsp_driver_not_loaded(&e) {
+            anyhow::anyhow!(WINFSP_DRIVER_NOT_LOADED)
+        } else {
+            anyhow::anyhow!("failed to create WinFsp host: {e:?}")
+        }
+    })?;
+    host.mount(mount).map_err(|e| {
+        if winfsp_driver_not_loaded(&e) {
+            anyhow::anyhow!(WINFSP_DRIVER_NOT_LOADED)
+        } else {
+            anyhow::anyhow!("failed to mount at {mount}: {e:?}")
+        }
+    })?;
     host.start()
         .map_err(|e| anyhow::anyhow!("failed to start dispatcher: {e:?}"))?;
     Ok(MountedVramDisk {
@@ -2562,6 +2599,9 @@ If {letter} is the only line, then from an ELEVATED prompt:
     fsptool-x64.exe unload
     fsptool-x64.exe load
 
+Run both. `unload` on its own leaves the machine with no WinFsp driver at all, and every
+later mount then fails with "no such device" until `load` puts it back.
+
 Any other WinFsp filesystem (sshfs-win, rclone mount, ...) would be torn down too, which
 is why the check comes first. Anything on a different driver -- an ImDisk RAM disk, for
 instance -- is unaffected."#
@@ -2648,6 +2688,20 @@ Mounted at {mount_point}. Press Enter (or Ctrl-C) to unmount."
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn no_such_device_is_recognised_in_both_forms() {
+        // WinFsp hands the same condition back as a raw NTSTATUS or as the
+        // HRESULT that wraps it, depending on which layer failed.
+        let err =
+            |code: u32| windows::core::Error::from_hresult(windows::core::HRESULT(code as i32));
+        assert!(winfsp_driver_not_loaded(&err(0xC000_000E)));
+        assert!(winfsp_driver_not_loaded(&err(0xD000_000E)));
+        // Anything else keeps the raw diagnostic; a wrong guess here would send
+        // the user off reloading a driver that is working fine.
+        assert!(!winfsp_driver_not_loaded(&err(0xC000_0022))); // STATUS_ACCESS_DENIED
+        assert!(!winfsp_driver_not_loaded(&err(0x8007_0002))); // ERROR_FILE_NOT_FOUND
+    }
 
     #[test]
     fn default_security_descriptor_is_self_relative() {
