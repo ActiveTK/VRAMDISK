@@ -8,3 +8,6 @@
 /src-tauri/target
 /src-tauri/gen
 /node_modules
+
+# Benchmark raw output
+/.bench_three_way.json

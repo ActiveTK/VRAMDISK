@@ -1,9 +1,10 @@
 # scripts/
 
-Manual end-to-end verification for VRAMDISK. Both scripts mount the real
-release binary on a real drive letter and drive it through the Windows
-filesystem API, so **both need an NVIDIA GPU, CUDA and WinFsp on the machine
-running them** — they cannot run on CI, and they are not part of `cargo test`.
+Manual end-to-end verification and benchmarking for VRAMDISK. Every script here
+mounts the real release binary on a real drive letter and drives it through the
+Windows filesystem API, so **they all need an NVIDIA GPU, CUDA and WinFsp on the
+machine running them** — they cannot run on CI, and they are not part of
+`cargo test`.
 Run them by hand before a release, after the release build succeeds.
 
 Build first (these scripts never build anything themselves):
@@ -46,7 +47,7 @@ random-read latency, and a small-file/metadata workload (create, stat, read,
 delete).
 
 ```powershell
-pwsh -File scriptsench_vs_ramdisk.ps1 -RamDisk R:\ [-Drive V:] [-Size 4GiB]
+pwsh -File scripts\bench_vs_ramdisk.ps1 -RamDisk R:\ [-Drive V:] [-Size 4GiB]
 ```
 
 You need a RAM disk mounted already -- ImDisk, OSFMount, whatever -- and its
@@ -59,6 +60,25 @@ mode really bypasses the Windows cache manager. Both modes are reported
 because both drives sit behind that cache; measuring only one would say more
 about the cache than about the device.
 
+## bench_three_way.ps1
+
+The same head-to-head widened to three targets: VRAMDISK, GpuRamDrive (GPU VRAM
+behind ImDisk's block device, with NTFS on top) and an ordinary RAM disk. On top
+of what `bench_vs_ramdisk.ps1` measures it adds random-read latency at three
+block sizes, concurrent sequential reads at 1/2/4/8 threads, the memory each
+design reserves, and a data-processing table — full-text search, MD5, SHA-256
+and zip — where VRAMDISK computes on the GPU and the other two must pull every
+byte into the CPU first.
+
+```powershell
+pwsh -File scripts\bench_three_way.ps1 -RamDisk R:\ -GpuRamDrive P:\ [-Drive V:]
+```
+
+Both of the other drives must already be mounted (each needs elevation to
+create, which this script deliberately does not ask for). Raw results are
+written to `.bench_three_way.json` at the repository root, which is git-ignored;
+the write-up lives in [`hikaku.md`](../hikaku.md).
+
 ## e2e_jobs.ps1
 
 The `$VRAMDISK` internal virtual API (DEV.md section 11), which the robustness
@@ -70,8 +90,9 @@ script does not touch at all:
   refuses writes, directory creation and deletes.
 - **Hash jobs** — `md5` / `sha1` / `sha256` / `fnv1a64` against host-computed
   digests, for both a tiny file (CUDA API-kernel path) and a 256 MiB file
-  (forced onto the CPU streaming path, which the calibrated routing threshold
-  is clamped to at most 128 MiB), plus recursive directory hashing.
+  (which calibration routes to the CPU streaming path on any machine whose CPU
+  hashes faster than its GPU, i.e. every machine measured so far), plus
+  recursive directory hashing.
 - **Encode jobs** — Base64 and hex, encode and decode, a byte-identical binary
   round-trip, the Base64 output checked against `[Convert]::ToBase64String`,
   and an invalid-character decode that must fail the job rather than hang.

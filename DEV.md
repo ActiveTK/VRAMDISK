@@ -852,6 +852,32 @@ write/read を次の 4 モードで計測する。
 - dedup
 - compress+dedup
 
+### 3 者比較
+
+`scripts\bench_three_way.ps1` は VRAMDISK・GpuRamDrive・システム RAM の RAM ディスクを
+同一ハーネスで計測する。結果と考察は `hikaku.md`。
+
+### 既知の性能欠陥：チャンクサイズでの上書きが配置を崩す
+
+`raw_runs()` は、論理的に隣接するチャンクの VRAM アドレスが連続している間だけ 1 つの
+ラン にまとめる。まとまれば 2 GiB を数回のカーネル起動で走査できるが、崩れると
+チャンクごとにカーネル起動とホスト側の境界つなぎが要る。
+
+**同じファイルをちょうど `CHUNK_SIZE`（64 KiB）ずつのブロックで上書きすると、この
+連続性が失われる。** 実測（2 GiB ファイル、GPU 検索の engine 時間）:
+
+```
+上書き前                          11 ms
+4 KiB ブロックで 3 回上書き        11 ms
+64 KiB ブロックで 3 回上書き       86 ms   <-- CHUNK_SIZE と一致
+1 MiB ブロックで 3 回上書き        10 ms   <-- 回復する
+16 MiB ブロックで 3 回上書き       13 ms
+```
+
+1 回だけ書いたファイルはブロックサイズによらず速い（1 GiB あたり 5〜7 ms）。
+上書きのときだけ起きる。断片化以外の要因（初回のカーネルコンパイル、VRAM の空き、
+GPU クロック）は個別に計測して除外済み。未修正。
+
 ### 検証
 
 実 VRAM を確保する（`Vram::new`）、CUDA kernel を起動する、nvCOMP を読み込む、の
@@ -867,6 +893,7 @@ write/read を次の 4 モードで計測する。
 | `cargo build` | CI | `vramdisk.exe`（GUI と CLI は同一バイナリ） |
 | `scripts\e2e_robustness.ps1` | ローカル（GPU 必須） | 通常の filesystem 面 |
 | `scripts\e2e_jobs.ps1` | ローカル（GPU 必須） | `$VRAMDISK` 仮想 API 全面 |
+| `scripts\bench_three_way.ps1` | ローカル（GPU + RAM ディスク + GpuRamDrive） | 3 者性能比較 → `hikaku.md` |
 
 GitHub-hosted runner には NVIDIA GPU が無いため、GPU 必須の unit test と E2E は
 CI で実行できない。リリース前に手動で回す。詳細は `scripts/README.md`。
