@@ -2545,7 +2545,26 @@ pub fn release_stale_mount(mount: &str) -> anyhow::Result<()> {
             Ok(())
         }
         Some(_) => anyhow::bail!(
-            "{letter} is still mapped. The definition lives in the system-wide device map, so removing it needs administrator rights -- re-run this from an elevated prompt."
+            r#"{letter} is still mapped, and nothing in user mode can take it away.
+
+The letter is a symbolic link in this logon session's device map, and the WinFsp driver
+still holds the orphaned volume behind it. DefineDosDevice reports success without
+changing anything, mountvol manages a different kind of mount point, and an elevated
+prompt gets its own device map where the letter does not even appear.
+
+Reloading the WinFsp driver releases it, with no reboot. fsptool-x64.exe lives in
+WinFsp's bin directory. First check that this is the only WinFsp volume:
+
+    fsptool-x64.exe lsvol
+
+If {letter} is the only line, then from an ELEVATED prompt:
+
+    fsptool-x64.exe unload
+    fsptool-x64.exe load
+
+Any other WinFsp filesystem (sshfs-win, rclone mount, ...) would be torn down too, which
+is why the check comes first. Anything on a different driver -- an ImDisk RAM disk, for
+instance -- is unaffected."#
         ),
     }
 }
