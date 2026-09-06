@@ -1,0 +1,76 @@
+=== VRAMDISK Speed Benchmark ===
+  device : CUDA[0] NVIDIA GeForce RTX 4070 (11.99 GB)
+  vram   : 6.00 GB
+  runs   : 3 per measurement
+
+[1] Raw VRAM Bandwidth  (host↔device memcpy, avg of 3 runs)
+    Size              Write (H→D)       Read (D→H)
+    ────────────────────────────────────────────────
+    4.00 KB            312.5 MB/s       358.4 MB/s
+    256.00 KB           5.33 GB/s        4.48 GB/s
+    4.00 MB             9.94 GB/s        6.53 GB/s
+    64.00 MB           10.48 GB/s        8.23 GB/s
+
+[1b] Device-to-Device Copy  (never crosses PCIe, avg of 3 runs)
+    Size               raw memcpy      file → file
+    ────────────────────────────────────────────────
+    4.00 MB           128.22 GB/s        4.23 GB/s
+    64.00 MB          195.64 GB/s        4.21 GB/s
+    256.00 MB         208.91 GB/s        4.08 GB/s
+    1.00 GB           212.99 GB/s        4.24 GB/s
+
+[2] Storage Engine Throughput  (no compress, no dedup, avg of 3 runs)
+    File size               Write             Read
+    ────────────────────────────────────────────────
+    1.00 MB             9.52 GB/s        2.97 GB/s
+    16.00 MB            8.75 GB/s        5.96 GB/s
+    64.00 MB           10.98 GB/s        4.95 GB/s
+    256.00 MB          10.23 GB/s        5.53 GB/s
+
+[2b] Concurrent Read Throughput  (8 threads, 256.00 MB, avg of 3 runs)
+    Block               Exclusive           Shared    Speedup
+    ──────────────────────────────────────────────────────────
+    64.00 KB            2.96 GB/s        2.86 GB/s      0.97x
+    1.00 MB             7.78 GB/s       10.90 GB/s      1.40x
+    4.00 MB             7.22 GB/s        8.17 GB/s      1.13x
+    16.00 MB            6.41 GB/s        6.57 GB/s      1.02x
+
+[2a] Dedup Engine Throughput  (--dedup, avg of 3 runs)
+    Case                 Write (verify)    Write (trust)
+    ────────────────────────────────────────────────────
+    unique write              9.08 GB/s        8.74 GB/s
+    duplicate write           1.72 GB/s       11.56 GB/s
+
+[2b] Compressed Engine Throughput  (--compress, compressible data, avg of 3 runs)
+    Data                    Write             Read
+    ────────────────────────────────────────────────
+    compressible        4.10 GB/s      1016.9 MB/s
+    incompressible        1.80 GB/s        4.86 GB/s
+
+[3] Compression  (256 × 64 KiB chunks per run, avg of 3 runs)
+
+    Data: compressible (64-byte repeating pattern)
+    Codec                Compress     Decompress    Ratio
+    ──────────────────────────────────────────────────────
+    LZ4 (GPU)           2.70 GB/s      1.36 GB/s  198.0:1
+    zstd-3 (CPU)       211.5 MB/s      1.55 GB/s  789.6:1
+
+    Data: incompressible (pseudo-random)
+    Codec                Compress     Decompress    Ratio
+    ──────────────────────────────────────────────────────
+    LZ4 (GPU)           2.72 GB/s      N/A (raw)    1.0:1
+    zstd-3 (CPU)       206.1 MB/s      1.44 GB/s    1.0:1
+
+[4] GPU FNV-1a Hash  (dedup path, 256 × 64 KiB chunks per run, avg of 3 runs)
+    batched (256 chunks/launch) : 74.03 GB/s
+    single chunk             : 737.6 MB/s (84.7 µs/chunk)
+
+[5] Full-Text Search  (512.00 MB payload, avg of 3 runs)
+    Pattern              CPU scan       GPU scan    Speedup   Matches
+    ------------------------------------------------------------------
+    rare (14 B)         4.24 GB/s    210.00 GB/s      49.5x         1
+    common (10 B)       2.36 GB/s    103.87 GB/s      44.0x   7354396
+    short (3 B)         2.82 GB/s    105.88 GB/s      37.5x   7354396
+    end to end                  -    100.72 GB/s              7354396
+
+Benchmark complete.
