@@ -838,6 +838,7 @@ GUI から実測すると、初回の job は module load と calibration を負
 `--bench` は合成ベンチマークを実行して終了する。主な計測対象は次の通り。
 
 - raw VRAM H2D / D2H bandwidth。
+- device-to-device コピー（生の memcpy と、ボリューム内のファイル→ファイル）。
 - raw storage engine write/read throughput。
 - dedup unique write / duplicate write throughput。
 - compressible / incompressible データでの compressed engine write/read throughput。
@@ -851,6 +852,22 @@ write/read を次の 4 モードで計測する。
 - compress
 - dedup
 - compress+dedup
+
+### device-to-device コピー
+
+ファイルベンチマーク（CrystalDiskMark、DiskSpd、その他 `ReadFile`/`WriteFile` を
+叩くもの全て）は、原理的に VRAM ↔ システムメモリしか測れない。読み書きするバッファが
+ベンチマークプロセスのアドレス空間にあるからで、ツールの実装を変えても動かない。
+RAM ディスクはその呼び出しをシステムメモリで処理するので、比較は「PCIe 往復」対
+「memcpy」になる。
+
+`StorageEngine::copy_file_in_volume` はこの制約の外にある操作である。ボリューム内の
+ファイル間コピーをホストを経由せずに行う。Win32 のファイル API にはこれを要求する
+手段が無いので、エンジン内部からしか到達できない。
+
+コピー先は `allocate_raw_file` で先に連続確保する。転送の結合（`raw_run_bytes`）は
+既にマップ済みで物理的に隣接するチャンクにしか効かないため、確保しないと 64 KiB
+ごとの memcpy になる。実測（1 GiB）で **4.2 GB/s → 176 GB/s**。
 
 ### 3 者比較
 

@@ -51,6 +51,7 @@ pub fn run(device: usize, vram_size: u64) -> Result<()> {
     println!("  runs   : {RUNS} per measurement\n");
 
     bench_vram(device, vram_size)?;
+    bench_device_copy(device, vram_size)?;
     bench_engine(device, vram_size)?;
     bench_engine_concurrent_read(device)?;
     bench_engine_dedup(device)?;
@@ -411,6 +412,79 @@ fn bench_vram(device: usize, vram_size: u64) -> Result<()> {
             throughput(size, avg(&wt)),
             throughput(size, avg(&rt)),
         );
+    }
+    println!();
+    Ok(())
+}
+
+// ─── [1b] Device-to-device copy ──────────────────────────────────────────────
+
+/// What a copy costs when the bytes never leave VRAM.
+///
+/// Every file benchmark — CrystalDiskMark, DiskSpd, anything driving
+/// `ReadFile`/`WriteFile` — necessarily measures VRAM ↔ system RAM, because the
+/// buffer it reads from and writes into lives in the benchmarking process. A
+/// RAM disk answers those calls out of system RAM, so the comparison is between
+/// a PCIe round trip and a `memcpy`. This section measures the operation those
+/// tools cannot reach: a copy that stays on the device.
+fn bench_device_copy(device: usize, vram_size: u64) -> Result<()> {
+    println!("[1b] Device-to-Device Copy  (never crosses PCIe, avg of {RUNS} runs)");
+    println!(
+        "    {:<12} {:>16} {:>16}",
+        "Size", "raw memcpy", "file → file"
+    );
+    println!("    {}", "─".repeat(48));
+
+    let sizes: &[u64] = &[
+        4 * 1024 * 1024,
+        64 * 1024 * 1024,
+        256 * 1024 * 1024,
+        1024 * 1024 * 1024,
+    ];
+    for &size in sizes {
+        // Source and destination both live in the same allocation, so the
+        // arena has to hold two copies plus the engine's own bookkeeping.
+        if size * 3 > vram_size {
+            break;
+        }
+
+        let raw = {
+            let mut vram = Vram::new(device, size * 2)?;
+            let base = vram.buf_device_ptr();
+            vram.write_at(0, &vec![0xA5u8; size as usize])?;
+            let mut t = Vec::with_capacity(RUNS);
+            for _ in 0..RUNS {
+                let start = Instant::now();
+                vram.copy_dev_into(size, base, size)?;
+                vram.sync()?;
+                t.push(start.elapsed());
+            }
+            throughput(size, avg(&t))
+        };
+
+        let file = {
+            let vram = Vram::new(device, size * 3)?;
+            let mut engine = StorageEngine::new(vram, false, false)?;
+            engine.table_mut().create_file("\\src.bin", 0).unwrap();
+            let block = vec![0x5Au8; 8 * 1024 * 1024];
+            let mut off = 0u64;
+            while off < size {
+                let take = ((size - off) as usize).min(block.len());
+                engine.write("\\src.bin", off, &block[..take])?;
+                off += take as u64;
+            }
+            let mut t = Vec::with_capacity(RUNS);
+            for i in 0..RUNS {
+                let dst = format!("\\dst{i}.bin");
+                let start = Instant::now();
+                engine.copy_file_in_volume("\\src.bin", &dst)?;
+                t.push(start.elapsed());
+                engine.remove(&dst)?;
+            }
+            throughput(size, avg(&t))
+        };
+
+        println!("    {:<12} {:>16} {:>16}", format_size(size), raw, file);
     }
     println!();
     Ok(())
