@@ -9,12 +9,26 @@ license = "MIT"
 name = "vramdisk"
 path = "src/lib.rs"
 
+# Tests that allocate real VRAM (`Vram::new`), launch CUDA kernels or load
+# nvCOMP are gated behind `gpu-tests`, which is ON by default so a plain
+# `cargo test` on a development machine still runs everything. CI has no
+# NVIDIA device, so it runs `cargo test --no-default-features`, which leaves
+# the GPU-free tests (namespace, allocator, job registry, CLI parsing, CRC
+# tables) running there instead of skipping testing altogether.
+[features]
+default = ["gpu-tests"]
+gpu-tests = []
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "cuda-12080", "dynamic-loading"] }
+digest = "0.10"
 libloading = "0.8"
+md-5 = "0.10"
 serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
 zstd = "0.13"
 
 [profile.release]
@@ -32,7 +46,9 @@ windows = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Registry",
+    "Win32_System_Threading",
 ] }
 
 [target.'cfg(windows)'.build-dependencies]

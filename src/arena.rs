@@ -27,6 +27,8 @@ struct Arena {
     used: u32,
     /// Freed `(offset, len)` slots available for reuse (no coalescing).
     free: Vec<(u32, u32)>,
+    /// Whether this arena is currently listed in `CompressedAllocator::open`.
+    in_open: bool,
 }
 
 impl Arena {
@@ -35,7 +37,14 @@ impl Arena {
             bump: 0,
             used: 0,
             free: Vec::new(),
+            in_open: false,
         }
+    }
+
+    /// No bump space left and no freed slots: nothing can ever fit again
+    /// until something is freed.
+    fn exhausted(&self) -> bool {
+        self.bump as u64 >= CHUNK_SIZE && self.free.is_empty()
     }
 
     /// Try to carve `len` bytes from this arena, returning the local offset.
@@ -76,27 +85,56 @@ impl Arena {
 }
 
 /// Sub-allocator over a set of 64KiB arena chunks.
+///
+/// Allocation cost is bounded: instead of scanning every arena (which turns a
+/// large compressed disk's per-chunk write into an O(#arenas) walk), only a
+/// short tail of `open` — arenas known to have bump space or freed slots — is
+/// probed, most recently touched first.
 #[derive(Default)]
 pub struct CompressedAllocator {
     arenas: HashMap<ChunkId, Arena>,
+    /// Arena chunks that (probably) still have free space, most recently
+    /// touched last. May contain stale ids of arenas that were dropped; those
+    /// are pruned lazily during allocation scans.
+    open: Vec<ChunkId>,
 }
 
 impl CompressedAllocator {
+    /// How many open arenas one allocation may probe before giving up and
+    /// letting the engine add a fresh arena. Bounds per-write cost while
+    /// keeping packing tight (freed space is still reused, just not
+    /// exhaustively hunted for).
+    const SCAN_LIMIT: usize = 32;
+
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Try to allocate `len` bytes in an existing arena, returning the
-    /// absolute byte offset into the VRAM buffer. Returns `None` if no current
+    /// absolute byte offset into the VRAM buffer. Returns `None` if no probed
     /// arena has room (the engine should then [`add_arena`] and retry).
     ///
     /// [`add_arena`]: CompressedAllocator::add_arena
     pub fn try_alloc(&mut self, len: u32) -> Option<u64> {
         debug_assert!(len > 0 && len as u64 <= CHUNK_SIZE);
-        for (&chunk, arena) in self.arenas.iter_mut() {
+        let mut scanned = 0usize;
+        let mut i = self.open.len();
+        while i > 0 && scanned < Self::SCAN_LIMIT {
+            i -= 1;
+            let chunk = self.open[i];
+            let Some(arena) = self.arenas.get_mut(&chunk) else {
+                // Stale id: the arena emptied and was dropped.
+                self.open.swap_remove(i);
+                continue;
+            };
             if let Some(off) = arena.alloc(len) {
+                if arena.exhausted() {
+                    arena.in_open = false;
+                    self.open.swap_remove(i);
+                }
                 return Some(chunk as u64 * CHUNK_SIZE + off as u64);
             }
+            scanned += 1;
         }
         None
     }
@@ -106,6 +144,10 @@ impl CompressedAllocator {
     pub fn add_arena(&mut self, chunk: ChunkId, len: u32) -> u64 {
         let mut arena = Arena::new();
         let off = arena.alloc(len).expect("fresh arena must fit len <= chunk");
+        if !arena.exhausted() {
+            arena.in_open = true;
+            self.open.push(chunk);
+        }
         self.arenas.insert(chunk, arena);
         chunk as u64 * CHUNK_SIZE + off as u64
     }
@@ -119,9 +161,14 @@ impl CompressedAllocator {
         let arena = self.arenas.get_mut(&chunk)?;
         arena.free(local, len);
         if arena.used == 0 {
+            // The id may still sit in `open`; it is pruned lazily on scan.
             self.arenas.remove(&chunk);
             Some(chunk)
         } else {
+            if !arena.in_open {
+                arena.in_open = true;
+                self.open.push(chunk);
+            }
             None
         }
     }

@@ -18,6 +18,7 @@ VRAMDISK が提供する主要機能は次の通り。
 - 任意のチャンク重複排除。
 - 任意のチャンク圧縮。
 - GPU 上でのハッシュ計算。
+- GPU 上でのファイルの Base64 / hex エンコード・デコード。
 - マウント済みファイルシステム内に公開される `$VRAMDISK` 仮想 API。
 - 共通 Rust エンジンを利用する CLI と Tauri GUI。
 
@@ -95,10 +96,12 @@ vramdisk.exe cli --bench-io
 | `-s, --size <SIZE>` | `max(0.8 x GPU[0] VRAM, 2GiB)` | ディスクサイズ。64 KiB 単位に切り上げる。`2GB`、`512MiB`、バイト数などを受け付ける。 |
 | `-c, --compress` | off | チャンク圧縮を有効にする。nvCOMP LZ4 を優先し、利用不可時は CPU zstd を使う。 |
 | `-d, --dedup` | off | チャンク重複排除を有効にする。圧縮と併用可能。 |
+| `--dedup-trust-hash` | off | dedup の共有判定を FNV-1a hash 一致のみで行い、byte 比較を省く。速いが、書き手を信頼できない環境では誤共有が起きる。`--dedup` 無しでは無効。 |
 | `-m, --mount <PT>` | `R:` | ドライブレターまたはディレクトリマウントポイント。 |
 | `--device <N>` | `0` | CUDA デバイス序数。 |
 | `--bench` | off | 合成ベンチマークを実行して終了する。マウント系オプションとは排他。 |
 | `--bench-io` | off | 一時マウントした VRAMDISK 上で実ファイルシステム越しの sequential write/read を計測する。 |
+| `--release-stale-mount <MOUNT>` | — | 強制終了で取り残されたドライブレターを解放して終了する。応答しているドライブには触れない。解放には管理者権限が必要。 |
 
 CLI でマウントした場合、Enter、Ctrl-C、またはプロセス終了までマウントを保持
 する。標準入力が EOF の場合は、プロセスが終了するまでマウントを維持する。
@@ -123,7 +126,7 @@ lib.rs
   gpu_hash.rs     GPU FNV-1a hash kernel wrapper
   api_kernel.rs   仮想 API 用 CUDA kernel
   internal_api.rs $VRAMDISK 仮想 API
-  engine.rs       byte-range I/O、sparse、dedup、compression
+  engine.rs       byte-range I/O、sparse、dedup、compression、encode jobs
   fs.rs           WinFsp filesystem 実装
 
 src-tauri/
@@ -243,6 +246,29 @@ copy-on-write を統合する。
 - スパース穴のゼロ埋め read。
 - 連続 raw チャンクの大きな転送への結合。
 
+### エラー分類
+
+`EngineError` は、呼び出し側がエラー文字列を検査せずに扱いを決められるよう
+分類されている。WinFsp 層はこの分類から `NTSTATUS` を、Jobs API はメッセージを
+選ぶ。`Display` は variant 名も Rust の quoting も含まない 1 行の英文を返し、
+その文字列がそのまま `result.json` と GUI に出る。
+
+| variant | 意味 | NTSTATUS |
+|---|---|---|
+| `Lookup` | 名前空間の解決失敗 | lookup 種別ごと |
+| `NoSpace` | 空き物理チャンクなし | `STATUS_DISK_FULL` |
+| `OutOfVram` | ジョブ用の一時 VRAM 不足（対処を含むメッセージ） | `STATUS_DISK_FULL` |
+| `NotAFile` | ファイルを期待した位置がディレクトリ | `STATUS_FILE_IS_A_DIRECTORY` |
+| `Cancelled` | 協調キャンセル | `STATUS_ACCESS_DENIED` |
+| `Cuda` | CUDA / nvCOMP の実失敗のみ | `STATUS_ACCESS_DENIED` |
+| `InvalidInput` | 入力データ・引数が不正（archive framing、base64、path 等） | `STATUS_INVALID_PARAMETER` |
+| `Unsupported` | 入力は正しいがこのビルド／構成で扱えない | `STATUS_INVALID_DEVICE_REQUEST` |
+| `Internal` | 自前で格納したデータが round-trip しない（不変条件違反） | `STATUS_DATA_ERROR` |
+
+`Cuda` を名乗ってよいのは `cuda()` helper が包む実際の driver / kernel 失敗だけ
+である。parse や検証の失敗をここに混ぜると、利用者は「GPU が壊れた」と読んで
+見当違いの調査を始める。
+
 ### Raw モード
 
 圧縮と重複排除がどちらも無効な場合、連続する full-chunk write は可能な限り
@@ -258,8 +284,33 @@ copy-on-write を統合する。
 - `chunk_hash` / `compressed_hash`: 逆引きメタデータ。
 
 content hash には GPU と CPU で同じ結果になる 2 段階 FNV-1a 64-bit を使う。
-full-chunk write は hash 一致候補を探し、衝突候補を検証してから既存 placement を
-共有する。
+full-chunk write は hash 一致候補を `hash_index` から探す。
+
+**hash の一致だけでは共有しない。** 共有を確定する前に、候補の中身と書き込もうと
+しているバイト列を厳密に比較する。
+
+- raw placement: 候補チャンク 64 KiB を device-to-host で読み戻して比較する。
+- compressed placement: blob を解凍して比較する。
+
+不一致なら候補を捨てて通常どおり新しいチャンクへ格納する（エラーにはしない）。
+拒否件数は `dedup.rejected_chunks` として trace に出る。
+
+FNV-1a は衝突耐性を持たず、衝突は意図的に構成できる。hash の再計算だけで確認して
+いた頃は、任意のバイト列を書ける主体が無関係なファイルのチャンクを自分のものへ
+別名化でき、そのファイルは黙って攻撃者のデータを読み出すようになっていた。
+バイト比較はこれを塞ぐ。
+
+batch 経路では、候補を採用する瞬間に `hash_index` を読み直す。batch 開始時の
+スナップショットを使うと、同一 batch 内で解放済みのチャンクを採用してしまい、
+allocator が空きとみなしているチャンクをファイルが指す状態を作れる
+（`[A,B]` を `[B,A]` で上書きする書き込みで発生する）。batch 中に索引の項目は
+削除されるだけで置き換えられないため、その場で引ける候補はスナップショットと
+同じ placement であることが保証される。
+
+検証のコストは重複が実際に見つかったときだけ発生する。unique write は影響を
+受けず、全重複の write は 64 KiB ごとの D2H 読み戻しぶん約 3〜4 倍遅くなる
+（実測で約 6 GB/s → 約 1.5〜1.9 GB/s）。すべての書き手を信頼できる環境では
+`--dedup-trust-hash` で従来の hash のみの判定に戻せる。
 
 共有 placement は部分書き込み時に直接変更しない。部分書き込みでは次の
 copy-on-write 手順を取る。
@@ -363,6 +414,55 @@ WinFsp の callback 全体を大域直列化せず、共有状態を mutex で�
 現行の engine 操作は `StorageEngine` mutex 内で直列化され、CUDA stream の利用も
 この範囲で整合させる。
 
+長時間ジョブがこの mutex を保持し続けるとボリューム全体が応答しなくなるため、
+job executor は engine 呼び出しを分割し、その境界ごとに lock を取り直す。
+
+| job | lock 保持の粒度 |
+|---|---|
+| CPU hash | 32 MiB window ごと |
+| GPU hash | GPU launch budget（約 0.1 秒ぶん）で区切った batch ごと |
+| archive / encode | 1 回の engine 呼び出し |
+
+lock を手放す境界では、並行 writer によって window / batch 間で観測時点の
+異なるスナップショットが混ざり得る。ジョブの応答性を優先してこれを許容する。
+
+engine は `RwLock` で保護する。メタデータのみを読む callback（stat、
+ディレクトリ列挙、security 照会、volume 情報）は shared guard を取り、互いに
+並行して走る。状態を変更するものは exclusive guard を取る。
+
+`read` callback はまず shared guard で `StorageEngine::read_into_shared` を
+試す。要求が触れる論理チャンクがすべて `Raw` またはスパース穴であれば、
+`Vram::read_at`（`&self` かつ内部で同期済み）だけで応答できるため、読み取りは
+互いに並行して走る。圧縮 placement を 1 つでも含む場合は、事前走査の段階で
+`Ok(None)` を返す（出力バッファには一切書き込まない）。呼び出し側は shared
+guard を解放してから exclusive guard を取り直し、ファイルを解決し直して
+`read_into` で再実行する。`RwLock` は再入不可であり、両方を同時に保持すると
+自スレッドで deadlock するため、この解放は必須である。
+
+trace カウンタは `AtomicU64` であり、shared guard 上の読み取りも exclusive
+path と同一に計上される（`trace_snapshot()` は従来通り plain `u64` の
+`EngineTrace` を返す）。
+
+Windows の `RwLock` は SRWLOCK であり fair ではないため、理屈の上では読み手が
+書き手を待たせ続け得る。WinFsp の dispatch thread 数は有界で、これらの callback
+は短時間で終わるため、実際には到達しない。
+
+より細かい粒度（ファイル単位・領域単位の lock と複数 CUDA stream の併用）は
+未実装である。write callback、および圧縮データを含む read は依然として
+exclusive guard 上で直列化される。
+
+### メタデータキャッシュ
+
+WinFsp のキャッシュタイムアウトは `file_info` のみ設定されており、`dir_info` /
+`volume_info` / `security` / `stream_info` は 0（キャッシュしない）だった。
+これらは 1 つ miss するごとに user-mode への往復が発生する。実測でこのスタックの
+往復は約 14 マイクロ秒で、cold path への `GetFileAttributesEx` はその往復を
+何度も踏む。特に security は path 解決のたびに問い合わされる。
+
+現在は 5 つとも 1000 ms を設定している。代償は staleness で、別ハンドル経由の
+ACL / サイズ変更が観測されるまで最大 1 秒かかる。これは元から `file_info` が
+受け入れていた条件と同じである。
+
 ### open handle と rename
 
 open handle は現在パスと delete-pending 状態を保持する。rename 時は対象サブツリー
@@ -375,11 +475,73 @@ security descriptor は node ごとに self-relative Windows security descriptor
 保持する。create 時には WinFsp から渡された descriptor を保存し、security 更新時は
 既存 descriptor に modification descriptor を適用する。
 
-明示 descriptor を持たない node と `$VRAMDISK` 仮想 node は次の既定 SDDL を使う。
+明示 descriptor を持たない node と `$VRAMDISK` 仮想 node は、マウントしたユーザー
+自身と SYSTEM / Administrators だけにフルアクセスを与える既定 SDDL を使う。
+`<user>` はプロセス token の user SID である。
 
 ```text
-O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)
+O:<user>G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<user>)
 ```
+
+token の照会に失敗した場合に限り、Everyone フルアクセス
+（`O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)`）へ fallback し、その旨を
+stderr に警告する。開けないボリュームより緩いボリュームの方がましだという判断で
+あり、実際にこの経路へ落ちることは想定していない。
+
+### CUDA kernel の事前コンパイル
+
+API kernel の PTX は NVRTC で実行時にコンパイルする。これに約 6 秒かかり、
+以前は最初の hash / archive / encode job がその全額を負担していた。
+
+現在はプロセスにつき 1 回だけコンパイルし（`OnceLock`）、`StorageEngine::new`
+から detached thread で先行して開始する。マウント時に同期実行すると mount が
+0.20 秒から 5.60 秒に伸びるため、背景で走らせている。mount は 0.23 秒のまま、
+最初の job は module load と calibration の約 0.2 秒だけを負担する。
+
+### 取り残されたマウントポイント
+
+WinFsp のホストプロセスを `TerminateProcess`（タスクマネージャの「タスクの終了」、
+`Stop-Process -Force`、`taskkill /F`）で落とすとアンマウントが走らず、ボリューム
+デバイスが残ることがある。この状態のドライブレターは I/O に一切応答しないため、
+ドライブを列挙するもの（PowerShell の provider 初期化、エクスプローラー、ファイル
+ダイアログ）が軒並みハングし、そのレターは再利用もできない。マッピングは
+システム全体のデバイスマップにあるので、プロセスが消えても残る。
+
+対策は 2 段構えである。
+
+- CLI の mount は `SetConsoleCtrlHandler` を入れてあり、Ctrl-C / Ctrl-Break /
+  コンソールを閉じる / ログオフ / シャットダウンのいずれでもアンマウントしてから
+  終了する。ハンドラは main スレッドのアンマウント完了を上限付きで待つ。
+  ここで待たずに戻ると Windows が撤収の途中でプロセスを殺す。
+- それでも取り残された場合は `--release-stale-mount <MOUNT>` で診断する。
+  対象が 5 秒以内に応答した場合は「生きている」と判断して何もしない（稼働中の
+  ボリュームを奪わないため）。
+
+ドライブレターは**そのログオンセッションのデバイスマップ**にあるシンボリック
+リンクであり、その先の孤児ボリュームを WinFsp ドライバが掴んだままになっている。
+このため user mode からは撤去できない。実測で確認した挙動は次の通り。
+
+| 手段 | 結果 |
+|---|---|
+| `DefineDosDevice(DDD_REMOVE_DEFINITION)` | 成功を返すが実際には消えない |
+| `mountvol <D>: /D` | 「指定されたファイルが見つかりません」（管理対象が別） |
+| 昇格したプロセスから同上 | そもそもレターが見えない（昇格で別のデバイスマップになる） |
+| `NtMakeTemporaryObject` + ハンドルクローズ | 成功を返すが、ドライバが参照を保持しているので残る |
+| `\GLOBAL??\<D>:` の照会 | 存在しない。`\??\<D>:` にのみ存在する |
+
+したがって解決策は WinFsp ドライバの再読み込みである（再起動は不要）。
+`--release-stale-mount` はこの状態を検出して手順を案内する。他の WinFsp
+ファイルシステムも巻き添えになるため、`fsptool-x64.exe lsvol` で対象が唯一で
+あることを確認してから `unload` / `load` する。ImDisk など別ドライバのものは
+影響を受けない。
+
+`unload` だけで止めると WinFsp のカーネルドライバが一切いなくなり、以降の
+マウントは全て `STATUS_NO_SUCH_DEVICE`（`0xC000000E` / HRESULT `0xD000000E`）で
+失敗する。生の NTSTATUS だけでは原因が分からないので、`mount()` はこのコードを
+判定して「ドライバが読み込まれていない。昇格して `fsptool-x64.exe load` を実行
+すること（再起動は不要）」と案内する。GUI 側は
+`vramdisk::fs::WINFSP_DRIVER_NOT_LOADED` との一致で検出し、翻訳済みの文言
+（`err_winfsp_driver_not_loaded`）に差し替える。
 
 ### WinFsp DLL 解決
 
@@ -435,11 +597,26 @@ job は次の pending descriptor を `CREATE_NEW` で作成し、JSON を書き�
 \$VRAMDISK\jobs\<id>\cancel
 ```
 
+`status.json` は `id` / `state` / `terminal` / `submitted_at_ms` /
+`updated_at_ms` / `error` に加えて `progress` を持つ。
+
+```json
+"progress": {"done_bytes": 1234, "total_bytes": 5678}
+```
+
+`progress` は executor が申告した時点の値であり、まだ何も報告していない job や、
+総量を事前に知り得ない job では `null` になる。`total_bytes` は見積もりであり
+途中で上方修正され得るため、消費側は `done_bytes` が古い `total_bytes` を
+上回る場合を想定すること。job が成功した時点で `done_bytes` は `total_bytes` に
+揃えられる。
+
 対応 job family は次の通り。
 
 - `hash`
 - `archive.compress`
 - `archive.extract`
+- `encode`
+- `search`
 
 #### Hash jobs
 
@@ -461,15 +638,38 @@ descriptor 例:
 - `sha256`
 - `fnv1a64`
 
-hash は CUDA API kernel の init/update/final 段で処理する。ファイル本文は host に
-戻さず、最終 digest だけを返す。
+hash は file ごとに GPU/CPU を自動選択する。小さい file で、全 placement が
+raw/sparse/LZ4 の場合は CUDA API kernel の init/update/final 段で処理する。
+巨大 file、または CPU zstd fallback chunk を含む file は CPU streaming path を使い、
+`StorageEngine::read` で 32 MiB window ごとに materialize して RustCrypto hash へ
+逐次投入する。
+
+hash kernel は message に対して逐次であるため、GPU 側は **1 スレッド**で走る。
+1 ファイルのスループットでは CPU に勝てないのが普通で、実測では RTX 4070 の
+SHA-256 が 0.055 GB/s に対し、SHA-NI を持つ i9-12900K は 1.64 GB/s だった
+（約 30 倍）。GPU が効くのは多数のファイルを 1 launch にまとめる batch 経路である。
+
+そのため初回 hash 時には、同じ約 1 MiB の sample で **GPU と CPU の両方**を測り、
+per-byte でどちらが速いかを比較して振り分けを決める。
+
+- GPU hash launch budget: `GPU throughput x 0.10 s` を `[4 MiB, 512 MiB]` に clamp。
+- CPU routing threshold:
+  - GPU が CPU 以上に速い場合は上限なし（`u64::MAX`）。
+    `hash_file_gpu_cancellable` は launch budget 単位で分割して流すので、
+    1 回の kernel に無制限の仕事が入ることはない。
+  - GPU の方が遅い場合は `GPU throughput x 0.25 s` と launch budget の小さい方。
+    batch を共有できる大きさのファイルだけを GPU へ入れる。
+
+以前は GPU 側のスループットだけを見て閾値を決めており（上限 128 MiB の clamp
+付き）、CPU と比較していなかったため、GPU の方が遅いサイズ帯まで GPU へ送って
+いた。
 
 raw チャンクは VRAM address descriptor として kernel に渡す。LZ4 compressed
 チャンクは nvCOMP で device scratch に D2D 解凍し、その scratch address を hash
 kernel に渡す。スパース穴は GPU kernel 内でゼロ列として合成する。
 
-CPU zstd fallback で格納された compressed chunk は GPU-only 契約を満たせないため、
-暗黙に host fallback せず unsupported として扱う。
+CPU zstd fallback で格納された compressed chunk は GPU kernel へは渡さず、暗黙
+エラーではなく CPU hash path に振り替える。
 
 #### Archive jobs
 
@@ -503,10 +703,26 @@ CPU zstd fallback で格納された compressed chunk は GPU-only 契約を満�
 - `tar.gz`
 - `zip`
 
+#### CRC32
+
+zip は payload ごとに CRC-32 を必要とする。`vramdisk_crc32_many` は batch 要素
+1 つにつき 1 スレッドしか割り当てないため、範囲全体を 1 要素として渡すと単一
+スレッドが逐次走査することになる（実測 256 MiB で 7.98 秒、約 5 MB/s）。
+
+現在は範囲を `CRC32_LANE_BYTES`（64 KiB）の lane に分割し、`CRC32_LAUNCH_BYTES`
+（512 MiB）ごとに 1 launch でまとめて計算したうえで、GF(2) 上の CRC-32 連結
+（zlib の `crc32_combine` 相当。lane 長が全て等しいので operator ladder は 1 回
+だけ構築する）で畳み込む。同じ 256 MiB が 11.2 ms（約 24 GB/s）になった。
+
+compressed placement を含む範囲は、lane ごとに一時 chunk を要するため hash の
+launch budget に従う。
+
 archive jobs では、対応できる範囲でファイル本文を GPU 上に保持する。CPU は
-descriptor、archive header、path metadata を扱う。対象は通常 raw/sparse placement
-のファイルであり、対応外の compressed placement、対応外の path 形式、一時 VRAM
-不足は明示エラーにする。
+descriptor、archive header、path metadata を扱う。source file と input archive は
+raw / sparse / compressed placement を受け付ける。LZ4 placement は nvCOMP で
+device scratch へ展開し、CPU zstd fallback placement は CPU で解凍して H2D
+アップロードする。対応外の path 形式や、一時 raw 展開ぶんの VRAM が足りない場合は
+原因と対処が分かる明示エラーにする。
 
 format ごとの処理方針は次の通り。
 
@@ -515,6 +731,106 @@ format ごとの処理方針は次の通り。
 - `tar.gz`: gzip multi-member layout と nvCOMP Deflate payload を使う。
 - `zip`: ZIP Deflate method 8、GPU CRC32、ZIP64 record、VRAMDISK 専用 chunk-size table を使う。
 
+archive job が失敗またはキャンセルされた場合、書きかけの出力 archive と
+`\.__vramdisk_*` staging temp file は自動的に除去される。展開途中の出力
+ファイルは診断用に残る。
+
+#### Encode jobs
+
+GPU 上で Base64 / hex のエンコード・デコードを行う。descriptor 例:
+
+```json
+{
+  "op": "encode",
+  "codec": "base64",
+  "direction": "encode",
+  "input": "\a.bin",
+  "output": "\a.b64"
+}
+```
+
+- `codec`: `base64` | `hex`。`direction`: `encode` | `decode`。
+- 固定サイズの staging パス（既定 48 MiB、空き VRAM に応じて縮小）単位で、
+  入力 slice を連続 raw staging に materialize → GPU kernel で変換 →
+  出力ファイルへ device-to-device で scatter する。ファイル全長の連続
+  VRAM 確保は不要で、raw / sparse / compressed のどの placement も入力にできる。
+- Base64 は 3 byte → 4 文字（`=` padding、行折り返しなし）。decode は
+  単一行の標準 Base64 のみ受け付け、末尾の ASCII 空白（改行等）は無視する。
+  `=` を含む最終グループだけ CPU で処理する。
+- hex は小文字で出力し、decode は大文字小文字両方を受け付ける。
+- 不正な入力文字は kernel の status flag 経由で明示エラーになる。
+- 失敗・キャンセル時は書きかけの出力ファイルと staging temp を除去する。
+
+#### Search jobs
+
+VRAM 上のファイル本文を GPU で全文検索する。descriptor 例:
+
+```json
+{
+  "op": "search",
+  "pattern": "TODO",
+  "paths": ["\src"],
+  "ignore_case": false,
+  "max_offsets": 64
+}
+```
+
+- `pattern` は正規表現ではなくリテラル。UTF-8 バイト列として照合する。
+  任意のバイト列を探す場合は `pattern` の代わりに `pattern_hex`（偶数長の 16 進）
+  を使う。上限は 256 バイト。
+- `paths` 省略時はボリューム全体を対象にする。他の job family と異なりこれを
+  既定にしているのは、全体検索が最も普通の使い方だからである。
+- `ignore_case` は ASCII の `A-Z` のみ畳む。対象は任意のバイト列であり、
+  特定のエンコーディングのテキストとは限らないため、Unicode の case folding は
+  行わない。
+- `max_offsets` は 1 ファイルあたりに**報告する**位置の数（既定 64）。
+  一致件数は常に正確で、位置だけが切り詰められる。切り詰めた場合は
+  `offsets_truncated` が真になる。
+
+この機能がこのハードウェアで意味を持つ理由は、データが既に VRAM にあることに尽きる。
+CPU 側の grep は同じ仕事をするのにボリューム全体を PCIe 越しに引き出す必要があるが、
+GPU カーネルはデバイスメモリ帯域でそのまま走査できる。
+
+走査経路は 2 つある。
+
+- **in-place（既定）**: ファイル本文が全て raw placement の場合は、VRAM 上に
+  ある物理的に連続なラン単位でそのままカーネルを起動する。コピーは発生しない。
+  ラン境界をまたぐ候補位置（各ランの末尾 `pattern 長 - 1` 個）は最大でも数百
+  バイトなので、host に読み戻して CPU で照合する。
+- **staging（fallback）**: 圧縮 placement またはスパース穴を含むファイルは、
+  `SEARCH_STAGE_BYTES`（64 MiB）の窓へ device-to-device で materialize してから
+  走査する。窓は `窓長 - (pattern 長 - 1)` ずつ進める。カーネルの最後の候補位置は
+  次の窓の最初の候補位置のちょうど 1 つ手前なので、二重計上は起きない。
+
+スパース穴を in-place の対象から外しているのは、全て 0x00 の pattern は穴の中で
+実際に一致し得るためである。取りこぼすより materialize した方がよい。
+
+実測（RTX 4070、512 MiB、`--bench` の `[5]`）:
+
+| pattern | CPU スキャン | GPU カーネル | 倍率 |
+|---|---:|---:|---:|
+| 14 バイト（希少） | 4.33 GB/s | 196.28 GB/s | 45.3x |
+| 10 バイト（多数一致） | 2.38 GB/s | 105.80 GB/s | 44.4x |
+| 3 バイト | 2.84 GB/s | 109.65 GB/s | 38.6x |
+
+engine 経由の end-to-end は 102.79 GB/s で、カーネル単体とほぼ同じである。
+CPU 側は grep が実際に行う first-byte filter と同じ形で、データは host RAM 上、
+I/O は計測外という条件である。
+
+ここに至るまでに 2 つの律速があった。staging を既定にしていた頃はコピーが走査を
+一桁上回っており（end-to-end 2.96 GB/s）、in-place 化で 88.9 GB/s になった。
+さらに、一致が数百万件ある pattern では launch ごとに 64 Ki 件のオフセットを
+無条件に転送してソートしていたため、呼び出し側が保持する件数だけに絞って
+102.8 GB/s になった。
+
+GUI から実測すると、初回の job は module load と calibration を負担するので
+1 GB/s 未満になるが、以降は 25〜109 GB/s で振れる（短時間のバーストでは GPU の
+クロックが上がりきらないため）。
+
+カーネルは 1 候補位置につき 1 スレッドの grid-stride で、pattern の**先頭と末尾**の
+バイトで先に落とす。大多数を占める不一致がロード 2 回で済むため、全体が
+帯域律速になる。
+
 ---
 
 ## 12. ベンチマーク
@@ -522,6 +838,7 @@ format ごとの処理方針は次の通り。
 `--bench` は合成ベンチマークを実行して終了する。主な計測対象は次の通り。
 
 - raw VRAM H2D / D2H bandwidth。
+- device-to-device コピー（生の memcpy と、ボリューム内のファイル→ファイル）。
 - raw storage engine write/read throughput。
 - dedup unique write / duplicate write throughput。
 - compressible / incompressible データでの compressed engine write/read throughput。
@@ -535,6 +852,81 @@ write/read を次の 4 モードで計測する。
 - compress
 - dedup
 - compress+dedup
+
+### device-to-device コピー
+
+ファイルベンチマーク（CrystalDiskMark、DiskSpd、その他 `ReadFile`/`WriteFile` を
+叩くもの全て）は、原理的に VRAM ↔ システムメモリしか測れない。読み書きするバッファが
+ベンチマークプロセスのアドレス空間にあるからで、ツールの実装を変えても動かない。
+RAM ディスクはその呼び出しをシステムメモリで処理するので、比較は「PCIe 往復」対
+「memcpy」になる。
+
+`StorageEngine::copy_file_in_volume` はこの制約の外にある操作である。ボリューム内の
+ファイル間コピーをホストを経由せずに行う。Win32 のファイル API にはこれを要求する
+手段が無いので、エンジン内部からしか到達できない。
+
+コピー先は `allocate_raw_file` で先に連続確保する。転送の結合（`raw_run_bytes`）は
+既にマップ済みで物理的に隣接するチャンクにしか効かないため、確保しないと 64 KiB
+ごとの memcpy になる。実測（1 GiB）で **4.2 GB/s → 176 GB/s**。
+
+### 3 者比較
+
+`scripts\bench_three_way.ps1` は VRAMDISK・GpuRamDrive・システム RAM の RAM ディスクを
+同一ハーネスで計測する。結果と考察は `hikaku.md`。
+
+### GPU 処理の計測にはウォームアップが要る
+
+ベンチが GPU ジョブを計測する前には、必ず時間を測らないウォームアップを回すこと。
+測らないと 2 つのコストが最初の数回に乗り、定常値ではなく立ち上がりを測ってしまう。
+
+**1. NVRTC のコンパイル待ち（約 5 秒、プロセスにつき 1 回）**
+
+`warm_gpu_api()` がマウント時に背景スレッドで先行開始するが、それが終わる前に
+ジョブが来ると残り時間を待つ。実測（2 GiB ファイルの検索ジョブ）:
+
+| | マウント〜最初のジョブ | 初回 engine ms |
+|---|---|---|
+| マウント直後に書いてすぐ検索 | 約 0.5 秒 | 4817 ms |
+| マウント後 30 秒待ってから同じ手順 | 30 秒 | 15 ms |
+
+**2. GPU のクロック立ち上がり（数百 ms）**
+
+host↔device コピーはコピーエンジンで走るため SM は遊んでいる。長時間コピーだけを
+続けた後の最初の数カーネルは低クロック状態で走る。実測（同一 2 GiB ファイルの
+連続検索、engine 時間）:
+
+```
+95 ms -> 90 ms -> 90 ms -> 34 ms -> 11 ms -> 11 ms
+```
+
+このとき走査バイト数は全反復で同一、`chunks.json` の物理ランは 1（完全連続）、
+`raw.read_ops` / `raw.read_bytes` は 1 も増えない。**遅い回も速い回も同じ in-place
+経路を通っており、コード経路の差ではない。** 検索の直前に `nvidia-smi` を呼ぶ
+（GPU を低電力状態から起こす）だけで減衰は消える。
+
+なお `raw_runs()` は隣接チャンクの VRAM アドレスが連続している間だけ 1 つのランに
+まとめる。上書きのブロックサイズを 4 KiB / 64 KiB / 1 MiB / 16 MiB と変えても
+ランは 1〜2 のままで、この経路が退化することは実測では確認できなかった。
+
+### 検証
+
+実 VRAM を確保する（`Vram::new`）、CUDA kernel を起動する、nvCOMP を読み込む、の
+いずれかを行う test は `gpu-tests` feature で gate する。この feature は既定で
+有効なので、開発機での `cargo test` は従来どおり全件走る。GPU の無い CI は
+`--no-default-features` を付けて、GPU 不要なぶんだけを実行する。
+
+| 手段 | 実行場所 | 対象 |
+|---|---|---|
+| `cargo test` | ローカル（GPU 必須） | 全 unit test |
+| `cargo test --no-default-features` | CI | GPU 不要な unit test（名前空間、chunk allocator、圧縮 blob arena、job registry、CLI parse、CRC table） |
+| `cargo clippy --all-targets -- -D warnings` | CI | lint。GPU 必須の test も型検査・lint される |
+| `cargo build` | CI | `vramdisk.exe`（GUI と CLI は同一バイナリ） |
+| `scripts\e2e_robustness.ps1` | ローカル（GPU 必須） | 通常の filesystem 面 |
+| `scripts\e2e_jobs.ps1` | ローカル（GPU 必須） | `$VRAMDISK` 仮想 API 全面 |
+| `scripts\bench_three_way.ps1` | ローカル（GPU + RAM ディスク + GpuRamDrive） | 3 者性能比較 → `hikaku.md` |
+
+GitHub-hosted runner には NVIDIA GPU が無いため、GPU 必須の unit test と E2E は
+CI で実行できない。リリース前に手動で回す。詳細は `scripts/README.md`。
 
 ---
 
@@ -584,6 +976,29 @@ frontend は Tauri が直接読み込む静的 HTML/CSS/JS である。別途 No
 - mounted status / stats。
 - hash job。
 - archive compress / extract。
+- encode（Base64 / hex）。
+- search（GPU 全文検索）。
+
+window はリサイズ可能（既定 404x580、最小 380x460）。
+
+### UI 言語
+
+UI は日本語 / 英語の二言語対応で、右上のセレクタで切り替えられる。
+
+- 既定はシステムの表示言語からの自動判定（`sys-locale`、ja 以外は en）。
+- 明示的な選択は `HKCU\Software\VRAMDISK` の `UiLanguage`（`ja` / `en`）へ保存され、次回以降はそれが優先される。
+- 切り替えは window 内の全ラベル、tray menu、native dialog（unmount 確認・マウント完了通知など）へ即時反映される。
+- frontend の文字列は `ui/app.js` の `I18N` 辞書、backend の文字列は
+  `src-tauri/src/main.rs` の `tr()` / `trf()` にある。`tr()` は静的文字列、
+  `trf()` は `{0}` / `{1}` プレースホルダを持つメッセージ用で、置換は
+  1 パスのみ行う（Windows のパスが `{1}` を含み得るため、置換結果を再置換しない）。
+- Tauri command と manager が返すエラーメッセージも同じ catalog を通す。
+  command は `UiLang` state から、manager thread は Tauri より先に起動されるため
+  リクエストに言語を載せて受け取る。
+- 未知のキーはキー名そのものを返す。空文字を返すと、tray の項目やダイアログが
+  無言で空欄になり、翻訳漏れではなくアプリの故障に見える。
+- engine crate（`vramdisk`）が返すエラーは英語のまま通過する。`EngineError` の
+  `Display` は技術的な 1 行メッセージであり、翻訳対象にしていない。
 
 ### Tauri commands
 
@@ -596,12 +1011,63 @@ frontend は Tauri が直接読み込む静的 HTML/CSS/JS である。別途 No
 | `unmount` | active mount を撤去する。 |
 | `mount_status` | active mount status または `null` を返す。 |
 | `stats` | `\$VRAMDISK\stats.json` を読み取る。 |
-| `hash_job` | 仮想 hash job を投入し結果を返す。 |
-| `archive_compress_job` | archive compression job を投入する。 |
-| `archive_extract_job` | archive extraction job を投入する。 |
+| `hash_job` | hash job を投入し job id を返す。 |
+| `archive_compress_job` | archive compression job を投入し job id を返す。 |
+| `archive_extract_job` | archive extraction job を投入し job id を返す。 |
+| `encode_job` | Base64/hex encode job を投入し job id を返す。 |
+| `search_job` | 全文検索 job を投入し job id を返す。 |
+| `job_status` | 指定 job の `status.json` を返す。 |
+| `job_result` | 指定 job の `result.json` を返す。 |
+| `job_cancel` | 指定 job のキャンセルを要求する。 |
+| `get_ui_language` | 現在の UI 言語（`ja` / `en`）を返す。 |
+| `set_ui_language` | UI 言語を registry へ保存し、tray menu を再構築する。 |
+| `browse_export_zip` | ZIP 保存先を選ぶダイアログを開く。 |
+| `export_zip` | ボリューム全体をホスト上の ZIP へ書き出す。 |
+| `export_cancel` | 実行中の export をキャンセルする。 |
+| `quit_app` | window 側から終了処理を完了させる。 |
+
+job 系 command は同期ブロックしない。frontend は job id を受け取って
+`job_status` をポーリングし、terminal になったら `job_result` を読む。これにより
+数十 GB 級のジョブも UI を塞がず、GUI から安全にキャンセルできる。
+
+実行中の表示は次の通り。
+
+- `status.json` の `progress` が使える場合は、確定的なプログレスバー、
+  処理済み／総バイト数、パーセント、および残り時間の推定を表示する。
+- `progress` が `null`、`total_bytes` が 0、値が不正のいずれかの場合は経過秒数
+  のみの表示へ fallback する。
+- 残り時間の推定は、経過が短すぎる間や進捗率が低すぎる間は雑音が大きいので
+  出さない。
+- 中止ボタンは常に表示する。
+
+終了判定は `state` フィールドで行う（`cancelled` か否かをエラーメッセージの
+文字列一致で判定してはならない）。
 
 hash / archive の path 入力は active mount point 相対に正規化する。mount point 外の
 絶対 path は拒否する。
+
+### ZIP エクスポート
+
+アンマウントおよび終了の直前に、ボリュームの内容をホスト上の ZIP として保存する
+選択肢を提示する。
+
+- 対象は window の「アンマウント」ボタン、tray の「アンマウント」、tray の「終了」の
+  3 経路すべて。いずれも window 内のモーダルで「ZIP に保存して〜」「保存せず〜」
+  「キャンセル」の 3 択を出す。window を表示できない場合のみ従来の 2 択 native
+  dialog へ fallback する。
+- export は engine の GPU ZIP writer ではなく、ホスト側で `std::fs` によりボリューム
+  を走査してストリーミング書き出しする。GPU 経路は出力 ZIP を VRAM ディスク上に
+  作るため、archive とほぼ同サイズの空き VRAM を要求する。「データを失わないための
+  保存」がディスク満杯時にちょうど失敗するのは受け入れられない。
+- `$VRAMDISK` はボリューム root 直下でのみ合成される仮想ディレクトリなので、
+  深さ 0 でのみ大文字小文字を無視して除外する。同名のユーザーディレクトリが
+  下位階層にあればそれは実データとして格納する。
+- 進捗は `export-progress` イベントで通知する。payload は jobs API の `progress` と
+  同じ `{"done_bytes": N, "total_bytes": M}` 形状で、frontend は job 用の
+  プログレスバー実装をそのまま再利用する。総量は事前走査で確定させる。
+- 個々のファイルの読み取り失敗は致命的にせず収集して報告する。export が完全に
+  成功した場合のみアンマウント／終了へ進む。キャンセル・失敗・一部失敗のいずれでも
+  ボリュームはマウントしたまま残し、データを回収できるようにする。
 
 ---
 
@@ -614,6 +1080,13 @@ WinFsp callback は FFI 境界をまたぐため、panic がプロセスや moun
 - offset と length の加算は checked arithmetic で行う。
 - `\a` から `\a\b` のような自己サブツリー rename を拒否する。
 - mutex poison は `into_inner` で復帰し、後続 callback の連鎖 panic を避ける。
+- job worker は executor の panic を catch して job を failed にする。
+- 未投入（`Receiving`）の job に対する `wait` はブロックせず status を返す。
+- zip / gzip / tar / LZ4 frame の parse は全ての short read を長さ検証する。
+- rename で置換された宛先 file の placement は engine 経由で解放される
+  （lookup 層だけで rename すると VRAM が leak する）。
+- 大文字小文字のみの rename は表示名を更新する（case-preserving）。
+- job registry は上限到達時に最古の terminal job を evict する。
 - unsupported な block clone path は安全に失敗させる。
 - `$VRAMDISK` は通常の filesystem mutation API からは read-only として扱う。
 
@@ -624,9 +1097,22 @@ Windows / WinFsp 構成では NVIDIA GPUDirect Storage / cuFile は利用しな�
 ## 15. 公開仕様上の制約
 
 - ストレージは揮発性であり、アンマウントまたはプロセス終了で内容は失われる。
+  GUI からのアンマウント／終了時には ZIP としてホストへ保存する選択肢を出すが、
+  プロセスの異常終了、ホストのクラッシュ、GPU リセットに対する保護は無い。
+- dedup は FNV-1a 64-bit hash で候補を索引し、共有を確定する前に内容を byte 比較
+  する。したがって既定では、意図的な hash 衝突による誤共有は起きない。
+  `--dedup-trust-hash` を指定した場合に限り byte 比較を省き、その場合は
+  任意のバイト列を書ける主体による誤共有（データ化け）が可能になる。
+  このフラグはすべての書き手を信頼できる環境専用である。
 - GUI 管理下では同時に 1 つのマウントのみをサポートする。
 - GPU 圧縮には互換性のある nvCOMP DLL が必要である。
-- CPU fallback で格納されたデータは、一部の GPU-only 内部 API では対象外になる。
+- hash API は large file と zstd fallback chunk を自動で CPU へ振り分ける。
+  archive jobs は raw / sparse / compressed placement を透過処理するが、compressed
+  source を raw に展開する一時 VRAM が不足すると明示エラーになる。
+- volume の既定 SD はマウントしたユーザー自身と SYSTEM / Administrators のみに
+  フルアクセスを与える。ただし `$VRAMDISK` の jobs / hash API はファイル単位の
+  DACL を確認しないため、明示的に緩い DACL を設定したファイルであっても、
+  ボリュームを開ける主体からは内容を読み出せる。
 - directory mount point は WinFsp が mount lifetime を所有し、unmount 時に削除される。
 - block clone は OS / WinFsp から source handle path を復元できる環境でのみ有効に働く。
 - GUI には合成ベンチマーク起動ビューを提供しない。

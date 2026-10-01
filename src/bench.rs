@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
+use crate::api_kernel::ApiKernel;
 use crate::cli::format_size;
 use crate::cuda::Vram;
 use crate::engine::StorageEngine;
@@ -47,14 +48,17 @@ pub fn run(device: usize, vram_size: u64) -> Result<()> {
         format_size(total_vram)
     );
     println!("  vram   : {}", format_size(vram_size));
-    println!("  runs   : {} per measurement\n", RUNS);
+    println!("  runs   : {RUNS} per measurement\n");
 
     bench_vram(device, vram_size)?;
+    bench_device_copy(device, vram_size)?;
     bench_engine(device, vram_size)?;
+    bench_engine_concurrent_read(device)?;
     bench_engine_dedup(device)?;
     bench_engine_compress(device)?;
     bench_compression(device)?;
     bench_hash(device)?;
+    bench_search(device)?;
 
     println!("Benchmark complete.");
     Ok(())
@@ -372,10 +376,7 @@ fn throughput(bytes: u64, elapsed: Duration) -> String {
 // ─── [1] Raw VRAM bandwidth ───────────────────────────────────────────────────
 
 fn bench_vram(device: usize, vram_size: u64) -> Result<()> {
-    println!(
-        "[1] Raw VRAM Bandwidth  (host↔device memcpy, avg of {} runs)",
-        RUNS
-    );
+    println!("[1] Raw VRAM Bandwidth  (host↔device memcpy, avg of {RUNS} runs)");
     println!(
         "    {:<12} {:>16} {:>16}",
         "Size", "Write (H→D)", "Read (D→H)"
@@ -416,18 +417,88 @@ fn bench_vram(device: usize, vram_size: u64) -> Result<()> {
     Ok(())
 }
 
+// ─── [1b] Device-to-device copy ──────────────────────────────────────────────
+
+/// What a copy costs when the bytes never leave VRAM.
+///
+/// Every file benchmark — CrystalDiskMark, DiskSpd, anything driving
+/// `ReadFile`/`WriteFile` — necessarily measures VRAM ↔ system RAM, because the
+/// buffer it reads from and writes into lives in the benchmarking process. A
+/// RAM disk answers those calls out of system RAM, so the comparison is between
+/// a PCIe round trip and a `memcpy`. This section measures the operation those
+/// tools cannot reach: a copy that stays on the device.
+fn bench_device_copy(device: usize, vram_size: u64) -> Result<()> {
+    println!("[1b] Device-to-Device Copy  (never crosses PCIe, avg of {RUNS} runs)");
+    println!(
+        "    {:<12} {:>16} {:>16}",
+        "Size", "raw memcpy", "file → file"
+    );
+    println!("    {}", "─".repeat(48));
+
+    let sizes: &[u64] = &[
+        4 * 1024 * 1024,
+        64 * 1024 * 1024,
+        256 * 1024 * 1024,
+        1024 * 1024 * 1024,
+    ];
+    for &size in sizes {
+        // Source and destination both live in the same allocation, so the
+        // arena has to hold two copies plus the engine's own bookkeeping.
+        if size * 3 > vram_size {
+            break;
+        }
+
+        let raw = {
+            let mut vram = Vram::new(device, size * 2)?;
+            let base = vram.buf_device_ptr();
+            vram.write_at(0, &vec![0xA5u8; size as usize])?;
+            let mut t = Vec::with_capacity(RUNS);
+            for _ in 0..RUNS {
+                let start = Instant::now();
+                vram.copy_dev_into(size, base, size)?;
+                vram.sync()?;
+                t.push(start.elapsed());
+            }
+            throughput(size, avg(&t))
+        };
+
+        let file = {
+            let vram = Vram::new(device, size * 3)?;
+            let mut engine = StorageEngine::new(vram, false, false)?;
+            engine.table_mut().create_file("\\src.bin", 0).unwrap();
+            let block = vec![0x5Au8; 8 * 1024 * 1024];
+            let mut off = 0u64;
+            while off < size {
+                let take = ((size - off) as usize).min(block.len());
+                engine.write("\\src.bin", off, &block[..take])?;
+                off += take as u64;
+            }
+            let mut t = Vec::with_capacity(RUNS);
+            for i in 0..RUNS {
+                let dst = format!("\\dst{i}.bin");
+                let start = Instant::now();
+                engine.copy_file_in_volume("\\src.bin", &dst)?;
+                t.push(start.elapsed());
+                engine.remove(&dst)?;
+            }
+            throughput(size, avg(&t))
+        };
+
+        println!("    {:<12} {:>16} {:>16}", format_size(size), raw, file);
+    }
+    println!();
+    Ok(())
+}
+
 // ─── [2] Storage engine throughput ───────────────────────────────────────────
 
 fn bench_engine(device: usize, vram_size: u64) -> Result<()> {
-    println!(
-        "[2] Storage Engine Throughput  (no compress, no dedup, avg of {} runs)",
-        RUNS
-    );
+    println!("[2] Storage Engine Throughput  (no compress, no dedup, avg of {RUNS} runs)");
     println!("    {:<12} {:>16} {:>16}", "File size", "Write", "Read");
     println!("    {}", "─".repeat(48));
 
     let test_sizes: &[u64] = &[
-        1 * 1024 * 1024,
+        1024 * 1024, // 1 MiB
         16 * 1024 * 1024,
         64 * 1024 * 1024,
         256 * 1024 * 1024,
@@ -483,63 +554,222 @@ fn bench_engine(device: usize, vram_size: u64) -> Result<()> {
     Ok(())
 }
 
-// ─── [2a] Deduplicated storage engine throughput ────────────────────────────
+// ─── [2b] Concurrent read throughput ────────────────────────────────────────
 
-fn bench_engine_dedup(device: usize) -> Result<()> {
+/// How much of the volume's read throughput was being lost to the engine lock.
+///
+/// Both columns run the *same* work — `THREADS` threads reading disjoint
+/// stripes of one raw file, in lockstep behind a barrier — and differ only in
+/// which guard they take:
+///
+/// * `shared`: an `RwLock` read guard plus `read_into_shared`, so the threads
+///   are inside the engine simultaneously and overlap their device-to-host
+///   copies across `Vram`'s transfer streams;
+/// * `exclusive`: an `RwLock` write guard plus `read_into`, which is what every
+///   read did before the fast path existed — one reader at a time.
+///
+/// The reported figure is aggregate throughput: total bytes moved by all
+/// threads divided by the wall time from the barrier to the last join.
+///
+/// The rows vary the per-call block size, because that — not the file size —
+/// decides how much there is to win. `Vram::read_at` already fans a *single*
+/// large transfer out over all of its transfer streams, so one reader with a
+/// big block already keeps the link busy and concurrency mostly buys back the
+/// serial work around the copy (the host-register/unregister pair, the
+/// placement walk, the default-stream fence). Below the optimized-transfer
+/// threshold the copy goes down the shared default stream instead, where there
+/// is nothing to overlap at all — so the small-block row is expected to sit at
+/// roughly 1.00x, and it is kept in the table precisely to show that the win
+/// comes from real transfer overlap and not from measurement noise.
+fn bench_engine_concurrent_read(device: usize) -> Result<()> {
+    use std::sync::RwLock;
+
+    const THREADS: usize = 8;
+    const SIZE: u64 = 256 * 1024 * 1024;
+    const BLOCKS: &[usize] = &[64 * 1024, 1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024];
+
     println!(
-        "[2a] Dedup Engine Throughput  (--dedup, avg of {} runs)",
-        RUNS
+        "[2b] Concurrent Read Throughput  ({THREADS} threads, {}, avg of {RUNS} runs)",
+        format_size(SIZE)
     );
+    println!(
+        "    {:<12} {:>16} {:>16} {:>10}",
+        "Block", "Exclusive", "Shared", "Speedup"
+    );
+    println!("    {}", "─".repeat(58));
 
-    let size = 64 * 1024 * 1024u64;
-    let vram = match Vram::new(device, size + 4 * CHUNK_SIZE) {
+    let vram = match Vram::new(device, SIZE + 4 * CHUNK_SIZE) {
         Ok(v) => v,
         Err(_) => {
             println!("    (skipped: cannot allocate VRAM)\n");
             return Ok(());
         }
     };
-    let mut engine = StorageEngine::new(vram, false, true)?;
-    engine.table_mut().create_file("\\unique", 0).unwrap();
-    engine.table_mut().create_file("\\dupe", 0).unwrap();
+    let mut engine = StorageEngine::new(vram, false, false)?;
+    engine.table_mut().create_file("\\bench", 0).unwrap();
+    let data: Vec<u8> = (0..SIZE as usize).map(|i| i as u8).collect();
+    engine
+        .write("\\bench", 0, &data)
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    drop(data);
+    let engine = Arc::new(RwLock::new(engine));
+
+    for &block in BLOCKS {
+        // Warm-up: prime the CUDA context binding on every worker thread and
+        // the pinned staging buffers, so the first timed run isn't paying for
+        // one-off setup.
+        concurrent_read_pass(&engine, SIZE, THREADS, block, true)?;
+        concurrent_read_pass(&engine, SIZE, THREADS, block, false)?;
+
+        let mut shared = Vec::with_capacity(RUNS);
+        let mut exclusive = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            exclusive.push(concurrent_read_pass(&engine, SIZE, THREADS, block, false)?);
+            shared.push(concurrent_read_pass(&engine, SIZE, THREADS, block, true)?);
+        }
+
+        let ex = avg(&exclusive);
+        let sh = avg(&shared);
+        println!(
+            "    {:<12} {:>16} {:>16} {:>10}",
+            format_size(block as u64),
+            throughput(SIZE, ex),
+            throughput(SIZE, sh),
+            format!("{:.2}x", ex.as_secs_f64() / sh.as_secs_f64()),
+        );
+    }
+    println!();
+    Ok(())
+}
+
+/// One pass: `threads` workers read disjoint stripes of `\bench` totalling
+/// `size` bytes and the wall time of the whole pass is returned.
+///
+/// `shared` selects the guard, which is the only difference between the two
+/// columns of [`bench_engine_concurrent_read`].
+fn concurrent_read_pass(
+    engine: &Arc<std::sync::RwLock<StorageEngine>>,
+    size: u64,
+    threads: usize,
+    block: usize,
+    shared: bool,
+) -> Result<Duration> {
+    let stripe = size.div_ceil(threads as u64);
+    let barrier = Arc::new(Barrier::new(threads + 1));
+    let mut handles = Vec::with_capacity(threads);
+
+    for t in 0..threads {
+        let engine = Arc::clone(engine);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let start = t as u64 * stripe;
+            let end = (start + stripe).min(size);
+            let mut buf = vec![0u8; block];
+            barrier.wait();
+            let mut off = start;
+            while off < end {
+                let take = ((end - off) as usize).min(block);
+                if shared {
+                    let guard = engine.read().expect("engine read guard");
+                    guard
+                        .read_into_shared("\\bench", off, &mut buf[..take])
+                        .expect("shared read")
+                        .expect("raw file must take the shared path");
+                } else {
+                    let mut guard = engine.write().expect("engine write guard");
+                    guard
+                        .read_into("\\bench", off, &mut buf[..take])
+                        .expect("exclusive read");
+                }
+                off += take as u64;
+            }
+        }));
+    }
+
+    barrier.wait();
+    let t = Instant::now();
+    for h in handles {
+        h.join()
+            .map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
+    }
+    Ok(t.elapsed())
+}
+
+// ─── [2a] Deduplicated storage engine throughput ────────────────────────────
+
+/// Dedup write throughput in both candidate-confirmation modes.
+///
+/// The two columns are the price of correctness: `verify` reads each confirmed
+/// duplicate chunk back from VRAM and compares it byte for byte (the default),
+/// while `trust-hash` (`--dedup-trust-hash`) confirms with a batched GPU
+/// re-hash and can therefore be fooled by a deliberate FNV-1a collision. Unique
+/// writes find no candidates and so should be near-identical in both columns;
+/// the duplicate row is where the difference shows up.
+fn bench_engine_dedup(device: usize) -> Result<()> {
+    println!("[2a] Dedup Engine Throughput  (--dedup, avg of {RUNS} runs)");
+
+    let size = 64 * 1024 * 1024u64;
     let unique: Vec<u8> = (0..size as usize).map(|i| (i % 251) as u8).collect();
 
-    println!("    {:<18} {:>16}", "Case", "Write");
-    println!("    {}", "─".repeat(38));
+    println!(
+        "    {:<18} {:>16} {:>16}",
+        "Case", "Write (verify)", "Write (trust)"
+    );
+    println!("    {}", "─".repeat(52));
 
-    let mut unique_times = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
-        engine
-            .set_size("\\unique", 0)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let t = Instant::now();
-        engine
-            .write("\\unique", 0, &unique)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        unique_times.push(t.elapsed());
-    }
+    // One engine per mode: the dedup index and the chunk bitmap both carry
+    // state between runs, so reusing an engine would let the first mode's
+    // leftovers decide what the second mode gets to share.
+    let mut unique_tp = Vec::with_capacity(2);
+    let mut dupe_tp = Vec::with_capacity(2);
+    for verify in [true, false] {
+        let vram = match Vram::new(device, size + 4 * CHUNK_SIZE) {
+            Ok(v) => v,
+            Err(_) => {
+                println!("    (skipped: cannot allocate VRAM)\n");
+                return Ok(());
+            }
+        };
+        let mut engine = StorageEngine::new(vram, false, true)?;
+        engine.set_dedup_verify_bytes(verify);
+        engine.table_mut().create_file("\\unique", 0).unwrap();
+        engine.table_mut().create_file("\\dupe", 0).unwrap();
 
-    let mut dupe_times = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
-        engine
-            .set_size("\\dupe", 0)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let t = Instant::now();
-        engine
-            .write("\\dupe", 0, &unique)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        dupe_times.push(t.elapsed());
+        let mut unique_times = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            engine
+                .set_size("\\unique", 0)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let t = Instant::now();
+            engine
+                .write("\\unique", 0, &unique)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            unique_times.push(t.elapsed());
+        }
+
+        let mut dupe_times = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            engine
+                .set_size("\\dupe", 0)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let t = Instant::now();
+            engine
+                .write("\\dupe", 0, &unique)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            dupe_times.push(t.elapsed());
+        }
+
+        unique_tp.push(throughput(size, avg(&unique_times)));
+        dupe_tp.push(throughput(size, avg(&dupe_times)));
     }
 
     println!(
-        "    {:<18} {:>16}",
-        "unique write",
-        throughput(size, avg(&unique_times))
+        "    {:<18} {:>16} {:>16}",
+        "unique write", unique_tp[0], unique_tp[1]
     );
     println!(
-        "    {:<18} {:>16}",
-        "duplicate write",
-        throughput(size, avg(&dupe_times))
+        "    {:<18} {:>16} {:>16}",
+        "duplicate write", dupe_tp[0], dupe_tp[1]
     );
     println!();
     Ok(())
@@ -549,8 +779,7 @@ fn bench_engine_dedup(device: usize) -> Result<()> {
 
 fn bench_engine_compress(device: usize) -> Result<()> {
     println!(
-        "[2b] Compressed Engine Throughput  (--compress, compressible data, avg of {} runs)",
-        RUNS
+        "[2b] Compressed Engine Throughput  (--compress, compressible data, avg of {RUNS} runs)"
     );
 
     // Allocate a context buffer; compressible data uses little of it, and the
@@ -637,10 +866,7 @@ fn bench_compression(device: usize) -> Result<()> {
     // Extra scratch for nvCOMP internal buffers.
     let scratch_vram = (CHUNKS as u64 + 16) * CHUNK_SIZE;
 
-    println!(
-        "[3] Compression  ({} × 64 KiB chunks per run, avg of {} runs)",
-        CHUNKS, RUNS
-    );
+    println!("[3] Compression  ({CHUNKS} × 64 KiB chunks per run, avg of {RUNS} runs)");
 
     for (label, data) in &[
         (
@@ -767,13 +993,150 @@ fn bench_compression(device: usize) -> Result<()> {
 
 // ─── [4] GPU FNV-1a hash (dedup path) ────────────────────────────────────────
 
+/// Full-text search: the GPU against an optimized CPU scan of the same bytes.
+///
+/// The CPU side is not a strawman -- it is the same first-byte-filter loop a
+/// good grep uses, over data already in host RAM, with no I/O in the timed
+/// region. That is the fairest stand-in for "grep on a RAM disk", which is what
+/// VRAMDISK is really competing with.
+fn bench_search(device: usize) -> Result<()> {
+    const MIB: u64 = 1024 * 1024;
+    let payload = 512 * MIB;
+
+    println!(
+        "[5] Full-Text Search  ({} payload, avg of {RUNS} runs)",
+        format_size(payload)
+    );
+
+    let vram_size = payload + CHUNK_SIZE;
+    let mut vram = Vram::new(device, vram_size)?;
+    let base = vram.buf_device_ptr();
+    let mut kernel = ApiKernel::new(&vram)?;
+
+    // Log-like text with a rare marker and a frequent word, so both the
+    // needle-in-a-haystack and the many-hits cases are covered.
+    let unit =
+        b"2026-09-06T00:00:00Z INFO  request path=/api/v1/items status=200 dur=12ms" as &[u8];
+    let mut host = Vec::with_capacity(payload as usize);
+    while (host.len() as u64) < payload {
+        let take = ((payload - host.len() as u64) as usize).min(unit.len());
+        host.extend_from_slice(&unit[..take]);
+    }
+    let marker = b"XXRAREMARKERXX";
+    let at = host.len() - 4096;
+    host[at..at + marker.len()].copy_from_slice(marker);
+    vram.write_at(0, &host)?;
+
+    println!("    Pattern              CPU scan       GPU scan    Speedup   Matches");
+    println!("    {}", "-".repeat(66));
+    for (label, needle) in [
+        ("rare (14 B)", &marker[..]),
+        ("common (10 B)", b"status=200" as &[u8]),
+        ("short (3 B)", b"api" as &[u8]),
+    ] {
+        // Warm-up, and a correctness check: a benchmark that disagrees with the
+        // reference is measuring the wrong thing.
+        let want = cpu_search_count(&host, needle);
+        let first = kernel.search(base, payload, needle, false, 0, 1)?;
+        anyhow::ensure!(
+            first.total == want,
+            "GPU search found {} matches for {label}, CPU found {want}",
+            first.total
+        );
+
+        let mut cpu = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let t = Instant::now();
+            let n = cpu_search_count(&host, needle);
+            std::hint::black_box(n);
+            cpu.push(t.elapsed());
+        }
+        let mut gpu = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let t = Instant::now();
+            kernel.search(base, payload, needle, false, 0, 1)?;
+            gpu.push(t.elapsed());
+        }
+        let (c, g) = (avg(&cpu), avg(&gpu));
+        println!(
+            "    {label:<16} {:>12} {:>14} {:>9.1}x {:>9}",
+            throughput(payload, c),
+            throughput(payload, g),
+            c.as_secs_f64() / g.as_secs_f64(),
+            want
+        );
+    }
+    // End to end through the engine: the job path the GUI actually uses, which
+    // adds a device-to-device staging copy per window on top of the scan above.
+    // Reported separately rather than instead, because the two answer different
+    // questions -- what the kernel can do, and what a user gets.
+    {
+        let vram = Vram::new(device, payload + 8 * CHUNK_SIZE)?;
+        let mut engine = StorageEngine::new(vram, false, false)?;
+        engine.table_mut().create_file("\\bench", 0).unwrap();
+        engine
+            .write("\\bench", 0, &host)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let paths = vec!["\\bench".to_string()];
+        let needle = b"status=200" as &[u8];
+        engine
+            .search_files_gpu_cancellable(&paths, needle, false, 1, |_, _| false)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mut t_all = Vec::with_capacity(RUNS);
+        let mut found = 0u64;
+        for _ in 0..RUNS {
+            let t = Instant::now();
+            let stats = engine
+                .search_files_gpu_cancellable(&paths, needle, false, 1, |_, _| false)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            t_all.push(t.elapsed());
+            found = stats.total_matches;
+        }
+        println!(
+            "    {:<16} {:>12} {:>14} {:>10} {:>9}",
+            "end to end",
+            "-",
+            throughput(payload, avg(&t_all)),
+            "",
+            found
+        );
+    }
+
+    println!();
+    Ok(())
+}
+
+/// First-byte filter then compare -- what a vectorized CPU matcher reduces to,
+/// and the baseline the GPU has to beat.
+fn cpu_search_count(hay: &[u8], needle: &[u8]) -> u64 {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    let (first, last) = (needle[0], needle[needle.len() - 1]);
+    let mut count = 0u64;
+    let mut i = 0usize;
+    let end = hay.len() - needle.len();
+    while i <= end {
+        match hay[i..=end].iter().position(|&b| b == first) {
+            None => break,
+            Some(off) => {
+                i += off;
+                if hay[i + needle.len() - 1] == last && &hay[i..i + needle.len()] == needle {
+                    count += 1;
+                }
+                i += 1;
+            }
+        }
+    }
+    count
+}
+
 fn bench_hash(device: usize) -> Result<()> {
     const CHUNKS: usize = 256;
     let total_bytes = CHUNK_SIZE * CHUNKS as u64;
 
     println!(
-        "[4] GPU FNV-1a Hash  (dedup path, {} × 64 KiB chunks per run, avg of {} runs)",
-        CHUNKS, RUNS
+        "[4] GPU FNV-1a Hash  (dedup path, {CHUNKS} × 64 KiB chunks per run, avg of {RUNS} runs)"
     );
 
     let vram_size = total_bytes + CHUNK_SIZE;

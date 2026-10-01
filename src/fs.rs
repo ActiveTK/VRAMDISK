@@ -2,23 +2,37 @@
 //!
 //! WinFsp dispatches callbacks from a pool of kernel-managed threads. We use
 //! `FineGuard` so independent callbacks may enter concurrently; shared engine
-//! state remains protected by `Mutex`, which also serialises the single CUDA
-//! stream until the engine grows finer region locks.
+//! state is protected by an `RwLock`. Metadata-only callbacks (stat, directory
+//! enumeration, security queries) take it shared and so run concurrently with
+//! each other; anything that mutates state or touches the single CUDA stream
+//! takes it exclusively.
+//!
+//! `read` is the one data-path callback that can also run shared: raw and
+//! sparse placements are served by `StorageEngine::read_into_shared` under a
+//! read guard, so concurrent reads of an uncompressed volume overlap. It falls
+//! back to the exclusive guard when the request needs decompression. Writes
+//! (and reads of compressed data) still serialise until the engine grows finer
+//! region locks and more than one CUDA stream.
+//!
+//! Long-running jobs must not hold the exclusive guard for their whole
+//! duration -- that freezes every callback on the volume -- so the job
+//! executors below split their work and re-acquire the lock at each boundary.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
+use std::thread::{self, JoinHandle};
 
 use anyhow::Context as _;
 use windows::Win32::Foundation::{
-    LocalFree, HANDLE, HLOCAL, STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_FULL,
-    STATUS_END_OF_FILE, STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_INVALID_PARAMETER, STATUS_INVALID_SECURITY_DESCR, STATUS_NOT_A_DIRECTORY,
-    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+    LocalFree, HANDLE, HLOCAL, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_DIRECTORY_NOT_EMPTY,
+    STATUS_DISK_FULL, STATUS_END_OF_FILE, STATUS_FILE_IS_A_DIRECTORY,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_INVALID_SECURITY_DESCR,
+    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR};
 use windows::Win32::Storage::FileSystem::{
@@ -36,7 +50,7 @@ use winfsp::FspInit;
 use winfsp::U16CStr;
 
 use crate::api_kernel::{digest_hex, HashAlgorithm};
-use crate::engine::{EngineError, StorageEngine};
+use crate::engine::{CpuHashState, EngineError, StorageEngine};
 use crate::internal_api::{self, Entry as InternalEntry};
 use crate::jobs::{status_json, JobRegistry, JobState, JobSubmitError};
 use crate::lookup::{LookupError, Node};
@@ -54,7 +68,13 @@ const FILE_ATTRIBUTE_SYSTEM: u32 = 0x04;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
 const INTERNAL_ATTRIBUTES: u32 =
     FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
-const DEFAULT_SECURITY_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
+/// DACL used when the current user's SID cannot be determined.
+///
+/// Granting `WD` (Everyone) full access is deliberately permissive: a volume
+/// nobody can open is worse than a permissive one, and the only way to reach
+/// this is a failing token query, which in practice does not happen. Callers
+/// warn on stderr when they fall back to it.
+const FALLBACK_SECURITY_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
 const FSCTL_DUPLICATE_EXTENTS_TO_FILE: u32 = 0x0009_8344;
 
 /// Per-open-handle state stored by WinFsp (boxed behind a pointer).
@@ -131,10 +151,15 @@ impl OpenFile {
 
 /// The WinFsp filesystem context.
 pub struct VramDiskFs {
-    engine: Mutex<StorageEngine>,
+    engine: Arc<RwLock<StorageEngine>>,
     jobs: Arc<JobRegistry>,
+    job_worker: JobWorkerHandle,
     label: String,
-    default_security_descriptor: Mutex<Vec<u8>>,
+    /// Built once from [`default_security_sddl`] and never changed, so it is
+    /// handed out by reference. It used to sit behind a `Mutex` and be cloned
+    /// on every call -- an allocation and a copy on the security-check path,
+    /// which runs for every path resolution.
+    default_security_descriptor: OnceLock<Vec<u8>>,
     /// Weak refs to the path `Arc` of every currently-open handle.
     /// Used by `rename` to propagate directory renames to all descendants.
     /// Dead refs are pruned lazily on each `open`/`create` call.
@@ -143,13 +168,22 @@ pub struct VramDiskFs {
 
 impl VramDiskFs {
     pub fn new(engine: StorageEngine, label: impl Into<String>) -> Self {
-        let default_security_descriptor =
-            security_descriptor_from_sddl(DEFAULT_SECURITY_SDDL).unwrap_or_default();
+        // Built eagerly so a malformed SDDL surfaces at mount rather than on
+        // the first security check. An empty result is left uncached so the
+        // accessor retries and can report the error properly.
+        let default_security_descriptor = OnceLock::new();
+        if let Ok(sd) = security_descriptor_from_sddl(default_security_sddl()) {
+            let _ = default_security_descriptor.set(sd);
+        }
+        let engine = Arc::new(RwLock::new(engine));
+        let jobs = Arc::new(JobRegistry::default());
+        let job_worker = JobWorkerHandle::spawn(engine.clone(), jobs.clone());
         VramDiskFs {
-            engine: Mutex::new(engine),
-            jobs: Arc::new(JobRegistry::default()),
+            engine,
+            jobs,
+            job_worker,
             label: label.into(),
-            default_security_descriptor: Mutex::new(default_security_descriptor),
+            default_security_descriptor,
             open_paths: Mutex::new(Vec::new()),
         }
     }
@@ -157,8 +191,37 @@ impl VramDiskFs {
     /// Lock the engine, recovering the guard if a previous callback poisoned
     /// the mutex by panicking. Keeping the volume alive (and at worst returning
     /// errors) is far better than aborting the whole mount on one bad call.
-    fn engine(&self) -> std::sync::MutexGuard<'_, StorageEngine> {
-        self.engine.lock().unwrap_or_else(|e| e.into_inner())
+    /// Exclusive access, for anything that mutates engine state or touches
+    /// the CUDA stream.
+    fn engine(&self) -> std::sync::RwLockWriteGuard<'_, StorageEngine> {
+        self.engine.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Shared access, for the metadata-only callbacks (stat, directory
+    /// enumeration, security queries, volume info) and for the raw/sparse read
+    /// fast path.
+    ///
+    /// The metadata callbacks used to queue behind every other callback on one
+    /// mutex even though they only read the namespace, so listing a large
+    /// directory serialised against every other stat on the volume. `read`
+    /// joins them whenever [`StorageEngine::read_into_shared`] can serve the
+    /// request; anything that mutates engine state, and any read that needs the
+    /// decompression codec, still takes [`Self::engine`] exclusively.
+    ///
+    /// `RwLock` on Windows wraps SRWLOCK, which is not a fair lock, so a
+    /// sustained flood of metadata reads could in principle starve a writer.
+    /// WinFsp dispatches from a bounded thread pool and these callbacks are
+    /// short, so that is not reachable in practice.
+    fn engine_shared(&self) -> std::sync::RwLockReadGuard<'_, StorageEngine> {
+        self.engine.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn enqueue_job(&self, id: String) {
+        self.job_worker.enqueue(id);
+    }
+
+    fn job_worker(&self) -> JobWorkerHandle {
+        self.job_worker.clone()
     }
 
     /// Lock `open_paths`, recovering from poisoning (see [`engine`]).
@@ -168,15 +231,14 @@ impl VramDiskFs {
         self.open_paths.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn default_security_descriptor(&self) -> winfsp::Result<Vec<u8>> {
-        let mut cached = self
-            .default_security_descriptor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if cached.is_empty() {
-            *cached = security_descriptor_from_sddl(DEFAULT_SECURITY_SDDL)?;
+    fn default_security_descriptor(&self) -> winfsp::Result<&[u8]> {
+        if let Some(sd) = self.default_security_descriptor.get() {
+            return Ok(sd);
         }
-        Ok(cached.clone())
+        // Built outside `get_or_init` so a failure propagates instead of being
+        // swallowed into a poisoned/empty cache.
+        let built = security_descriptor_from_sddl(default_security_sddl())?;
+        Ok(self.default_security_descriptor.get_or_init(|| built))
     }
 
     /// Allocate a normalized path `Arc`, register a `Weak` ref in
@@ -184,18 +246,159 @@ impl VramDiskFs {
     fn register_path(&self, normalized: String) -> Arc<Mutex<String>> {
         let arc = Arc::new(Mutex::new(normalized));
         let mut slots = self.open_paths();
-        slots.retain(|w| w.upgrade().is_some()); // prune closed handles
+        // Pruning walks the whole vector, and this runs on every open, so
+        // sweeping unconditionally made an open cost O(number of live handles)
+        // -- quadratic across a workload that opens many files at once, like a
+        // build tree. Sweep only when the vector is about to grow instead:
+        // that is amortized O(1) per open, and the sweep is what keeps it from
+        // growing at all while handles are being closed.
+        if slots.len() == slots.capacity() {
+            slots.retain(|w| w.strong_count() > 0);
+        }
         slots.push(Arc::downgrade(&arc));
         arc
     }
 }
 
+impl Drop for VramDiskFs {
+    fn drop(&mut self) {
+        self.job_worker.shutdown();
+    }
+}
+
+#[derive(Clone)]
+struct JobWorkerHandle {
+    inner: Arc<JobWorker>,
+}
+
+struct JobWorker {
+    engine: Arc<RwLock<StorageEngine>>,
+    jobs: Arc<JobRegistry>,
+    state: Mutex<JobWorkerState>,
+    changed: Condvar,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+struct JobWorkerState {
+    queue: VecDeque<String>,
+    current: Option<String>,
+    shutdown: bool,
+}
+
+impl JobWorkerHandle {
+    fn spawn(engine: Arc<RwLock<StorageEngine>>, jobs: Arc<JobRegistry>) -> Self {
+        let inner = Arc::new(JobWorker {
+            engine,
+            jobs,
+            state: Mutex::new(JobWorkerState::default()),
+            changed: Condvar::new(),
+            join: Mutex::new(None),
+        });
+        let thread_inner = inner.clone();
+        let handle = thread::Builder::new()
+            .name("vramdisk-job-worker".to_string())
+            .spawn(move || thread_inner.run())
+            .expect("spawn job worker thread");
+        *inner.join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        Self { inner }
+    }
+
+    fn enqueue(&self, id: String) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.shutdown
+            || state.current.as_deref() == Some(id.as_str())
+            || state.queue.iter().any(|queued| queued == &id)
+        {
+            if state.shutdown {
+                drop(state);
+                self.inner.jobs.cancel(&id);
+            }
+            return;
+        }
+        state.queue.push_back(id);
+        self.inner.changed.notify_all();
+    }
+
+    fn shutdown(&self) {
+        let (queued, current, handle) = {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.shutdown {
+                state.shutdown = true;
+            }
+            let queued: Vec<String> = state.queue.drain(..).collect();
+            let current = state.current.clone();
+            self.inner.changed.notify_all();
+            let handle = self
+                .inner
+                .join
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            (queued, current, handle)
+        };
+
+        for id in queued {
+            self.inner.jobs.cancel(&id);
+        }
+        if let Some(id) = current {
+            self.inner.jobs.cancel(&id);
+        }
+
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl JobWorker {
+    fn run(self: Arc<Self>) {
+        loop {
+            let id = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(id) = state.queue.pop_front() {
+                        state.current = Some(id.clone());
+                        break id;
+                    }
+                    if state.shutdown {
+                        return;
+                    }
+                    state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+
+            execute_job(&id, &self.jobs, &self.engine);
+
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.current.as_deref() == Some(id.as_str()) {
+                state.current = None;
+            }
+            self.changed.notify_all();
+            if state.shutdown && state.queue.is_empty() {
+                return;
+            }
+        }
+    }
+}
+
 /// Map engine/lookup errors to NTSTATUS.
+///
+/// The engine's error taxonomy is richer than what a WinFsp callback can say,
+/// so each variant is mapped to the status whose standard meaning is closest —
+/// this is what Explorer and the Win32 layer turn into a message for the user,
+/// and a wrong choice here produces a badly misleading one.
 fn map_engine_err(e: EngineError) -> winfsp::FspError {
     match e {
         EngineError::Lookup(l) => map_lookup_err(l),
-        EngineError::NoSpace => STATUS_DISK_FULL.into(),
+        EngineError::NoSpace | EngineError::OutOfVram(_) => STATUS_DISK_FULL.into(),
         EngineError::NotAFile => STATUS_FILE_IS_A_DIRECTORY.into(),
+        EngineError::Cancelled => STATUS_ACCESS_DENIED.into(),
+        EngineError::InvalidInput(_) => STATUS_INVALID_PARAMETER.into(),
+        EngineError::Unsupported(_) => STATUS_INVALID_DEVICE_REQUEST.into(),
+        // Our own stored data failed to round-trip: report a data error rather
+        // than something that reads as a permissions or argument problem.
+        EngineError::Internal(_) => STATUS_DATA_ERROR.into(),
         EngineError::Cuda(_) => STATUS_ACCESS_DENIED.into(),
     }
 }
@@ -287,11 +490,14 @@ fn fill_internal_file_info(entry: &InternalEntry, content_len: Option<u64>, info
     info.ea_size = 0;
 }
 
-fn node_security_descriptor(fs: &VramDiskFs, node: &Node) -> winfsp::Result<Vec<u8>> {
+/// The security descriptor to report for `node`, borrowed from either the node
+/// itself or the shared default. Deliberately not cloned: this runs on every
+/// path resolution.
+fn node_security_descriptor<'a>(fs: &'a VramDiskFs, node: &'a Node) -> winfsp::Result<&'a [u8]> {
     if node.security_descriptor.is_empty() {
         fs.default_security_descriptor()
     } else {
-        Ok(node.security_descriptor.clone())
+        Ok(&node.security_descriptor)
     }
 }
 
@@ -321,6 +527,14 @@ fn job_content(entry: &InternalEntry, jobs: &JobRegistry, wait: bool) -> winfsp:
             Ok(snap.result.into_bytes())
         }
         InternalEntry::JobWaitFile { id } if wait => {
+            // Only block for jobs that were actually submitted. A job still in
+            // `Receiving` (descriptor file created but never written/closed)
+            // would otherwise never reach a terminal state and pin a WinFsp
+            // worker thread forever.
+            let snap = jobs.snapshot(id).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+            if snap.state == JobState::Receiving {
+                return Ok(status_json(&snap).into_bytes());
+            }
             let snap = jobs.wait(id).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
             Ok(snap.result.into_bytes())
         }
@@ -370,27 +584,103 @@ fn submit_internal_if_needed(context: &OpenFile, jobs: &JobRegistry) -> Option<S
     Some(id.clone())
 }
 
-fn execute_job(id: &str, jobs: &JobRegistry, engine: &mut StorageEngine) {
+#[derive(Debug)]
+enum JobExecutionError {
+    Cancelled,
+    Failed(String),
+}
+
+/// Exclusive engine access for a job executor.
+fn lock_shared_engine(
+    engine: &Arc<RwLock<StorageEngine>>,
+) -> std::sync::RwLockWriteGuard<'_, StorageEngine> {
+    engine.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Read-only engine access for a job executor, for the metadata passes
+/// (resolving a job's target paths, sizing files) that precede the real work.
+fn read_shared_engine(
+    engine: &Arc<RwLock<StorageEngine>>,
+) -> std::sync::RwLockReadGuard<'_, StorageEngine> {
+    engine.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Turn an engine failure into a job outcome.
+///
+/// Formats with `Display`, not `Debug`: this string is written verbatim into
+/// `result.json` and shown to the user by the GUI, and `Debug` would surface
+/// the Rust variant name and quoting -- `Cuda("truncated zip local header")`
+/// rather than the sentence the error actually wrote.
+fn map_job_engine_error(prefix: &str, err: EngineError) -> JobExecutionError {
+    match err {
+        EngineError::Cancelled => JobExecutionError::Cancelled,
+        other => JobExecutionError::Failed(format!("{prefix}: {other}")),
+    }
+}
+
+fn check_job_cancelled(id: &str, jobs: &JobRegistry) -> Result<(), JobExecutionError> {
+    if jobs.cancel_requested(id) {
+        Err(JobExecutionError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// The callback the engine's long-running jobs poll at their safe points: it
+/// publishes the byte counters into the registry (so `status.json` can drive a
+/// determinate bar and an ETA) and answers whether the job has been asked to
+/// stop.
+///
+/// A `(0, 0)` tick is the engine's documented "no useful counter here" signal,
+/// emitted by pre-flight checks that run before any measurable work. Storing it
+/// would replace a real total published moments earlier with a zero
+/// denominator, so those ticks are skipped and only the cancellation question
+/// is answered.
+fn job_progress_sink<'a>(jobs: &'a JobRegistry, id: &'a str) -> impl FnMut(u64, u64) -> bool + 'a {
+    move |done, total| {
+        if total != 0 {
+            jobs.set_progress(id, done, total);
+        }
+        jobs.cancel_requested(id)
+    }
+}
+
+fn execute_job(id: &str, jobs: &JobRegistry, engine: &Arc<RwLock<StorageEngine>>) {
     let Some(descriptor) = jobs.start(id) else {
         return;
     };
-    match execute_job_descriptor(id, &descriptor, engine) {
-        Ok(result) => jobs.succeed(id, result),
-        Err(e) => jobs.fail(id, e),
+    // A panic inside an executor must not kill the worker thread (jobs would
+    // silently stop running) or leave this job non-terminal forever (anything
+    // blocked in `wait` would then hang). Catch it and fail the job instead.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute_job_descriptor(id, &descriptor, jobs, engine)
+    }));
+    match outcome {
+        Ok(Ok(result)) => jobs.succeed(id, result),
+        Ok(Err(JobExecutionError::Cancelled)) => jobs.finish_cancelled(id),
+        Ok(Err(JobExecutionError::Failed(e))) => jobs.fail(id, e),
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "job executor panicked".to_string());
+            jobs.fail(id, format!("job executor panicked: {msg}"));
+        }
     }
 }
 
 fn execute_job_descriptor(
     id: &str,
     descriptor: &str,
-    engine: &mut StorageEngine,
-) -> Result<String, String> {
+    jobs: &JobRegistry,
+    engine: &Arc<RwLock<StorageEngine>>,
+) -> Result<String, JobExecutionError> {
     let v: serde_json::Value = serde_json::from_str(descriptor)
-        .map_err(|e| format!("invalid job descriptor JSON: {e}"))?;
-    let op = v
-        .get("op")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "job descriptor must contain string field \"op\"".to_string())?;
+        .map_err(|e| JobExecutionError::Failed(format!("invalid job descriptor JSON: {e}")))?;
+    let op = v.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
+        JobExecutionError::Failed("job descriptor must contain string field \"op\"".to_string())
+    })?;
     match op {
         "noop" => Ok(serde_json::json!({
             "id": id,
@@ -401,47 +691,67 @@ fn execute_job_descriptor(
         })
         .to_string()
             + "\r\n"),
-        "hash" | "hash.calculate" => execute_hash_job(id, &v, engine),
-        "archive.compress" | "compress.archive" => execute_archive_compress_job(id, &v, engine),
-        "archive.extract" | "extract.archive" => execute_archive_extract_job(id, &v, engine),
-        _ => Err("no GPU executor registered for requested operation".to_string()),
+        "hash" | "hash.calculate" => execute_hash_job(id, &v, jobs, engine),
+        "archive.compress" | "compress.archive" => {
+            execute_archive_compress_job(id, &v, jobs, engine)
+        }
+        "archive.extract" | "extract.archive" => execute_archive_extract_job(id, &v, jobs, engine),
+        "encode" | "encode.file" => execute_encode_job(id, &v, jobs, engine),
+        "search" | "search.content" | "grep" => execute_search_job(id, &v, jobs, engine),
+        _ => Err(JobExecutionError::Failed(
+            "no GPU executor registered for requested operation".to_string(),
+        )),
     }
 }
 
 fn execute_archive_compress_job(
     id: &str,
     descriptor: &serde_json::Value,
-    engine: &mut StorageEngine,
-) -> Result<String, String> {
+    jobs: &JobRegistry,
+    engine: &Arc<RwLock<StorageEngine>>,
+) -> Result<String, JobExecutionError> {
     let format_name = descriptor
         .get("format")
         .or_else(|| descriptor.get("codec"))
         .and_then(|v| v.as_str())
         .unwrap_or("tar.zst");
-    let format = NvcompFrameCodec::parse(format_name)
-        .ok_or_else(|| format!("unsupported archive format: {format_name}"))?;
+    let format = NvcompFrameCodec::parse(format_name).ok_or_else(|| {
+        JobExecutionError::Failed(format!("unsupported archive format: {format_name}"))
+    })?;
     let output = descriptor
         .get("output")
         .or_else(|| descriptor.get("destination"))
         .or_else(|| descriptor.get("dest"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "archive.compress job requires output".to_string())?;
+        .ok_or_else(|| {
+            JobExecutionError::Failed("archive.compress job requires output".to_string())
+        })?;
     let recursive = descriptor
         .get("recursive")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let roots = descriptor_paths(descriptor, "path", "paths")?;
+    let roots = descriptor_paths(descriptor, "path", "paths").map_err(JobExecutionError::Failed)?;
     let mut targets = BTreeSet::new();
-    for root in roots {
-        collect_hash_targets(engine, &root, recursive, &mut targets)?;
+    {
+        let engine = read_shared_engine(engine);
+        for root in roots {
+            check_job_cancelled(id, jobs)?;
+            collect_hash_targets(&engine, &root, recursive, &mut targets)
+                .map_err(JobExecutionError::Failed)?;
+        }
     }
     let paths: Vec<String> = targets.into_iter().collect();
     if paths.is_empty() {
-        return Err("archive.compress resolved no files".to_string());
+        return Err(JobExecutionError::Failed(
+            "archive.compress resolved no files".to_string(),
+        ));
     }
-    let stats = engine
-        .archive_compress_gpu(format, &paths, output)
-        .map_err(|e| format!("GPU archive compression failed: {e:?}"))?;
+    let stats = {
+        let mut engine = lock_shared_engine(engine);
+        engine
+            .archive_compress_gpu_cancellable(format, &paths, output, job_progress_sink(jobs, id))
+            .map_err(|e| map_job_engine_error("GPU archive compression failed", e))?
+    };
     let throughput = if stats.elapsed_ms == 0 {
         serde_json::Value::Null
     } else {
@@ -470,30 +780,42 @@ fn execute_archive_compress_job(
 fn execute_archive_extract_job(
     id: &str,
     descriptor: &serde_json::Value,
-    engine: &mut StorageEngine,
-) -> Result<String, String> {
+    jobs: &JobRegistry,
+    engine: &Arc<RwLock<StorageEngine>>,
+) -> Result<String, JobExecutionError> {
     let format_name = descriptor
         .get("format")
         .or_else(|| descriptor.get("codec"))
         .and_then(|v| v.as_str())
         .unwrap_or("tar.zst");
-    let format = NvcompFrameCodec::parse(format_name)
-        .ok_or_else(|| format!("unsupported archive format: {format_name}"))?;
+    let format = NvcompFrameCodec::parse(format_name).ok_or_else(|| {
+        JobExecutionError::Failed(format!("unsupported archive format: {format_name}"))
+    })?;
     let archive = descriptor
         .get("archive")
         .or_else(|| descriptor.get("input"))
         .or_else(|| descriptor.get("path"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "archive.extract job requires archive/input/path".to_string())?;
+        .ok_or_else(|| {
+            JobExecutionError::Failed("archive.extract job requires archive/input/path".to_string())
+        })?;
     let output_dir = descriptor
         .get("output_dir")
         .or_else(|| descriptor.get("destination"))
         .or_else(|| descriptor.get("dest"))
         .and_then(|v| v.as_str())
         .unwrap_or("\\");
-    let stats = engine
-        .archive_extract_gpu(format, archive, output_dir)
-        .map_err(|e| format!("GPU archive extraction failed: {e:?}"))?;
+    let stats = {
+        let mut engine = lock_shared_engine(engine);
+        engine
+            .archive_extract_gpu_cancellable(
+                format,
+                archive,
+                output_dir,
+                job_progress_sink(jobs, id),
+            )
+            .map_err(|e| map_job_engine_error("GPU archive extraction failed", e))?
+    };
     let throughput = if stats.elapsed_ms == 0 {
         serde_json::Value::Null
     } else {
@@ -511,6 +833,214 @@ fn execute_archive_extract_job(
         "output_dir": stats.output_dir,
         "file_count": stats.file_count,
         "archive_bytes": stats.archive_bytes,
+        "output_bytes": stats.output_bytes,
+        "elapsed_ms": stats.elapsed_ms,
+        "throughput_mib_s": throughput,
+        "error": null,
+    })
+    .to_string()
+        + "\r\n")
+}
+
+/// Default number of match offsets reported per file. Counts are always exact;
+/// this only bounds how many positions come back, so one pathological file
+/// cannot produce a megabyte of JSON.
+const SEARCH_DEFAULT_MAX_OFFSETS: usize = 64;
+
+fn execute_search_job(
+    id: &str,
+    descriptor: &serde_json::Value,
+    jobs: &JobRegistry,
+    engine: &Arc<RwLock<StorageEngine>>,
+) -> Result<String, JobExecutionError> {
+    // The pattern is either text or, for binary needles, hex.
+    let (needle, pattern_text) = match (
+        descriptor.get("pattern").and_then(|v| v.as_str()),
+        descriptor.get("pattern_hex").and_then(|v| v.as_str()),
+    ) {
+        (Some(p), _) => (p.as_bytes().to_vec(), p.to_string()),
+        (None, Some(h)) => {
+            let bytes = decode_hex_pattern(h)
+                .ok_or_else(|| JobExecutionError::Failed("pattern_hex is not valid hex".into()))?;
+            (bytes, format!("hex:{h}"))
+        }
+        (None, None) => {
+            return Err(JobExecutionError::Failed(
+                "search job requires pattern or pattern_hex".to_string(),
+            ))
+        }
+    };
+    let ignore_case = descriptor
+        .get("ignore_case")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let recursive = descriptor
+        .get("recursive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let max_offsets = descriptor
+        .get("max_offsets")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(SEARCH_DEFAULT_MAX_OFFSETS);
+
+    // Unlike the other job families, an omitted path means "the whole
+    // volume": searching everything is the common case, and making the
+    // caller spell the root would be ceremony.
+    let roots =
+        descriptor_paths(descriptor, "path", "paths").unwrap_or_else(|_| vec!["\\".to_string()]);
+    let mut targets = BTreeSet::new();
+    {
+        let engine = read_shared_engine(engine);
+        for root in roots {
+            check_job_cancelled(id, jobs)?;
+            collect_hash_targets(&engine, &root, recursive, &mut targets)
+                .map_err(JobExecutionError::Failed)?;
+        }
+    }
+    let paths: Vec<String> = targets.into_iter().collect();
+    if paths.is_empty() {
+        return Err(JobExecutionError::Failed(
+            "search resolved no files".to_string(),
+        ));
+    }
+
+    let stats = {
+        let mut engine = lock_shared_engine(engine);
+        engine
+            .search_files_gpu_cancellable(
+                &paths,
+                &needle,
+                ignore_case,
+                max_offsets,
+                job_progress_sink(jobs, id),
+            )
+            .map_err(|e| map_job_engine_error("GPU search failed", e))?
+    };
+
+    let files: Vec<serde_json::Value> = stats
+        .hits
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "path": h.path,
+                "matches": h.matches,
+                "offsets": h.offsets,
+                "offsets_truncated": h.truncated,
+            })
+        })
+        .collect();
+    let throughput = if stats.elapsed_ms == 0 {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(
+            (stats.bytes_scanned as f64 / 1048576.0) / (stats.elapsed_ms as f64 / 1000.0)
+        )
+    };
+    Ok(serde_json::json!({
+        "id": id,
+        "state": JobState::Succeeded.as_str(),
+        "ok": true,
+        "op": "search",
+        "pattern": pattern_text,
+        "pattern_bytes": stats.pattern_len,
+        "ignore_case": stats.ignore_case,
+        "files_scanned": stats.files_scanned,
+        "files_matched": stats.files_matched,
+        "bytes_scanned": stats.bytes_scanned,
+        "total_matches": stats.total_matches,
+        "files": files,
+        "elapsed_ms": stats.elapsed_ms,
+        "throughput_mib_s": throughput,
+        "error": null,
+    })
+    .to_string()
+        + "
+")
+}
+
+/// Parse an even-length hex string into bytes, for searching binary needles
+/// that cannot be spelled in a JSON string.
+fn decode_hex_pattern(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    if text.is_empty() || text.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
+
+fn execute_encode_job(
+    id: &str,
+    descriptor: &serde_json::Value,
+    jobs: &JobRegistry,
+    engine: &Arc<RwLock<StorageEngine>>,
+) -> Result<String, JobExecutionError> {
+    use crate::engine::{EncodeCodec, EncodeDirection};
+
+    let codec_name = descriptor
+        .get("codec")
+        .or_else(|| descriptor.get("format"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("base64");
+    let codec = EncodeCodec::parse(codec_name).ok_or_else(|| {
+        JobExecutionError::Failed(format!("unsupported encode codec: {codec_name}"))
+    })?;
+    let direction_name = descriptor
+        .get("direction")
+        .or_else(|| descriptor.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("encode");
+    let direction = EncodeDirection::parse(direction_name).ok_or_else(|| {
+        JobExecutionError::Failed(format!("unsupported encode direction: {direction_name}"))
+    })?;
+    let input = descriptor
+        .get("input")
+        .or_else(|| descriptor.get("path"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JobExecutionError::Failed("encode job requires input".to_string()))?;
+    let output = descriptor
+        .get("output")
+        .or_else(|| descriptor.get("destination"))
+        .or_else(|| descriptor.get("dest"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JobExecutionError::Failed("encode job requires output".to_string()))?;
+
+    let stats = {
+        let mut engine = lock_shared_engine(engine);
+        engine
+            .encode_file_gpu_cancellable(
+                codec,
+                direction,
+                input,
+                output,
+                job_progress_sink(jobs, id),
+            )
+            .map_err(|e| map_job_engine_error("GPU encode failed", e))?
+    };
+    let throughput = if stats.elapsed_ms == 0 {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(
+            (stats.input_bytes as f64 / 1048576.0) / (stats.elapsed_ms as f64 / 1000.0)
+        )
+    };
+    Ok(serde_json::json!({
+        "id": id,
+        "state": JobState::Succeeded.as_str(),
+        "ok": true,
+        "op": "encode",
+        "codec": stats.codec,
+        "direction": stats.direction,
+        "input": stats.input,
+        "output": stats.output,
+        "input_bytes": stats.input_bytes,
         "output_bytes": stats.output_bytes,
         "elapsed_ms": stats.elapsed_ms,
         "throughput_mib_s": throughput,
@@ -546,31 +1076,110 @@ fn descriptor_paths(
 fn execute_hash_job(
     id: &str,
     descriptor: &serde_json::Value,
-    engine: &mut StorageEngine,
-) -> Result<String, String> {
+    jobs: &JobRegistry,
+    engine: &Arc<RwLock<StorageEngine>>,
+) -> Result<String, JobExecutionError> {
     let alg_name = descriptor
         .get("algorithm")
         .or_else(|| descriptor.get("alg"))
         .and_then(|v| v.as_str())
         .unwrap_or("sha256");
-    let alg = HashAlgorithm::parse(alg_name)
-        .ok_or_else(|| format!("unsupported hash algorithm: {alg_name}"))?;
+    let alg = HashAlgorithm::parse(alg_name).ok_or_else(|| {
+        JobExecutionError::Failed(format!("unsupported hash algorithm: {alg_name}"))
+    })?;
     let recursive = descriptor
         .get("recursive")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let roots = descriptor_paths(descriptor, "path", "paths")?;
+    let roots = descriptor_paths(descriptor, "path", "paths").map_err(JobExecutionError::Failed)?;
 
     let mut targets = BTreeSet::new();
-    for root in roots {
-        collect_hash_targets(engine, &root, recursive, &mut targets)?;
+    {
+        let engine = read_shared_engine(engine);
+        for root in roots {
+            check_job_cancelled(id, jobs)?;
+            collect_hash_targets(&engine, &root, recursive, &mut targets)
+                .map_err(JobExecutionError::Failed)?;
+        }
     }
 
     let paths: Vec<String> = targets.into_iter().collect();
-    let digests = engine
-        .hash_files_gpu_many(&paths, alg)
-        .map_err(|e| format!("batched GPU hash failed: {e:?}"))?;
+    let mut digests = vec![Vec::new(); paths.len()];
+
+    // Route each file to the GPU or CPU path, and total the work up front so
+    // the job can report a real percentage rather than only elapsed seconds.
+    // Each entry is (index into `paths`, path, size). The size is carried along
+    // so the progress accounting below never re-takes the engine lock just to
+    // ask how big a file was.
+    let mut gpu_batches: Vec<Vec<(usize, String, u64)>> = Vec::new();
+    let mut cpu_files: Vec<(usize, String)> = Vec::new();
+    let mut total_bytes = 0u64;
+    {
+        let mut engine = lock_shared_engine(engine);
+        // One batch is sized to the engine's GPU hash launch budget, which is
+        // calibrated to about 0.1 s of GPU work. That is also what bounds how
+        // long a batch holds the engine lock below.
+        let budget = engine.gpu_hash_launch_budget().max(1);
+        let mut batch: Vec<(usize, String, u64)> = Vec::new();
+        let mut batch_bytes = 0u64;
+        for (idx, path) in paths.iter().enumerate() {
+            check_job_cancelled(id, jobs)?;
+            let size = engine
+                .file_size(path)
+                .map_err(|e| map_job_engine_error("hash routing failed", e))?;
+            total_bytes = total_bytes.saturating_add(size);
+            if engine
+                .should_hash_on_gpu_routed(path)
+                .map_err(|e| map_job_engine_error("hash routing failed", e))?
+            {
+                batch.push((idx, path.clone(), size));
+                batch_bytes = batch_bytes.saturating_add(size);
+                if batch_bytes >= budget {
+                    gpu_batches.push(std::mem::take(&mut batch));
+                    batch_bytes = 0;
+                }
+            } else {
+                cpu_files.push((idx, path.clone()));
+            }
+        }
+        if !batch.is_empty() {
+            gpu_batches.push(batch);
+        }
+    }
+    jobs.set_progress(id, 0, total_bytes);
+
+    // Hash a batch at a time, taking the engine lock per batch instead of once
+    // for the whole job: a hash over a large tree used to hold the lock start
+    // to finish, freezing every other filesystem callback on the volume for
+    // its full duration.
+    for batch in gpu_batches {
+        let batch_paths: Vec<String> = batch.iter().map(|(_, p, _)| p.clone()).collect();
+        let batch_digests = {
+            let mut engine = lock_shared_engine(engine);
+            engine
+                // The engine's per-batch counters are deliberately ignored:
+                // this executor owns the job's progress and credits a whole
+                // batch with `advance_progress` once it comes back, so feeding
+                // the batch-local counters to `set_progress` as well would make
+                // the total jump between the batch and the job.
+                .hash_files_gpu_many_cancellable(&batch_paths, alg, |_, _| {
+                    jobs.cancel_requested(id)
+                })
+                .map_err(|e| map_job_engine_error("GPU hash failed", e))?
+        };
+        let mut done = 0u64;
+        for ((idx, _, size), digest) in batch.into_iter().zip(batch_digests.into_iter()) {
+            done = done.saturating_add(size);
+            digests[idx] = digest;
+        }
+        jobs.advance_progress(id, done);
+    }
+
+    for (idx, path) in cpu_files {
+        digests[idx] = hash_file_cpu_windowed(engine, jobs, id, &path, alg)?;
+    }
+
     let mut files = Vec::with_capacity(paths.len());
     for (path, digest) in paths.iter().zip(digests.iter()) {
         files.push(serde_json::json!({
@@ -593,6 +1202,83 @@ fn execute_hash_job(
         + "\r\n")
 }
 
+fn hash_file_cpu_windowed(
+    engine: &Arc<RwLock<StorageEngine>>,
+    jobs: &JobRegistry,
+    id: &str,
+    path: &str,
+    alg: HashAlgorithm,
+) -> Result<Vec<u8>, JobExecutionError> {
+    let size = {
+        let engine = read_shared_engine(engine);
+        engine
+            .file_size(path)
+            .map_err(|e| map_job_engine_error("CPU hash failed", e))?
+    };
+    let mut hasher = CpuHashState::new(alg);
+    let mut offset = 0u64;
+    while offset < size {
+        check_job_cancelled(id, jobs)?;
+        let take = ((size - offset).min(crate::engine::CPU_HASH_WINDOW_BYTES as u64)) as usize;
+        let chunk = {
+            let mut engine = lock_shared_engine(engine);
+            engine
+                .read(path, offset, take)
+                .map_err(|e| map_job_engine_error("CPU hash failed", e))?
+        };
+        // Long CPU hashes intentionally release the engine lock between windows.
+        // Concurrent writers may therefore produce a mixed-time snapshot across
+        // windows, which is acceptable here to keep filesystem callbacks responsive.
+        hasher.update(&chunk);
+        offset += take as u64;
+        jobs.advance_progress(id, take as u64);
+    }
+    Ok(hasher.finalize())
+}
+
+fn hash_file_cpu_windowed_no_cancel(
+    engine: &Arc<RwLock<StorageEngine>>,
+    path: &str,
+    alg: HashAlgorithm,
+) -> Result<Vec<u8>, EngineError> {
+    let size = {
+        let engine = read_shared_engine(engine);
+        engine.file_size(path)?
+    };
+    let mut hasher = CpuHashState::new(alg);
+    let mut offset = 0u64;
+    while offset < size {
+        let take = ((size - offset).min(crate::engine::CPU_HASH_WINDOW_BYTES as u64)) as usize;
+        let chunk = {
+            let mut engine = lock_shared_engine(engine);
+            engine.read(path, offset, take)?
+        };
+        // Keep the lock scoped to each materialized window so virtual hash reads
+        // do not monopolize the filesystem during long CPU hashing. Concurrent
+        // writers may therefore yield a mixed-time snapshot across windows.
+        hasher.update(&chunk);
+        offset += take as u64;
+    }
+    Ok(hasher.finalize())
+}
+
+fn compute_internal_hash(
+    engine: &Arc<RwLock<StorageEngine>>,
+    path: &str,
+    alg: HashAlgorithm,
+) -> Result<Vec<u8>, EngineError> {
+    let use_gpu = {
+        let mut engine = lock_shared_engine(engine);
+        engine.should_hash_on_gpu_routed(path)?
+    };
+    if use_gpu {
+        let mut engine = lock_shared_engine(engine);
+        engine.hash_file_gpu(path, alg)
+    } else {
+        hash_file_cpu_windowed_no_cancel(engine, path, alg)
+    }
+}
+
 fn collect_hash_targets(
     engine: &StorageEngine,
     path: &str,
@@ -610,25 +1296,22 @@ fn collect_hash_targets(
     if !recursive {
         return Err(format!("path is a directory and recursive=false: {path}"));
     }
-    let entries = engine
-        .table()
-        .readdir(&path)
-        .map_err(|_| format!("cannot read directory: {path}"))?;
-    let base = if path == "\\" { String::new() } else { path };
-    let children: Vec<(String, bool)> = entries
-        .into_iter()
-        .map(|(name, child)| {
-            (
-                format!("{base}\\{}", name.to_ascii_lowercase()),
-                child.is_dir,
-            )
-        })
-        .collect();
-    for (child_path, is_dir) in children {
-        if is_dir {
-            collect_hash_targets(engine, &child_path, recursive, out)?;
-        } else {
-            out.insert(child_path);
+    // Iterative walk with an explicit stack: directory nesting depth is
+    // user-controlled, and recursing per level could overflow the stack.
+    let mut pending = vec![path];
+    while let Some(dir) = pending.pop() {
+        let entries = engine
+            .table()
+            .readdir(&dir)
+            .map_err(|_| format!("cannot read directory: {dir}"))?;
+        let base = if dir == "\\" { "" } else { dir.as_str() };
+        for (name, child) in entries {
+            let child_path = format!("{base}\\{}", name.to_ascii_lowercase());
+            if child.is_dir {
+                pending.push(child_path);
+            } else {
+                out.insert(child_path);
+            }
         }
     }
     Ok(())
@@ -636,6 +1319,75 @@ fn collect_hash_targets(
 
 struct FileSecurityCopy {
     size: u64,
+}
+
+/// The security descriptor applied to nodes that carry no explicit one of
+/// their own, and to the `$VRAMDISK` virtual nodes.
+///
+/// This is a personal scratch volume, so its intended audience is the account
+/// that mounted it, plus SYSTEM and the local Administrators group — the two
+/// principals that could take ownership regardless, and which the GUI needs in
+/// order to manage a mount it started elevated. Everyone (`WD`) used to be
+/// granted full access here, which meant that on a machine with more than one
+/// signed-in account — a shared workstation, a terminal server, a box running
+/// services under other identities — anything written to the disk was readable
+/// by all of them. Scoping the ACE to the mounting user's SID closes that
+/// without changing anything for the single-user case.
+///
+/// Computed once: the process token cannot change identity underneath us.
+fn default_security_sddl() -> &'static str {
+    static SDDL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SDDL.get_or_init(|| match current_user_sid_string() {
+        Some(sid) => format!("O:{sid}G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{sid})"),
+        None => {
+            eprintln!(
+                "vramdisk: could not read this process's user SID; falling back to a volume                  DACL that grants Everyone full access"
+            );
+            FALLBACK_SECURITY_SDDL.to_string()
+        }
+    })
+}
+
+/// The current process token's user SID in string (`S-1-5-21-...`) form, ready
+/// to splice into an SDDL string. `None` if the token cannot be queried.
+fn current_user_sid_string() -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return None;
+        }
+        let sid = (|| {
+            // The sizing call is expected to fail with ERROR_INSUFFICIENT_BUFFER;
+            // all we want from it is `needed`.
+            let mut needed = 0u32;
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+            if needed == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; needed as usize];
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buf.as_mut_ptr().cast()),
+                needed,
+                &mut needed,
+            )
+            .ok()?;
+            let user = &*buf.as_ptr().cast::<TOKEN_USER>();
+            let mut raw = PWSTR::null();
+            ConvertSidToStringSidW(user.User.Sid, &mut raw).ok()?;
+            let text = raw.to_string().ok();
+            let _ = LocalFree(Some(HLOCAL(raw.0.cast())));
+            text
+        })();
+        let _ = CloseHandle(token);
+        sid
+    }
 }
 
 fn security_descriptor_from_sddl(sddl: &str) -> winfsp::Result<Vec<u8>> {
@@ -717,10 +1469,10 @@ impl FileSystemContext for VramDiskFs {
         _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
         let path = crate::lookup::normalize(&file_name.to_string_lossy());
-        let engine = self.engine();
+        let engine = self.engine_shared();
         if let Some(entry) = internal_api::resolve(&path, &engine) {
             let sd = self.default_security_descriptor()?;
-            let copied = write_security_descriptor(&sd, security_descriptor)?;
+            let copied = write_security_descriptor(sd, security_descriptor)?;
             return Ok(FileSecurity {
                 reparse: false,
                 sz_security_descriptor: copied.size,
@@ -733,7 +1485,7 @@ impl FileSystemContext for VramDiskFs {
         }
         let node = engine.get(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
         let sd = node_security_descriptor(self, node)?;
-        let copied = write_security_descriptor(&sd, security_descriptor)?;
+        let copied = write_security_descriptor(sd, security_descriptor)?;
         Ok(FileSecurity {
             reparse: false,
             sz_security_descriptor: copied.size,
@@ -775,6 +1527,17 @@ impl FileSystemContext for VramDiskFs {
                 drop(engine);
                 let wait = matches!(entry, InternalEntry::JobWaitFile { .. });
                 let content = job_content(&entry, &self.jobs, wait)?;
+                fill_internal_file_info(&entry, Some(content.len() as u64), file_info.as_mut());
+                return Ok(OpenFile::new_internal(
+                    self.register_path(path),
+                    entry,
+                    content,
+                ));
+            } else if let InternalEntry::HashFile { alg, target_file } = &entry {
+                drop(engine);
+                let digest = compute_internal_hash(&self.engine, target_file, *alg)
+                    .map_err(map_engine_err)?;
+                let content = format!("{}\r\n", digest_hex(&digest)).into_bytes();
                 fill_internal_file_info(&entry, Some(content.len() as u64), file_info.as_mut());
                 return Ok(OpenFile::new_internal(
                     self.register_path(path),
@@ -834,9 +1597,11 @@ impl FileSystemContext for VramDiskFs {
             engine.table_mut().create_file(&raw_path, file_attributes)
         }
         .map_err(map_lookup_err)?;
+        // The node owns its descriptor, so this is the one place the default
+        // genuinely has to be copied.
         node.security_descriptor = match _security_descriptor {
             Some(sd) => security_descriptor_from_void_slice(sd),
-            None => self.default_security_descriptor()?,
+            None => self.default_security_descriptor()?.to_vec(),
         };
         fill_file_info(node, file_info.as_mut());
         drop(engine);
@@ -845,8 +1610,7 @@ impl FileSystemContext for VramDiskFs {
 
     fn close(&self, context: Self::FileContext) {
         if let Some(id) = submit_internal_if_needed(&context, &self.jobs) {
-            let mut engine = self.engine();
-            execute_job(&id, &self.jobs, &mut engine);
+            self.enqueue_job(id);
         }
     }
 
@@ -864,7 +1628,7 @@ impl FileSystemContext for VramDiskFs {
             fill_internal_file_info(&internal.entry, Some(len), file_info);
             return Ok(());
         }
-        let engine = self.engine();
+        let engine = self.engine_shared();
         let node = engine
             .get(&context.path())
             .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
@@ -879,13 +1643,13 @@ impl FileSystemContext for VramDiskFs {
     ) -> winfsp::Result<u64> {
         if context.internal.is_some() {
             let sd = self.default_security_descriptor()?;
-            return Ok(write_security_descriptor(&sd, security_descriptor)?.size);
+            return Ok(write_security_descriptor(sd, security_descriptor)?.size);
         }
-        let engine = self.engine();
+        let engine = self.engine_shared();
         let path = context.path();
         let node = engine.get(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
         let sd = node_security_descriptor(self, node)?;
-        Ok(write_security_descriptor(&sd, security_descriptor)?.size)
+        Ok(write_security_descriptor(sd, security_descriptor)?.size)
     }
 
     fn set_security(
@@ -904,7 +1668,7 @@ impl FileSystemContext for VramDiskFs {
             node_security_descriptor(self, node)?
         };
         let updated = apply_security_descriptor_modification(
-            &current,
+            current,
             security_information,
             modification_descriptor,
         )?;
@@ -936,15 +1700,40 @@ impl FileSystemContext for VramDiskFs {
             buffer[..n].copy_from_slice(&data[off..off + n]);
             return Ok(n as u32);
         }
-        let mut engine = self.engine();
         let path = context.path();
+        // Fast path: raw and sparse data can be served through a shared guard,
+        // so concurrent reads of the volume actually run concurrently instead
+        // of queueing behind each other. `read_into_shared` yields `Ok(None)`
+        // (having written nothing) whenever the request needs exclusive access
+        // — today, any compressed placement in range.
+        //
+        // The shared guard must be released before taking the exclusive one:
+        // `RwLock` is not reentrant, so upgrading in place would deadlock the
+        // thread against itself. Hence the inner scope.
+        {
+            let engine = self.engine_shared();
+            let size = engine.get(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?.size;
+            if offset >= size {
+                return Err(STATUS_END_OF_FILE.into());
+            }
+            // Read straight into WinFsp's output buffer: the device-to-host
+            // copy lands in the final destination with no intermediate Vec
+            // allocation and no second memcpy back into `buffer`.
+            if let Some(n) = engine
+                .read_into_shared(&path, offset, buffer)
+                .map_err(map_engine_err)?
+            {
+                return Ok(n as u32);
+            }
+        }
+        // Fallback. The file is re-resolved from scratch under the exclusive
+        // guard rather than carrying size or placement state across the gap: a
+        // writer may have run in between, so anything observed above is stale.
+        let mut engine = self.engine();
         let size = engine.get(&path).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?.size;
         if offset >= size {
             return Err(STATUS_END_OF_FILE.into());
         }
-        // Read straight into WinFsp's output buffer: the device-to-host copy
-        // lands in the final destination with no intermediate Vec allocation
-        // and no second memcpy back into `buffer`.
         let n = engine
             .read_into(&path, offset, buffer)
             .map_err(map_engine_err)?;
@@ -1106,13 +1895,16 @@ impl FileSystemContext for VramDiskFs {
         if internal_api::is_internal_path(&from_norm) || internal_api::is_internal_path(&to_norm) {
             return Err(STATUS_ACCESS_DENIED.into());
         }
-        {
-            let mut engine = self.engine();
-            engine
-                .table_mut()
-                .rename(&from, &to, replace_if_exists)
-                .map_err(map_lookup_err)?;
-        } // release engine lock before touching open_paths
+        // Hold the engine lock across both the namespace rename and the
+        // open-handle path fixup: if another callback could create a new node
+        // at the old path between the two steps, its fresh handle would be
+        // wrongly rewritten to point at the renamed file. Lock order is
+        // engine -> open_paths everywhere (open/create touch open_paths only
+        // after releasing the engine), so this cannot deadlock.
+        let mut engine = self.engine();
+        engine
+            .rename(&from, &to, replace_if_exists)
+            .map_err(map_engine_err)?;
 
         // Rewrite the stored path of every open handle whose path is exactly
         // `old_prefix` (the renamed entry itself) or starts with
@@ -1190,7 +1982,7 @@ impl FileSystemContext for VramDiskFs {
             return Ok(());
         }
         if delete_file && context.is_dir {
-            let engine = self.engine();
+            let engine = self.engine_shared();
             if let Some(node) = engine.get(&context.path()) {
                 if !node.children.is_empty() {
                     return Err(STATUS_DIRECTORY_NOT_EMPTY.into());
@@ -1204,8 +1996,7 @@ impl FileSystemContext for VramDiskFs {
     fn cleanup(&self, context: &Self::FileContext, _file_name: Option<&U16CStr>, flags: u32) {
         if context.internal.is_some() {
             if let Some(id) = submit_internal_if_needed(context, &self.jobs) {
-                let mut engine = self.engine();
-                execute_job(&id, &self.jobs, &mut engine);
+                self.enqueue_job(id);
             }
             return;
         }
@@ -1227,10 +2018,12 @@ impl FileSystemContext for VramDiskFs {
     }
 
     fn get_volume_info(&self, out: &mut VolumeInfo) -> winfsp::Result<()> {
-        let engine = self.engine();
-        let stats = engine.stats();
-        out.total_size = stats.total_bytes;
-        out.free_size = stats.free_physical_bytes;
+        // Explorer polls this constantly during copies; use the O(1) allocator
+        // counters instead of the full namespace walk `stats()` performs.
+        let engine = self.engine_shared();
+        let (total, free) = engine.volume_usage();
+        out.total_size = total;
+        out.free_size = free;
         out.set_volume_label(&self.label);
         Ok(())
     }
@@ -1323,7 +2116,7 @@ impl FileSystemContext for VramDiskFs {
                         emit_internal("cancel", InternalEntry::JobCancelFile { id: id.clone() })?;
                     }
                     InternalEntry::ChunksRootDir => {
-                        let engine = self.engine();
+                        let engine = self.engine_shared();
                         let entries = engine.table().readdir("\\").map_err(map_lookup_err)?;
                         for (name, child) in entries {
                             if name.eq_ignore_ascii_case(internal_api::DISPLAY_ROOT) {
@@ -1337,7 +2130,7 @@ impl FileSystemContext for VramDiskFs {
                         }
                     }
                     InternalEntry::ChunksDir { target_dir } => {
-                        let engine = self.engine();
+                        let engine = self.engine_shared();
                         let base = if target_dir == "\\" {
                             String::new()
                         } else {
@@ -1364,7 +2157,7 @@ impl FileSystemContext for VramDiskFs {
                         }
                     }
                     InternalEntry::HashAlgDir { alg, target_dir } => {
-                        let engine = self.engine();
+                        let engine = self.engine_shared();
                         let base = if target_dir == "\\" {
                             String::new()
                         } else {
@@ -1398,7 +2191,7 @@ impl FileSystemContext for VramDiskFs {
                     | InternalEntry::HashFile { .. } => {}
                 }
             } else {
-                let engine = self.engine();
+                let engine = self.engine_shared();
                 // Set the entry name as raw UTF-16 *without* a NUL terminator;
                 // WinFsp derives the name length from the entry size.
                 let mut emit = |name: &str, node: &Node| -> winfsp::Result<()> {
@@ -1604,6 +2397,7 @@ type VramDiskHost = FileSystemHost<VramDiskFs, FineGuard>;
 
 pub struct MountedVramDisk {
     host: VramDiskHost,
+    job_worker: JobWorkerHandle,
     _init: FspInit,
     active: bool,
 }
@@ -1615,6 +2409,7 @@ impl MountedVramDisk {
 
     fn stop_unmount(&mut self) {
         if self.active {
+            self.job_worker.shutdown();
             self.host.stop();
             self.host.unmount();
             self.active = false;
@@ -1628,6 +2423,20 @@ impl Drop for MountedVramDisk {
     }
 }
 
+/// How long WinFsp may serve cached metadata before asking us again, in ms.
+///
+/// Every miss is a full user-mode round trip (measured at ~14 us on this
+/// stack), and a `GetFileAttributesEx` on a cold path costs several of them.
+/// `FileInfoTimeout` alone was already set; the sibling timeouts were left at
+/// 0, meaning "never cache", so directory listings, volume queries and above
+/// all the per-open security checks paid that round trip every single time.
+///
+/// The cost of caching is staleness: an ACL or size change made through some
+/// other handle can take up to this long to be observed. One second is what
+/// the file-info cache already accepted, and it is the value WinFsp's own
+/// samples use.
+const METADATA_CACHE_MS: u32 = 1000;
+
 fn volume_params() -> VolumeParams {
     let mut vp = VolumeParams::new();
     vp.sector_size(512)
@@ -1635,7 +2444,11 @@ fn volume_params() -> VolumeParams {
         .max_component_length(255)
         .volume_creation_time(crate::lookup::now_filetime())
         .volume_serial_number(0x5652_414D) // "VRAM"
-        .file_info_timeout(1000)
+        .file_info_timeout(METADATA_CACHE_MS)
+        .dir_info_timeout(METADATA_CACHE_MS)
+        .volume_info_timeout(METADATA_CACHE_MS)
+        .security_timeout(METADATA_CACHE_MS)
+        .stream_info_timeout(METADATA_CACHE_MS)
         .case_sensitive_search(false)
         .case_preserved_names(true)
         .unicode_on_disk(true)
@@ -1646,50 +2459,227 @@ fn volume_params() -> VolumeParams {
     vp
 }
 
+/// `STATUS_NO_SUCH_DEVICE`, and the HRESULT form of it that WinFsp also hands back.
+const STATUS_NO_SUCH_DEVICE: i32 = 0xC000_000Eu32 as i32;
+const HRESULT_NO_SUCH_DEVICE: i32 = 0xD000_000Eu32 as i32;
+
+/// WinFsp's user-mode DLL answers "no such device" when its kernel driver is not
+/// loaded -- the DLL and the installation are fine, there is simply nothing
+/// listening on `\Device\WinFsp.Disk`. That happens after `fsptool unload`, which
+/// is exactly what one runs to clear an orphaned mount point, so it is a state a
+/// user can easily be left in. The bare NTSTATUS says none of that.
+fn winfsp_driver_not_loaded(e: &windows::core::Error) -> bool {
+    matches!(e.code().0, STATUS_NO_SUCH_DEVICE | HRESULT_NO_SUCH_DEVICE)
+}
+
+/// The exact text `mount` fails with in that case. Public so a front end can
+/// recognise it and show its own translated wording instead.
+pub const WINFSP_DRIVER_NOT_LOADED: &str = r#"the WinFsp kernel driver is not loaded.
+
+WinFsp itself is installed -- its DLL answered -- but the file system driver is
+not running, so there is no device to attach a volume to. `fsptool unload` leaves
+the machine in this state, and nothing reloads the driver on its own.
+
+From an ELEVATED prompt:
+
+    "C:\Program Files (x86)\WinFsp\bin\fsptool-x64.exe" load
+
+No reboot is needed. `fsptool-x64.exe lsvol` should then run without error."#;
+
 pub fn mount(engine: StorageEngine, mount: &str, label: &str) -> anyhow::Result<MountedVramDisk> {
     preload_winfsp_dll().context("could not locate/load WinFsp (is it installed?)")?;
     let init = winfsp::winfsp_init().context("WinFsp init failed (is WinFsp installed?)")?;
 
     let fs = VramDiskFs::new(engine, label);
-    let mut host = VramDiskHost::new(volume_params(), fs)
-        .map_err(|e| anyhow::anyhow!("failed to create WinFsp host: {e:?}"))?;
-    host.mount(mount)
-        .map_err(|e| anyhow::anyhow!("failed to mount at {mount}: {e:?}"))?;
+    let job_worker = fs.job_worker();
+    let mut host = VramDiskHost::new(volume_params(), fs).map_err(|e| {
+        if winfsp_driver_not_loaded(&e) {
+            anyhow::anyhow!(WINFSP_DRIVER_NOT_LOADED)
+        } else {
+            anyhow::anyhow!("failed to create WinFsp host: {e:?}")
+        }
+    })?;
+    host.mount(mount).map_err(|e| {
+        if winfsp_driver_not_loaded(&e) {
+            anyhow::anyhow!(WINFSP_DRIVER_NOT_LOADED)
+        } else {
+            anyhow::anyhow!("failed to mount at {mount}: {e:?}")
+        }
+    })?;
     host.start()
         .map_err(|e| anyhow::anyhow!("failed to start dispatcher: {e:?}"))?;
     Ok(MountedVramDisk {
         host,
+        job_worker,
         _init: init,
         active: true,
     })
 }
 
 /// Mount the engine as a WinFsp volume and block until the user unmounts.
+/// Release a drive letter whose VRAMDISK was killed instead of unmounted.
+///
+/// `TerminateProcess` on a WinFsp host skips the unmount, and the volume device
+/// can survive with nobody to answer its I/O. The drive letter is then a black
+/// hole: every read of it blocks forever, so anything that enumerates drives --
+/// PowerShell's provider initialisation, Explorer, a file dialog -- hangs too,
+/// and the letter cannot be reused. The mapping outlives the process because it
+/// lives in the system-wide device map.
+///
+/// Refuses to act on a drive that answers, so it cannot take a live volume
+/// away. Removing the definition needs administrator rights; without them
+/// `DefineDosDevice` reports success while changing only this process's view,
+/// which is why the result is verified rather than trusted.
+pub fn release_stale_mount(mount: &str) -> anyhow::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        DefineDosDeviceW, DDD_EXACT_MATCH_ON_REMOVE, DDD_RAW_TARGET_PATH, DDD_REMOVE_DEFINITION,
+    };
+
+    let letter = mount.trim().trim_end_matches(['\\', '/']).to_string();
+    anyhow::ensure!(
+        letter.len() == 2
+            && letter.ends_with(':')
+            && letter.starts_with(|c: char| c.is_ascii_alphabetic()),
+        "expected a drive letter such as T:, got {mount:?}"
+    );
+    let wide: Vec<u16> = letter.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let target = query_dos_device(&wide);
+    let Some(target) = target else {
+        println!("{letter} is not mapped to anything; nothing to release.");
+        return Ok(());
+    };
+    println!("{letter} -> {target}");
+
+    // A live drive answers this immediately; a stale one never answers at all.
+    let probe_path = format!("{letter}\\");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::fs::metadata(&probe_path).is_ok());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(_) => {
+            anyhow::bail!(
+                "{letter} is responding, so it is not stale -- refusing to touch it. Unmount it normally instead."
+            );
+        }
+        Err(_) => println!("{letter} did not respond in 5s; treating it as stale."),
+    }
+
+    let target_w: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = DefineDosDeviceW(
+            DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE | DDD_RAW_TARGET_PATH,
+            PCWSTR(wide.as_ptr()),
+            PCWSTR(target_w.as_ptr()),
+        );
+    }
+
+    match query_dos_device(&wide) {
+        None => {
+            println!("Released {letter}.");
+            Ok(())
+        }
+        Some(_) => anyhow::bail!(
+            r#"{letter} is still mapped, and nothing in user mode can take it away.
+
+The letter is a symbolic link in this logon session's device map, and the WinFsp driver
+still holds the orphaned volume behind it. DefineDosDevice reports success without
+changing anything, mountvol manages a different kind of mount point, and an elevated
+prompt gets its own device map where the letter does not even appear.
+
+Reloading the WinFsp driver releases it, with no reboot. fsptool-x64.exe lives in
+WinFsp's bin directory. First check that this is the only WinFsp volume:
+
+    fsptool-x64.exe lsvol
+
+If {letter} is the only line, then from an ELEVATED prompt:
+
+    fsptool-x64.exe unload
+    fsptool-x64.exe load
+
+Run both. `unload` on its own leaves the machine with no WinFsp driver at all, and every
+later mount then fails with "no such device" until `load` puts it back.
+
+Any other WinFsp filesystem (sshfs-win, rclone mount, ...) would be torn down too, which
+is why the check comes first. Anything on a different driver -- an ImDisk RAM disk, for
+instance -- is unaffected."#
+        ),
+    }
+}
+
+/// The device `name` (e.g. `T:`) currently resolves to, if any.
+fn query_dos_device(name: &[u16]) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
+    let mut buf = vec![0u16; 2048];
+    let n = unsafe { QueryDosDeviceW(PCWSTR(name.as_ptr()), Some(&mut buf)) };
+    if n == 0 {
+        return None;
+    }
+    // A double-NUL terminated list; the first entry is the active definition.
+    String::from_utf16_lossy(&buf[..n as usize])
+        .split('\0')
+        .find(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Set when the user asks the CLI mount to stop, from either the console
+/// control handler or the stdin watcher.
+static CLI_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// Set once the volume is actually down, so the control handler can wait for
+/// the unmount instead of letting Windows kill us mid-teardown.
+static CLI_UNMOUNTED: AtomicBool = AtomicBool::new(false);
+
+/// Console control handler: Ctrl-C, Ctrl-Break, console close, logoff, shutdown.
+///
+/// Returning from this callback lets Windows terminate the process, and a
+/// terminated WinFsp host can leave its volume device behind -- the drive
+/// letter then answers no I/O and cannot be reused until reboot. So it asks the
+/// main thread to unmount and waits (bounded) for that to finish.
+unsafe extern "system" fn cli_ctrl_handler(_ctrl_type: u32) -> windows::core::BOOL {
+    CLI_SHUTDOWN.store(true, Ordering::Release);
+    for _ in 0..200 {
+        if CLI_UNMOUNTED.load(Ordering::Acquire) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    windows::core::BOOL(1)
+}
+
 pub fn run(engine: StorageEngine, mount_point: &str, label: &str) -> anyhow::Result<()> {
     let mounted = mount(engine, mount_point, label)?;
-    println!("\nMounted at {mount_point}. Press Enter (or Ctrl-C / kill the process) to unmount.");
+    println!(
+        "
+Mounted at {mount_point}. Press Enter (or Ctrl-C) to unmount."
+    );
 
-    // Wait for the user to press Enter. A bare EOF (e.g. launched with no
-    // attached console) is ignored so the mount stays up until the process is
-    // killed; WinFsp tears the volume down on process exit either way.
-    use std::io::BufRead;
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => {
-                // EOF: park forever; rely on Ctrl-C / kill to stop.
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(3600));
-                }
-            }
-            Ok(_) => break,
-            Err(_) => break,
+    // Best effort: without it a Ctrl-C still unmounts on most paths, but the
+    // console-close and shutdown cases would not.
+    unsafe {
+        let _ =
+            windows::Win32::System::Console::SetConsoleCtrlHandler(Some(cli_ctrl_handler), true);
+    }
+
+    // Enter on stdin also stops us. A bare EOF (launched with no console) is
+    // ignored so the mount stays up until a signal arrives -- returning there
+    // would tear the volume down the instant a detached process started.
+    std::thread::spawn(|| {
+        use std::io::BufRead;
+        let mut line = String::new();
+        if !matches!(std::io::stdin().lock().read_line(&mut line), Ok(0)) {
+            CLI_SHUTDOWN.store(true, Ordering::Release);
         }
+    });
+
+    while !CLI_SHUTDOWN.load(Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     mounted.unmount();
+    CLI_UNMOUNTED.store(true, Ordering::Release);
     println!("Unmounted.");
     Ok(())
 }
@@ -1697,10 +2687,25 @@ pub fn run(engine: StorageEngine, mount_point: &str, label: &str) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn no_such_device_is_recognised_in_both_forms() {
+        // WinFsp hands the same condition back as a raw NTSTATUS or as the
+        // HRESULT that wraps it, depending on which layer failed.
+        let err =
+            |code: u32| windows::core::Error::from_hresult(windows::core::HRESULT(code as i32));
+        assert!(winfsp_driver_not_loaded(&err(0xC000_000E)));
+        assert!(winfsp_driver_not_loaded(&err(0xD000_000E)));
+        // Anything else keeps the raw diagnostic; a wrong guess here would send
+        // the user off reloading a driver that is working fine.
+        assert!(!winfsp_driver_not_loaded(&err(0xC000_0022))); // STATUS_ACCESS_DENIED
+        assert!(!winfsp_driver_not_loaded(&err(0x8007_0002))); // ERROR_FILE_NOT_FOUND
+    }
 
     #[test]
     fn default_security_descriptor_is_self_relative() {
-        let sd = security_descriptor_from_sddl(DEFAULT_SECURITY_SDDL).unwrap();
+        let sd = security_descriptor_from_sddl(default_security_sddl()).unwrap();
         assert!(sd.len() >= 20);
         let reported = unsafe {
             GetSecurityDescriptorLength(PSECURITY_DESCRIPTOR(sd.as_ptr() as *mut c_void))
@@ -1728,6 +2733,7 @@ mod tests {
         (fs, context)
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn create_preserves_display_case() {
         let _ = preload_winfsp_dll();
@@ -1762,20 +2768,27 @@ mod tests {
         fs.close(context);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn hash_job_hashes_multiple_paths_and_directories() {
         let vram = crate::cuda::Vram::new(0, crate::CHUNK_SIZE * 8).expect("test vram");
-        let mut engine = StorageEngine::new(vram, false, false).expect("engine");
-        engine.table_mut().create_file("\\a.txt", 0).unwrap();
-        engine.table_mut().create_dir("\\dir", 0).unwrap();
-        engine.table_mut().create_file("\\dir\\b.txt", 0).unwrap();
-        engine.write("\\a.txt", 0, b"abc").unwrap();
-        engine.write("\\dir\\b.txt", 0, b"hello").unwrap();
+        let mut raw_engine = StorageEngine::new(vram, false, false).expect("engine");
+        raw_engine.table_mut().create_file("\\a.txt", 0).unwrap();
+        raw_engine.table_mut().create_dir("\\dir", 0).unwrap();
+        raw_engine
+            .table_mut()
+            .create_file("\\dir\\b.txt", 0)
+            .unwrap();
+        raw_engine.write("\\a.txt", 0, b"abc").unwrap();
+        raw_engine.write("\\dir\\b.txt", 0, b"hello").unwrap();
+        let engine = Arc::new(RwLock::new(raw_engine));
+        let jobs = JobRegistry::default();
 
         let result = execute_job_descriptor(
             "job-hash",
             r#"{"op":"hash","algorithm":"sha256","paths":["\\a.txt","\\dir"],"recursive":true}"#,
-            &mut engine,
+            &jobs,
+            &engine,
         )
         .unwrap();
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -1789,6 +2802,7 @@ mod tests {
         assert!(result.contains("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn cleanup_deletes_when_winfsp_sets_delete_flag() {
         let (fs, context) = test_fs_with_file("\\victim");
@@ -1796,11 +2810,99 @@ mod tests {
         assert!(fs.engine().get("\\victim").is_none());
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn cleanup_deletes_when_set_delete_marked_pending() {
         let (fs, context) = test_fs_with_file("\\victim");
         context.delete_pending.store(true, Ordering::SeqCst);
         fs.cleanup(&context, None, 0);
         assert!(fs.engine().get("\\victim").is_none());
+    }
+
+    fn wait_for_job_state(fs: &VramDiskFs, id: &str, expected: JobState) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(snap) = fs.jobs.snapshot(id) {
+                if snap.state == expected {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() <= deadline,
+                "timed out waiting for job {id} to reach {expected:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn test_fs_with_hash_input() -> VramDiskFs {
+        let vram = crate::cuda::Vram::new(0, crate::CHUNK_SIZE * 8).expect("test vram");
+        let mut engine = StorageEngine::new(vram, false, false).expect("engine");
+        engine.table_mut().create_file("\\data.bin", 0).unwrap();
+        engine.write("\\data.bin", 0, &[7u8; 1024]).unwrap();
+        VramDiskFs::new(engine, "test")
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn async_worker_reports_running_then_wait_returns_result() {
+        let fs = test_fs_with_hash_input();
+        let id = "job-running";
+        fs.jobs.reserve(id).unwrap();
+        fs.jobs
+            .complete_submission(
+                id,
+                br#"{"op":"hash","algorithm":"sha256","paths":["\\data.bin"],"recursive":true}"#,
+            )
+            .unwrap();
+
+        let engine_guard = fs.engine();
+        fs.enqueue_job(id.to_string());
+        wait_for_job_state(&fs, id, JobState::Running);
+
+        let running = fs.jobs.snapshot(id).unwrap();
+        let status = status_json(&running);
+        assert!(status.contains(r#""state": "running""#));
+        assert!(status.contains(r#""terminal": false"#));
+
+        drop(engine_guard);
+
+        let done = fs.jobs.wait(id).unwrap();
+        assert_eq!(done.state, JobState::Succeeded);
+        let wait_result = String::from_utf8(
+            job_content(
+                &InternalEntry::JobWaitFile { id: id.into() },
+                &fs.jobs,
+                true,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(done.result, wait_result);
+        assert!(done.result.contains(r#""ok":true"#) || done.result.contains(r#""ok": true"#));
+    }
+
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
+    #[test]
+    fn async_worker_cancels_running_job_at_safe_boundary() {
+        let fs = test_fs_with_hash_input();
+        let id = "job-cancel";
+        fs.jobs.reserve(id).unwrap();
+        fs.jobs
+            .complete_submission(
+                id,
+                br#"{"op":"hash","algorithm":"sha256","paths":["\\data.bin"],"recursive":true}"#,
+            )
+            .unwrap();
+
+        let engine_guard = fs.engine();
+        fs.enqueue_job(id.to_string());
+        wait_for_job_state(&fs, id, JobState::Running);
+        assert!(fs.jobs.cancel(id));
+        drop(engine_guard);
+
+        let done = fs.jobs.wait(id).unwrap();
+        assert_eq!(done.state, JobState::Cancelled);
+        assert!(done.result.contains("cancelled by user"));
     }
 }

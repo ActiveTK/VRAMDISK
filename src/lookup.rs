@@ -113,7 +113,7 @@ impl LookupTable {
     }
 
     pub fn get(&self, path: &str) -> Option<&Node> {
-        self.nodes.get(&normalize(path))
+        self.nodes.get(normalize_key(path).as_ref())
     }
 
     pub fn nodes(&self) -> impl Iterator<Item = &Node> {
@@ -122,17 +122,28 @@ impl LookupTable {
 
     #[allow(dead_code)] // used by the storage engine (Phase 4)
     pub fn get_mut(&mut self, path: &str) -> Option<&mut Node> {
-        self.nodes.get_mut(&normalize(path))
+        self.nodes.get_mut(normalize_key(path).as_ref())
     }
 
     #[cfg(test)]
     pub fn exists(&self, path: &str) -> bool {
-        self.nodes.contains_key(&normalize(path))
+        self.nodes.contains_key(normalize_key(path).as_ref())
     }
 
+    /// Number of nodes in the table, root included. Test-only: the running
+    /// engine tracks its own counters and never asks the table for a count.
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Whether the table holds no nodes at all. Always `false` in practice —
+    /// `new()` seeds the root and `remove` refuses to delete it — but clippy
+    /// requires the pair, and it keeps the collection-like surface honest.
+    #[cfg(test)]
+    #[allow(dead_code)] // paired with `len()` for API completeness; no test needs it yet
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Create a file at `path`. Parent must exist and be a directory.
@@ -213,7 +224,11 @@ impl LookupTable {
 
     /// Rename/move `from` to `to`. If `to` exists: replaced when `replace`,
     /// else `AlreadyExists`. Moves the whole subtree for directories.
-    pub fn rename(&mut self, from: &str, to: &str, replace: bool) -> LResult<()> {
+    ///
+    /// Returns the node that was replaced at `to` (if any) so the caller —
+    /// the storage engine — can free the VRAM placements it still owns.
+    /// Dropping that node without freeing its coords would leak its chunks.
+    pub fn rename(&mut self, from: &str, to: &str, replace: bool) -> LResult<Option<Node>> {
         let from_key = normalize(from);
         let to_key = normalize(to);
         if from_key == ROOT {
@@ -223,7 +238,22 @@ impl LookupTable {
             return Err(LookupError::NotFound);
         }
         if from_key == to_key {
-            return Ok(());
+            // Same lookup key, but possibly a different display case
+            // (`foo.txt` -> `FOO.txt`). The volume is case-preserving, so a
+            // case-only rename must update the stored display name instead of
+            // silently doing nothing.
+            let new_name = display_name(to);
+            let old_name = self.nodes.get(&from_key).unwrap().name.clone();
+            if new_name != old_name && !new_name.is_empty() {
+                if let Some((parent, _)) = split_parent(&from_key) {
+                    if let Some(p) = self.nodes.get_mut(&parent) {
+                        p.children.remove(&old_name);
+                        p.children.insert(new_name.clone());
+                    }
+                }
+                self.nodes.get_mut(&from_key).unwrap().name = new_name;
+            }
+            return Ok(None);
         }
         // Disallow moving a directory into itself or one of its own
         // descendants (e.g. `\a` -> `\a\b`): re-rooting the subtree under a key
@@ -232,6 +262,7 @@ impl LookupTable {
         if from_is_dir && to_key.starts_with(&format!("{from_key}\\")) {
             return Err(LookupError::InvalidName);
         }
+        let mut replaced = None;
         if self.nodes.contains_key(&to_key) {
             if !replace {
                 return Err(LookupError::AlreadyExists);
@@ -240,7 +271,7 @@ impl LookupTable {
             if existing.is_dir {
                 return Err(LookupError::IsADirectory);
             }
-            self.remove(to)?;
+            replaced = Some(self.remove(to)?);
         }
         let (to_parent, _) = split_parent(&to_key).ok_or(LookupError::InvalidName)?;
         match self.nodes.get(&to_parent) {
@@ -281,7 +312,7 @@ impl LookupTable {
             }
             self.nodes.insert(new_key, node);
         }
-        Ok(())
+        Ok(replaced)
     }
 }
 
@@ -316,9 +347,67 @@ pub fn normalize(path: &str) -> String {
         if s.len() > 1 {
             s.push('\\');
         }
-        s.push_str(&comp.to_ascii_lowercase());
+        // Lowercase in place. `comp.to_ascii_lowercase()` allocated a fresh
+        // `String` for every path component, on a path that runs on every
+        // lookup -- and there are several lookups per filesystem callback.
+        for b in comp.bytes() {
+            s.push(b.to_ascii_lowercase() as char);
+        }
     }
     s
+}
+
+/// True when `path` is already exactly what [`normalize`] would return.
+///
+/// Decided in one pass with no allocation, so the hot lookup paths can skip
+/// normalization entirely: the keys the filesystem layer hands back (open
+/// file contexts, directory entries, engine-internal paths) are already
+/// normalized, and re-deriving them allocated a `String` per call for nothing.
+fn is_normalized(path: &str) -> bool {
+    let b = path.as_bytes();
+    if b.first() != Some(&b'\\') {
+        return false;
+    }
+    if b.len() == 1 {
+        return true; // the root
+    }
+    if b[b.len() - 1] == b'\\' {
+        return false; // trailing separator
+    }
+    let mut prev_sep = true; // index 0 is the leading separator
+    let mut dot_run = 0usize;
+    for &c in &b[1..] {
+        match c {
+            b'/' => return false,
+            b'\\' => {
+                if prev_sep {
+                    return false; // empty component
+                }
+                if dot_run == 1 {
+                    return false; // a "." component, which normalize drops
+                }
+                prev_sep = true;
+                dot_run = 0;
+            }
+            _ => {
+                if c.is_ascii_uppercase() {
+                    return false;
+                }
+                dot_run = if c == b'.' && prev_sep { 1 } else { usize::MAX };
+                prev_sep = false;
+            }
+        }
+    }
+    dot_run != 1
+}
+
+/// Normalized form of `path`, borrowing it when it already is normalized.
+fn normalize_key(path: &str) -> std::borrow::Cow<'_, str> {
+    if is_normalized(path) {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        std::borrow::Cow::Owned(normalize(path))
+    }
 }
 
 /// Final path component in original case.
@@ -483,5 +572,58 @@ mod tests {
         let t = now_filetime();
         assert!(t > 125_000_000_000_000_000);
         assert!(t < 190_000_000_000_000_000);
+    }
+
+    /// `normalize_key` borrows only when the result is byte-for-byte what
+    /// `normalize` would have produced. A wrong `true` here would silently
+    /// look up the wrong node, so the equivalence is asserted directly
+    /// rather than the predicate being spot-checked.
+    #[test]
+    fn normalize_key_always_matches_normalize() {
+        let cases = [
+            "",
+            "/",
+            "\\",
+            "\\\\",
+            "\\a",
+            "\\A",
+            "a",
+            "a/b",
+            "\\a\\b",
+            "\\a\\\\b",
+            "\\a\\B\\c",
+            "\\a\\.\\b",
+            "\\.",
+            "\\a\\",
+            "\\a.txt",
+            "\\A.TXT",
+            "\\..\\b",
+            "\\a\\..",
+            "\\a b\\c d",
+            "\\日本語\\B",
+            "\\a.\\b",
+            "\\.a",
+            "\\a\\.\\.\\b",
+        ];
+        for c in cases {
+            assert_eq!(
+                normalize_key(c).as_ref(),
+                normalize(c).as_str(),
+                "normalize_key disagreed for {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_is_case_insensitive_through_the_borrowed_path() {
+        let mut t = LookupTable::new();
+        t.create("\\Dir", true, 0).unwrap();
+        t.create("\\Dir\\File.TXT", false, 0).unwrap();
+        // Already-normalized key: borrowed, no allocation.
+        assert!(t.get("\\dir\\file.txt").is_some());
+        // Needs normalizing: owned.
+        assert!(t.get("\\DIR\\FILE.txt").is_some());
+        assert!(t.get("Dir/File.TXT").is_some());
+        assert!(t.get("\\dir\\.\\file.txt").is_some());
     }
 }

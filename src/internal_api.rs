@@ -51,11 +51,26 @@ VRAMDISK 内部API
       ジョブ状態を JSON で表示します。
 
   \\$VRAMDISK\\jobs\\<id>\\wait
-      ジョブ完了まで read をブロックし、完了時に result.json と同じ内容を返します。
+      投入済みジョブの完了まで read をブロックし、完了時に result.json と同じ内容を返します。
 
   hash job descriptor 例:
       {\"op\":\"hash\",\"algorithm\":\"sha256\",\"paths\":[\"\\\\data\"],\"recursive\":true}
       md5, sha1, sha256, fnv1a64 に対応します。
+
+  archive job descriptor 例:
+      {\"op\":\"archive.compress\",\"format\":\"tar.zst\",\"paths\":[\"\\\\data\"],\"output\":\"\\\\out.tar.zst\"}
+      {\"op\":\"archive.extract\",\"format\":\"tar.zst\",\"archive\":\"\\\\out.tar.zst\",\"output_dir\":\"\\\\restore\"}
+      tar.zst, tar.lz4, tar.gz, zip に対応します（nvCOMP が必要）。
+
+  encode job descriptor 例:
+      {\"op\":\"encode\",\"codec\":\"base64\",\"direction\":\"encode\",\"input\":\"\\\\a.bin\",\"output\":\"\\\\a.b64\"}
+      codec は base64 / hex、direction は encode / decode に対応します。
+
+  search job descriptor 例:
+      {\"op\":\"search\",\"pattern\":\"TODO\",\"paths\":[\"\\\\data\"],\"ignore_case\":false}
+      VRAM 上のファイル本文を GPU で全文検索します。paths 省略時はボリューム全体。
+      pattern の代わりに pattern_hex で任意のバイト列を指定できます（偶数長の 16 進）。
+      max_offsets で 1 ファイルあたりの報告位置数を制限できます（既定 64、件数は常に正確）。
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,7 +240,7 @@ pub fn content(entry: &Entry, engine: &mut StorageEngine) -> Result<Vec<u8>, Eng
         Entry::TraceJsonFile => Ok(trace_json(engine).into_bytes()),
         Entry::ChunksJsonFile { target_file } => Ok(chunks_json(engine, target_file)?.into_bytes()),
         Entry::HashFile { alg, target_file } => {
-            let digest = engine.hash_file_gpu(target_file, *alg)?;
+            let digest = engine.hash_file(target_file, *alg)?;
             Ok(format!("{}\r\n", digest_hex(&digest)).into_bytes())
         }
         Entry::RootDir
@@ -298,6 +313,7 @@ compress.raw_fallback_chunks: {}\r\n\
 dedup.hash_chunks: {}\r\n\
 dedup.candidate_chunks: {}\r\n\
 dedup.shared_chunks: {}\r\n\
+dedup.rejected_chunks: {}\r\n\
 dedup.unique_chunks: {}\r\n\
 gpu.hash_chunks: {}\r\n",
         t.read_calls,
@@ -319,6 +335,7 @@ gpu.hash_chunks: {}\r\n",
         t.dedup_hash_chunks,
         t.dedup_candidate_chunks,
         t.dedup_shared_chunks,
+        t.dedup_rejected_chunks,
         t.dedup_unique_chunks,
         t.gpu_hash_chunks,
     )
@@ -345,6 +362,7 @@ fn trace_json(engine: &StorageEngine) -> String {
             "    \"hash_chunks\": {},\r\n",
             "    \"candidate_chunks\": {},\r\n",
             "    \"shared_chunks\": {},\r\n",
+            "    \"rejected_chunks\": {},\r\n",
             "    \"unique_chunks\": {}\r\n",
             "  }},\r\n",
             "  \"gpu\": {{\"hash_chunks\": {}}}\r\n",
@@ -369,6 +387,7 @@ fn trace_json(engine: &StorageEngine) -> String {
         t.dedup_hash_chunks,
         t.dedup_candidate_chunks,
         t.dedup_shared_chunks,
+        t.dedup_rejected_chunks,
         t.dedup_unique_chunks,
         t.gpu_hash_chunks,
     )
@@ -541,15 +560,11 @@ fn chunks_json(engine: &StorageEngine, target_file: &str) -> Result<String, Engi
                 content_hash,
             } => {
                 out.push_str("      \"kind\": \"raw\",\r\n");
+                out.push_str(&format!("      \"physical_chunk\": {physical_chunk},\r\n"));
                 out.push_str(&format!(
-                    "      \"physical_chunk\": {},\r\n",
-                    physical_chunk
+                    "      \"physical_offset\": {physical_offset},\r\n"
                 ));
-                out.push_str(&format!(
-                    "      \"physical_offset\": {},\r\n",
-                    physical_offset
-                ));
-                out.push_str(&format!("      \"refcount\": {},\r\n", refcount));
+                out.push_str(&format!("      \"refcount\": {refcount},\r\n"));
                 out.push_str(&format!("      \"shared\": {},\r\n", *refcount > 1));
                 out.push_str(&format!(
                     "      \"content_hash\": {}\r\n",
@@ -564,10 +579,10 @@ fn chunks_json(engine: &StorageEngine, target_file: &str) -> Result<String, Engi
                 content_hash,
             } => {
                 out.push_str("      \"kind\": \"compressed\",\r\n");
-                out.push_str(&format!("      \"offset\": {},\r\n", offset));
-                out.push_str(&format!("      \"len\": {},\r\n", len));
+                out.push_str(&format!("      \"offset\": {offset},\r\n"));
+                out.push_str(&format!("      \"len\": {len},\r\n"));
                 out.push_str(&format!("      \"codec\": \"{}\",\r\n", codec_name(*codec)));
-                out.push_str(&format!("      \"refcount\": {},\r\n", refcount));
+                out.push_str(&format!("      \"refcount\": {refcount},\r\n"));
                 out.push_str(&format!("      \"shared\": {},\r\n", *refcount > 1));
                 out.push_str(&format!(
                     "      \"content_hash\": {}\r\n",
@@ -713,6 +728,7 @@ mod tests {
         assert!(!is_internal_path("\\normal"));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn resolves_public_entries_without_md5_alias() {
         let vram = crate::cuda::Vram::new(0, crate::CHUNK_SIZE).expect("test vram");
@@ -754,6 +770,7 @@ mod tests {
         assert_eq!(resolve("\\$vramdisk\\md5\\file.bin", &engine), None);
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn chunks_json_reports_raw_and_sparse_chunks() {
         let vram = crate::cuda::Vram::new(0, crate::CHUNK_SIZE * 4).expect("test vram");
@@ -772,6 +789,7 @@ mod tests {
         assert!(json.contains("\"physical_chunk\": 0"));
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires an NVIDIA GPU")]
     #[test]
     fn chunks_json_reports_dedup_refcount_and_hash() {
         let vram = crate::cuda::Vram::new(0, crate::CHUNK_SIZE * 4).expect("test vram");

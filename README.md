@@ -6,7 +6,16 @@ VRAMDISKは、GPUのVRAMを独自のファイルシステム経由でWindowsに�
 
 VRAM上にはオブジェクトストレージのような構造でデータを保存しているため、GPUの高い並列計算性能を活用してGPU上でそのままファイルを圧縮したり、ハッシュ値を求めたり、エンコードしたりすることができます。
 
-※アンマウント/プロセス終了でデータは消えます。
+マウント中は次のGPUツールが使えます（GUIのツールパネル、または `$VRAMDISK` 内部APIから）。
+
+| ツール | 内容 |
+|---|---|
+| ハッシュ計算 | MD5 / SHA-1 / SHA-256 / FNV-1a 64 をGPU/CPU自動振り分けで計算 |
+| 圧縮・展開 | tar.zst / tar.lz4 / tar.gz / zip をGPU上で作成・展開（要 nvCOMP） |
+| エンコード | Base64 / hex（16進テキスト）のエンコード・デコードをGPU上で実行 |
+| 全文検索 | ドライブ上の全ファイルをGPUで横断検索（VRAM帯域で走査するのでPCIeを通りません） |
+
+※VRAM上のデータはアンマウント/プロセス終了で消えます。GUIからアンマウントまたは終了するときは、ドライブの内容をZIPとしてPCに保存するか選べます。
 
 ## 導入方法
 
@@ -44,7 +53,7 @@ https://developer.nvidia.com/nvcomp-downloads?target_os=Windows&target_arch=x86_
 
 https://aka.ms/vc14/vc_redist.x64.exe
 
-### 「Cloud not find the WebView2 Runtime」と表示された場合
+### 「Could not find the WebView2 Runtime」と表示された場合
 
 以下から、WebView2ランタイムを導入してください。Evergreen Standalone Installerで大丈夫です。
 

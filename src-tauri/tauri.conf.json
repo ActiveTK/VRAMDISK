@@ -11,9 +11,11 @@
     "windows": [
       {
         "title": "VRAMDISK",
-        "width": 380,
-        "height": 400,
-        "resizable": false
+        "width": 404,
+        "height": 580,
+        "minWidth": 380,
+        "minHeight": 460,
+        "resizable": true
       }
     ],
     "security": {

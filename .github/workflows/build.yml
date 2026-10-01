@@ -1,17 +1,27 @@
 name: build
 
-# Build-only CI: GitHub-hosted runners have no NVIDIA GPU, so this verifies
-# that vramdisk.exe compiles on every push/PR. It intentionally does not run
-# `cargo test` — the unit tests allocate real GPU VRAM (`Vram::new`) and
-# require an actual CUDA device, which this workflow cannot provide.
-# GPU-dependent test/E2E verification stays a local/manual step (see
-# CURRENT.md). There is no installer to build (bundle.active=false in
+# GitHub-hosted runners have no NVIDIA GPU, so this verifies that
+# vramdisk.exe compiles on every push/PR and runs everything that can be
+# checked without a CUDA device. Tests that allocate real VRAM are gated
+# behind the `gpu-tests` feature (on by default, so a local `cargo test` still
+# runs them); the lint job below runs the rest with --no-default-features.
+# Full GPU test and E2E verification stays a local/manual step (see
+# scripts/README.md). There is no installer to build (bundle.active=false in
 # tauri.conf.json) — vramdisk.exe is a standalone executable, so this is a
 # plain `cargo build`, no Node/npm/tauri-cli involved.
 #
 # There's only one binary: vramdisk.exe is both the GUI (default launch) and
 # the CLI (`vramdisk.exe cli ...` / `vramdisk.exe benchmark ...`), so building
 # it here covers both.
+#
+# Alongside the build there's a `lint` gate: `cargo clippy --all-targets
+# -- -D warnings` over the root crate (the storage engine — the GUI crate in
+# src-tauri/ is a thin shell around it). `--all-targets` means the GPU-only
+# unit tests are *type-checked and linted* here even though they are never
+# run, which is exactly the coverage we can get without a device. It's a
+# separate job so a lint regression and a build break report independently,
+# and so the two run in parallel; it repeats the msvc/libclang setup because
+# linting the root crate still runs winfsp-sys's bindgen build script.
 
 on:
   push:
@@ -58,3 +68,46 @@ jobs:
           name: vramdisk
           path: src-tauri/target/release/vramdisk.exe
           if-no-files-found: error
+
+  lint:
+    name: Lint and GPU-free tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `profile: minimal` is this action's default and omits clippy, so ask
+      # for it explicitly.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      # Same reason as the build job: winfsp-sys's bindgen runs during
+      # `cargo clippy` too, and needs MSVC's CRT headers plus libclang.
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate libclang
+        shell: pwsh
+        run: |
+          $cand = "$env:ProgramFiles\LLVM\bin"
+          if (-not (Test-Path "$cand\libclang.dll")) {
+            throw "libclang.dll not found at $cand (expected preinstalled on windows-latest)"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$cand"
+
+      # Warnings are denied so lint debt can't accumulate silently. Run from
+      # the repo root — that's the root crate; src-tauri/ is covered by the
+      # build job above.
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # The GPU-gated tests are compiled and linted by the step above but
+      # cannot run here, so this runs the rest: namespace, chunk allocator,
+      # compressed-blob arena, job registry, CLI parsing and the CRC tables.
+      # Better than the previous state, where CI ran no tests at all.
+      - name: cargo test (GPU-free subset)
+        run: cargo test --lib --no-default-features --locked

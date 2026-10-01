@@ -31,7 +31,7 @@ impl ChunkAllocator {
         };
         // Mark padding bits (beyond `total`) in the last word as used so they
         // are never handed out.
-        let rem = (total % 64) as u32;
+        let rem = total % 64;
         if rem != 0 {
             let last = words - 1;
             let valid_mask = (1u64 << rem) - 1;
@@ -97,25 +97,43 @@ impl ChunkAllocator {
             return None;
         }
 
-        // Simple bit scan. Walks the run of free bits; resets on a used bit.
+        // Word-at-a-time scan: fully-used words (u64::MAX) break the current
+        // run in O(1) and fully-free words (0) extend it by 64 in O(1); only
+        // mixed words fall back to a per-bit walk. Padding bits past `total`
+        // are pre-marked used, so they can never join a run.
         let mut run_start: u32 = 0;
         let mut run_len: u32 = 0;
-        let mut chunk: u32 = 0;
-        while chunk < self.total {
-            if self.is_used(chunk) {
+        for (w, &word) in self.words.iter().enumerate() {
+            let word_base = (w as u32) * 64;
+            if word == u64::MAX {
                 run_len = 0;
-                run_start = chunk + 1;
-            } else {
+                continue;
+            }
+            if word == 0 {
                 if run_len == 0 {
-                    run_start = chunk;
+                    run_start = word_base;
                 }
-                run_len += 1;
-                if run_len == count {
+                run_len += 64;
+                if run_len >= count {
                     self.mark_used(run_start, count);
                     return Some(run_start);
                 }
+                continue;
             }
-            chunk += 1;
+            for bit in 0..64u32 {
+                if word & (1u64 << bit) != 0 {
+                    run_len = 0;
+                } else {
+                    if run_len == 0 {
+                        run_start = word_base + bit;
+                    }
+                    run_len += 1;
+                    if run_len == count {
+                        self.mark_used(run_start, count);
+                        return Some(run_start);
+                    }
+                }
+            }
         }
         None
     }
