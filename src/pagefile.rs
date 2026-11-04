@@ -54,7 +54,7 @@ impl PagefileManager {
             diagnostics.push("swapadd was found; it will not be executed by this check.".into());
         } else {
             diagnostics.push(
-                "swapadd64.exe was not found (set VRAMDISK_SWAPADD to its full path to identify it).".into(),
+                "swapadd.exe was not found beside vramdisk.exe, in C:\\ProgramData, or on PATH (set VRAMDISK_SWAPADD to its full path to identify it).".into(),
             );
         }
 
@@ -98,13 +98,26 @@ impl PagefileManager {
 }
 
 fn discover_swapadd() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
     if let Some(path) = env::var_os("VRAMDISK_SWAPADD") {
-        let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
+        candidates.push(PathBuf::from(path));
     }
-    env::split_paths(&env::var_os("PATH").unwrap_or_default())
-        .flat_map(|dir| [dir.join("swapadd64.exe"), dir.join("swapadd.exe")])
-        .find(|path| path.is_file())
+
+    if let Some(executable_dir) = env::current_exe().ok().and_then(|path| path.parent().map(Path::to_path_buf)) {
+        candidates.extend([executable_dir.join("swapadd64.exe"), executable_dir.join("swapadd.exe")]);
+    }
+
+    candidates.extend([
+        PathBuf::from(r"C:\ProgramData\swapadd64.exe"),
+        PathBuf::from(r"C:\ProgramData\swapadd.exe"),
+    ]);
+
+    candidates.extend(
+        env::split_paths(&env::var_os("PATH").unwrap_or_default())
+            .flat_map(|dir| [dir.join("swapadd64.exe"), dir.join("swapadd.exe")]),
+    );
+
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 #[cfg(windows)]

@@ -9,9 +9,9 @@
 | Existing WinFsp filesystem | `RUNTIME_VERIFIED` by the existing project | Existing `src/fs.rs` and `src/engine.rs` path is unchanged. |
 | Generic block-storage contract | `IMPLEMENTED` | `src/block.rs`; checked LBA ranges, 512/4096-byte sectors, CUDA backing, and a test-only in-memory backend. |
 | WinSpd SCSI device and Windows disk integration | `NOT IMPLEMENTED` | WinSpd SDK/driver is not installed in the current environment, and no WinSpd adapter is present. |
-| Pagefile diagnostics | `IMPLEMENTED` (read-only) | `vramdisk.exe pagefile status` / `check` query Windows CIM data and locate `swapadd64.exe`; they never execute it. |
+| Pagefile diagnostics | `IMPLEMENTED` (read-only) | `vramdisk.exe pagefile status` / `check` query Windows CIM data and locate `swapadd.exe` / `swapadd64.exe` beside the app, in `C:\ProgramData`, or on `PATH`; they never execute it. |
 | Dynamic pagefile add/remove | `UNSUPPORTED / EXPERIMENTAL_UNVERIFIED` | `enable`, `disable`, and `verify` are guarded and cannot modify Windows paging configuration. |
-| GPU block-storage runtime | `NOT RUNTIME_VERIFIED` | The host reports Tesla M40 24 GB in WDDM mode, but Rust/Cargo is unavailable here to build or run this module. |
+| GPU block-storage runtime | `NOT RUNTIME_VERIFIED` | GitHub Actions builds the Windows Release executable and runs GPU-free tests; no VRAM disk runtime test has been performed on the Tesla M40. |
 | Windows paging over WinSpd | `NOT PAGING_VALIDATED` | No WinSpd paging-path support statement or system-level paging test was found. |
 
 ## Architecture findings
@@ -44,7 +44,7 @@ vramdisk.exe pagefile enable --size 2048M   # intentionally blocked
 vramdisk.exe pagefile disable               # intentionally blocked
 ```
 
-`status` and `check` are observational. `VRAMDISK_SWAPADD` can point to a local `swapadd64.exe` so diagnostics can identify the executable without running it. The official download/source listing is maintained by [LTRData](https://ltr-data.se/opencode.html); VRAMDISK does not download or redistribute the executable.
+`status` and `check` are observational. `VRAMDISK_SWAPADD` can point to a local `swapadd.exe` / `swapadd64.exe`; diagnostics also look beside `vramdisk.exe`, in `C:\ProgramData`, and on `PATH`. They identify the executable without running it. The official download/source listing is maintained by [LTRData](https://ltr-data.se/opencode.html); VRAMDISK does not download or redistribute the executable.
 
 ## Deferred work and safe test order
 
