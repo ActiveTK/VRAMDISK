@@ -24,62 +24,68 @@
             <select id="device" required></select>
           </div>
 
-          <div class="field workflow-card">
-            <label data-i18n="fileDiskWorkflow">File RAM disk</label>
-            <button id="mount-btn" type="submit" class="btn btn-primary btn-block" data-i18n="mount">マウント</button>
+          <div class="workflow-tabs" role="tablist" aria-label="Disk workflow">
+            <button id="file-workflow-tab" type="button" class="workflow-tab active" role="tab" aria-selected="true" aria-controls="file-workflow-panel" data-workflow-tab="file" data-i18n="fileDiskWorkflow">File RAM disk</button>
+            <button id="pagefile-workflow-tab" type="button" class="workflow-tab" role="tab" aria-selected="false" aria-controls="pagefile-workflow-panel" data-workflow-tab="pagefile" data-i18n="pagefileWorkflow">GPU VRAM disk + Windows pagefile</button>
           </div>
 
-          <div class="field">
-            <label data-i18n="target">マウント先</label>
-            <div class="seg" role="tablist">
-              <button type="button" class="seg-btn active" data-mount-mode="drive" data-i18n="driveLetter">ドライブレター</button>
-              <button type="button" class="seg-btn" data-mount-mode="folder" data-i18n="folder">フォルダ</button>
-            </div>
-            <div id="mount-drive-field">
-              <select id="drive" required></select>
-            </div>
-            <div id="mount-folder-field" hidden>
-              <div class="row">
-                <input id="mount-folder" type="text" placeholder="C:\vramdisk" spellcheck="false" />
-                <button id="browse-folder-btn" type="button" class="btn" data-i18n="browse">参照...</button>
+          <div id="file-workflow-panel" class="workflow-panel" role="tabpanel" aria-labelledby="file-workflow-tab" data-workflow-panel="file">
+            <button id="mount-btn" type="submit" class="btn btn-primary btn-block" data-i18n="mount">マウント</button>
+
+            <div class="field">
+              <label data-i18n="target">マウント先</label>
+              <div class="seg" role="tablist">
+                <button type="button" class="seg-btn active" data-mount-mode="drive" data-i18n="driveLetter">ドライブレター</button>
+                <button type="button" class="seg-btn" data-mount-mode="folder" data-i18n="folder">フォルダ</button>
+              </div>
+              <div id="mount-drive-field">
+                <select id="drive" required></select>
+              </div>
+              <div id="mount-folder-field" hidden>
+                <div class="row">
+                  <input id="mount-folder" type="text" placeholder="C:\vramdisk" spellcheck="false" />
+                  <button id="browse-folder-btn" type="button" class="btn" data-i18n="browse">参照...</button>
+                </div>
               </div>
             </div>
-          </div>
 
-          <div class="field">
-            <label for="size-value" data-i18n="capacity">容量</label>
-            <div class="row size-row">
-              <input id="size-value" type="number" min="0" step="any" inputmode="decimal" />
-              <select id="size-unit">
-                <option value="MB">MB</option>
-                <option value="GB" selected>GB</option>
-              </select>
+            <div class="field">
+              <label for="size-value" data-i18n="capacity">容量</label>
+              <div class="row size-row">
+                <input id="size-value" type="number" min="0" step="any" inputmode="decimal" />
+                <select id="size-unit">
+                  <option value="MB">MB</option>
+                  <option value="GB" selected>GB</option>
+                </select>
+              </div>
+              <div id="size-error" class="hint error" hidden></div>
             </div>
-            <div id="size-error" class="hint error" hidden></div>
-          </div>
 
-          <div class="field">
-            <label data-i18n="options">オプション</label>
-            <div class="check-col">
-              <label class="check"><input id="compress" type="checkbox" /> <span data-i18n="compressOpt">データを圧縮（nvCOMP / GPU）</span></label>
-              <label class="check"><input id="dedup" type="checkbox" /> <span data-i18n="dedupOpt">同一内容のチャンクを共有</span></label>
+            <div class="field">
+              <label data-i18n="options">オプション</label>
+              <div class="check-col">
+                <label class="check"><input id="compress" type="checkbox" /> <span data-i18n="compressOpt">データを圧縮（nvCOMP / GPU）</span></label>
+                <label class="check"><input id="dedup" type="checkbox" /> <span data-i18n="dedupOpt">同一内容のチャンクを共有</span></label>
+              </div>
+              <div id="compress-hint" class="hint" hidden data-i18n="compressHint">
+                nvCOMP が見つからないため、この GUI では圧縮を利用できません（CLI では CPU zstd にフォールバックします）
+              </div>
             </div>
-            <div id="compress-hint" class="hint" hidden data-i18n="compressHint">
-              nvCOMP が見つからないため、この GUI では圧縮を利用できません（CLI では CPU zstd にフォールバックします）
+
+            <div id="setup-status" class="status-text" role="status"></div>
+          </div>
+
+          <div id="pagefile-workflow-panel" class="workflow-panel" role="tabpanel" aria-labelledby="pagefile-workflow-tab" data-workflow-panel="pagefile" hidden>
+            <div class="field pagefile-status-panel workflow-card">
+              <div class="hint" data-i18n="pagefileWarning">Experimental: adding a pagefile to this volatile VRAM disk may hang Windows if the disk or service stops. Keep the Windows-managed pagefile on C:.</div>
+              <button id="pagefile-check-btn" type="button" class="btn" data-i18n="pagefileCheck">Check pagefile status</button>
+              <label for="pagefile-size" data-i18n="pagefileSizeLabel">Fixed pagefile size (MB)</label>
+              <div class="hint" data-i18n="pagefileDiskFootprint">GPU disk capacity is the pagefile size plus 32 MiB.</div>
+              <input id="pagefile-size" type="number" min="1" value="16384" />
+              <button id="pagefile-enable-btn" type="button" class="btn btn-primary btn-block" data-i18n="pagefileEnable">Create GPU disk on M: and add pagefile</button>
+              <div id="pagefile-status" class="status-text" role="status"></div>
             </div>
           </div>
-
-          <div class="field pagefile-status-panel workflow-card">
-            <label data-i18n="pagefileWorkflow">GPU VRAM disk + Windows pagefile</label>
-            <div class="hint" data-i18n="pagefileWarning">Experimental: adding a pagefile to this volatile VRAM disk may hang Windows if the disk or service stops. Keep the Windows-managed pagefile on C:.</div>
-            <button id="pagefile-check-btn" type="button" class="btn" data-i18n="pagefileCheck">Check pagefile status</button>
-            <label for="pagefile-size" data-i18n="pagefileSizeLabel">Fixed pagefile size (MB)</label>
-            <input id="pagefile-size" type="number" min="1" value="16384" />
-            <button id="pagefile-enable-btn" type="button" class="btn btn-primary btn-block" data-i18n="pagefileEnable">Create GPU disk on M: and add pagefile</button>
-            <div id="pagefile-status" class="status-text" role="status"></div>
-          </div>
-
-          <div id="setup-status" class="status-text" role="status"></div>
         </form>
       </section>
 

@@ -455,7 +455,7 @@ fn start_winspd_pagefile_disk(
     cfg: PagefileDiskConfig,
 ) -> anyhow::Result<PagefileDiskStatus> {
     use std::path::Path;
-    const FILESYSTEM_OVERHEAD: u64 = 1024 * 1024 * 1024;
+    const FILESYSTEM_OVERHEAD: u64 = 32 * 1024 * 1024;
     let disk_size = cfg
         .pagefile_size
         .checked_add(FILESYSTEM_OVERHEAD)

@@ -1,6 +1,6 @@
 # WinSpd / VRAM pagefile audit
 
-**Audit date:** 2026-11-04
+**Audit date:** 2026-11-05
 
 ## Current status
 
@@ -10,7 +10,7 @@
 | Generic block-storage contract | `IMPLEMENTED` | `src/block.rs`; checked LBA ranges, 512/4096-byte sectors, CUDA backing, and a test-only in-memory backend. |
 | WinSpd SCSI adapter | `IMPLEMENTED` (optional build feature) | `src/winspd.rs` and `native/winspd_shim.c` map Read/Write/Flush/Unmap requests to `BlockStorage`. |
 | Pagefile diagnostics | `IMPLEMENTED` (read-only) | `vramdisk.exe pagefile status` / `check` query Windows CIM data and locate `swapadd.exe` / `swapadd64.exe` beside the app, in `C:\ProgramData`, or on `PATH`. |
-| Explicit pagefile add | `IMPLEMENTED / EXPERIMENTAL_UNVERIFIED` | The GUI and CLI can explicitly ask `swapadd` to add a pagefile at a caller-supplied path and size. Existing pagefiles are preserved. This does not validate paging safety. |
+| Explicit pagefile add | `IMPLEMENTED / EXPERIMENTAL_UNVERIFIED` | The GUI creates a GPU-backed WinSpd disk, partitions and formats the new disk as M:, then asks `swapadd` to add a fixed-size pagefile. The disk reserves 32 MiB beyond the requested pagefile size. Existing pagefiles are preserved. This does not validate paging safety. |
 | Pagefile remove | `UNSUPPORTED` | VRAMDISK does not remove or reconfigure active Windows pagefiles. |
 | GPU block-storage runtime | `BASIC I/O VERIFIED BY USER` | User reported `stgtest` returned `OK`, the WinSpd disk came online, and ordinary file reads/writes succeeded. Low-memory and paging-path behavior remain untested. |
 | Windows paging over WinSpd | `NOT PAGING_VALIDATED` | No WinSpd paging-path support statement or system-level paging test was found. |
@@ -19,7 +19,7 @@
 
 - `src/cuda.rs` owns a contiguous CUDA device allocation through `Vram`. `Vram::new` uses a zero-initializing allocation; `read_at`, `write_at`, `zero_at`, and `sync` provide byte-addressed transfers.
 - `src/engine.rs`, `src/chunk.rs`, `src/arena.rs`, and `src/lookup.rs` form the existing file-storage model. The 64 KiB allocator, sparse file map, compression, and deduplication are file semantics and must not be used as an NTFS LBA translation layer.
-- `src/fs.rs` exposes the file engine through WinFsp. The optional WinSpd API currently runs through CLI mode; GUI lifecycle controls are not added yet.
+- `src/fs.rs` exposes the file engine through WinFsp. The GUI has separate tabs for the file-based WinFsp RAM disk and the GPU-backed WinSpd pagefile disk. The pagefile workflow owns the WinSpd device on the manager thread and only formats a newly appeared, size-matched VRAMDISK that is still RAW.
 - `BlockStorage` is the boundary below the WinSpd adapter. `GpuBlockStorage` uses only VRAM and serializes CUDA access; the RAM-backed implementation exists only in tests.
 - The local machine has a Tesla M40 24 GB in WDDM mode. WinFsp exists under `C:\Program Files (x86)\WinFsp`; WinSpd SDK/driver paths and services were not found. Rust/Cargo and npm are unavailable in this shell.
 
@@ -29,7 +29,7 @@ The [WinSpd project](https://github.com/winfsp/winspd) describes a kernel StorPo
 
 Microsoft's [storage-driver paging-path guidance](https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/restrictions-on-pageable-code-in-storage-drivers) describes deadlock constraints for drivers that service paging I/O. That guidance does not establish that a user-mode WinSpd storage process, its dispatcher, CUDA context, CUDA driver calls, and their memory dependencies are safe in the paging path. A page fault could wait for a user-mode service whose working set or dependencies themselves require paging. This circular-wait scenario is a technical risk assessment, not a claim that every WinSpd device will deadlock.
 
-Therefore NTFS visibility, successful `swapadd`, or an increased commit limit do not prove paging I/O correctness. The GUI exposes only a manual, user-initiated swapadd attempt and keeps automatic enable disabled. Treat a pagefile on this disk as experimental until WinSpd explicitly supports paging and a recoverable test environment validates the complete paging path, including low-memory behavior and service/CUDA dependencies.
+Therefore NTFS visibility, successful `swapadd`, or an increased commit limit do not prove paging I/O correctness. The GUI exposes only a manual, user-initiated creation and swapadd sequence; it does not include startup integration to recreate the GPU disk at boot. Treat a pagefile on this disk as experimental until WinSpd explicitly supports paging and a recoverable test environment validates the complete paging path, including low-memory behavior and service/CUDA dependencies.
 
 ## License and redistribution
 
@@ -55,14 +55,14 @@ vramdisk.exe winspd --mode pipe --size 1GiB
 vramdisk.exe winspd --mode disk --size 1GiB
 ```
 
-Set `WINSPD_SDK_DIR` to the WinSpd Developer SDK root when building. Pipe mode is for `stgtest-x64.exe` at `\\.\pipe\vramdisk\0`; it does not expose a Windows disk. Disk mode requires the installed WinSpd driver and an elevated terminal; it exposes a new VRAM disk but does not initialize or format it. Release builds open a dedicated console window for the interactive WinSpd CLI so Enter can be read even though the main executable uses the Windows GUI subsystem. GUI controls are available for explicitly adding a pagefile; WinSpd device lifecycle management is still pending.
+Set `WINSPD_SDK_DIR` to the WinSpd Developer SDK root when building. Pipe mode is for `stgtest-x64.exe` at `\\.\pipe\vramdisk\0`; it does not expose a Windows disk. Disk mode requires the installed WinSpd driver and an elevated terminal; it exposes a new VRAM disk but does not initialize or format it. The GUI pagefile tab runs the integrated disk creation and pagefile sequence and also requires elevation. Release builds open a dedicated console window for the interactive WinSpd CLI so Enter can be read even though the main executable uses the Windows GUI subsystem.
 
 ## Deferred work and safe test order
 
 1. Run `vramdisk.exe winspd --mode pipe --size 1GiB` and use `stgtest-x64.exe` against `\\.\pipe\vramdisk\0`; this requires the WinSpd user-mode DLL but not its kernel driver.
 2. Test `vramdisk.exe winspd --mode disk --size 1GiB` only after installing WinSpd and identifying the newly created VRAMDISK device; never initialize or format another disk.
-3. Add manager-thread lifecycle handling for WinSpd after validating clean shutdown in release builds.
-4. Run GPU tests on the Tesla M40 using 1–4 GiB only after WinSpd protocol tests pass.
+3. Validate clean manager-thread shutdown and M: disk removal behavior in release builds; the GUI stays in the tray after a pagefile is added, and a reboot ends that session.
+4. Run GPU tests on the Tesla M40 using small pagefile sizes only in a recoverable environment after WinSpd protocol tests pass.
 5. Keep `C:\pagefile.sys` enabled. The experimental swapadd action only adds the requested file; do not use it for workloads that cannot tolerate a WinSpd/GPU service interruption. A successful swapadd call or ordinary file I/O is not evidence that Windows paging is safe on this disk.
 
 No driver installation, disk initialization/formatting, system paging configuration change, GPU reset, forced service termination, low-memory stress, or crash test was performed.

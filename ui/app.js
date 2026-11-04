@@ -33,9 +33,10 @@ let gpuList = []; // cached from list_gpus()
 
 const I18N = {
   ja: {
-    fileDiskWorkflow: "ファイル型 RAM ディスクをマウント",
-    pagefileWorkflow: "GPU VRAM ディスクを作成してページファイルを追加",
+    fileDiskWorkflow: "ファイル RAM ディスク",
+    pagefileWorkflow: "GPU ページファイル",
     pagefileSizeLabel: "固定ページファイルサイズ（MB）",
+    pagefileDiskFootprint: "GPU ディスク容量はページファイルサイズ + 32 MiB です。",
     pagefileCreating: "WinSpd ディスクを作成し、M: を初期化して swapadd を実行中…",
     pagefileCreated: "GPU VRAM ディスク M: を作成し、ページファイルを追加しました。アプリを終了せず、Windows 管理の C: ページファイルも残してください。",
     pagefileSizeInvalid: "ページファイルのサイズを確認してください。",
@@ -180,9 +181,10 @@ const I18N = {
     bootFail: "初期化に失敗しました: {0}",
   },
   en: {
-    fileDiskWorkflow: "Mount a file based RAM disk",
-    pagefileWorkflow: "Create a GPU VRAM disk and add a pagefile",
+    fileDiskWorkflow: "File RAM disk",
+    pagefileWorkflow: "GPU pagefile",
     pagefileSizeLabel: "Fixed pagefile size (MB)",
+    pagefileDiskFootprint: "GPU disk capacity is the pagefile size plus 32 MiB.",
     pagefileCreating: "Creating the WinSpd disk, preparing M:, and running swapadd…",
     pagefileCreated: "Created the GPU VRAM disk on M: and added its pagefile. Keep VRAMDISK running and retain the Windows managed pagefile on C:.",
     pagefileSizeInvalid: "Check the pagefile size.",
@@ -370,6 +372,17 @@ async function switchLanguage(lang) {
     await invoke("set_ui_language", { language: lang });
   } catch (e) {
     console.error("set_ui_language", e);
+  }
+}
+
+function setWorkflowTab(name) {
+  for (const tab of document.querySelectorAll("[data-workflow-tab]")) {
+    const selected = tab.dataset.workflowTab === name;
+    tab.classList.toggle("active", selected);
+    tab.setAttribute("aria-selected", String(selected));
+  }
+  for (const panel of document.querySelectorAll("[data-workflow-panel]")) {
+    panel.hidden = panel.dataset.workflowPanel !== name;
   }
 }
 
@@ -1348,6 +1361,9 @@ async function boot() {
   }
   applyLanguage();
   el("lang-select").addEventListener("change", () => switchLanguage(el("lang-select").value));
+  for (const tab of document.querySelectorAll("[data-workflow-tab]")) {
+    tab.addEventListener("click", () => setWorkflowTab(tab.dataset.workflowTab));
+  }
   el("pagefile-check-btn").addEventListener("click", checkPagefileStatus);
   el("pagefile-enable-btn").addEventListener("click", enablePagefile);
 
