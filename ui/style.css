@@ -623,3 +623,9 @@ input[type="checkbox"] {
   max-height: 140px;
   overflow-y: auto;
 }
+
+.pagefile-status-panel #pagefile-status {
+  white-space: pre-wrap;
+  max-height: 120px;
+  overflow-y: auto;
+}

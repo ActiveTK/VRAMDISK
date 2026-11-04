@@ -70,3 +70,7 @@ npm install            # 仅首次运行：安装 @tauri-apps/cli
 本程序采用 MIT 许可证发布。
 
 © 2026 ActiveTK。详见 [LICENSE](LICENSE)。
+
+## WinSpd / ページファイル開発メモ
+
+現在は既存の WinFsp ファイルシステムのみを実装しています。ブロックストレージ用の共通インターフェースと読み取り専用のページファイル診断を追加しましたが、WinSpd デバイスはまだ接続されていません。WinSpd 経由の Windows ページファイル I/O は未検証であり、自動有効化はできません。詳細は [WinSpd / VRAM ページファイル監査](docs/WINSPD_PAGING_AUDIT.md) を参照してください。

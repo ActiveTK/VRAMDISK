@@ -79,3 +79,7 @@ This program is released under The MIT License.
 
 (c) 2026 ActiveTK.
 https://github.com/ActiveTK/VRAMDISK/blob/main/LICENSE
+
+## WinSpd and pagefile development status
+
+The existing WinFsp filesystem remains the only implemented Windows backend. A reusable block-storage interface and read-only pagefile diagnostics have been added, but there is no connected WinSpd device yet. Windows paging I/O through WinSpd is unverified and cannot be enabled automatically. See the [WinSpd / VRAM pagefile audit](docs/WINSPD_PAGING_AUDIT.md) for the findings and safe test plan.

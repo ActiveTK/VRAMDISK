@@ -76,6 +76,22 @@ pub fn nvcomp_available() -> bool {
     vramdisk::nvcomp::nvcomp_available()
 }
 
+/// Read-only Windows pagefile and compatibility diagnostics. Pagefile
+/// activation is deliberately unavailable until the WinSpd paging path is
+/// validated.
+#[tauri::command]
+pub fn pagefile_status() -> serde_json::Value {
+    let report = vramdisk::pagefile::PagefileManager::status();
+    serde_json::json!({
+        "compatibility": report.compatibility.as_str(),
+        "auto_enable": report.auto_enable,
+        "swapadd_path": report.swapadd_path.map(|path| path.display().to_string()),
+        "active_pagefiles": report.active_pagefiles,
+        "commit_status": report.commit_status,
+        "diagnostics": report.diagnostics,
+    })
+}
+
 /// CLI-flag-derived defaults for the setup screen, e.g. a shortcut launching
 /// `vramdisk.exe --mount R: --compress` pre-fills those fields instead of
 /// mounting automatically. Every field is `null` unless that specific flag

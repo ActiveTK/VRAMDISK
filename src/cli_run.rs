@@ -27,6 +27,16 @@ pub fn run(args: Vec<String>) -> i32 {
         }
     }
 
+    if args.first().is_some_and(|arg| arg == "pagefile") {
+        return match crate::pagefile::run_cli(&args[1..]) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("Error: {err:#}");
+                1
+            }
+        };
+    }
+
     let cli_args = std::iter::once("vramdisk".to_string()).chain(args);
     let args = Cli::parse_from(cli_args);
 

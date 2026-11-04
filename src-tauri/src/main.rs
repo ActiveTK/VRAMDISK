@@ -370,10 +370,10 @@ pub(crate) fn after_mount_success(app: &AppHandle, mount_point: &str) {
         });
 }
 
-/// vramdisk.exe is both the GUI and (via these two dispatch tokens) the CLI
-/// that used to be a separate `vramdisk-cli.exe`. `cli`/`benchmark` run the
-/// old CLI synchronously in the console and exit — no window is ever
-/// created. Any other argv (e.g. a shortcut with `--mount R: --compress`) is
+/// vramdisk.exe is both the GUI and CLI. `cli`/`benchmark` run the old CLI;
+/// `pagefile` exposes read-only diagnostics and guarded operations. CLI modes
+/// run synchronously in the console and exit before a window is created. Any
+/// other argv (e.g. a shortcut with `--mount R: --compress`) is
 /// left for the normal GUI startup below, which uses it only to seed the
 /// setup screen's initial field values (see `commands::initial_overrides`),
 /// never to mount automatically.
@@ -387,10 +387,14 @@ fn dispatch_cli_mode(argv: &[String]) {
     if mode == "cdm-bench" {
         std::process::exit(vramdisk::cdm_bench::run(argv[1..].to_vec()));
     }
-    if mode != "cli" && mode != "benchmark" {
+    if mode != "cli" && mode != "benchmark" && mode != "pagefile" {
         return;
     }
-    let mut rest = argv[1..].to_vec();
+    let mut rest = if mode == "pagefile" {
+        argv.to_vec()
+    } else {
+        argv[1..].to_vec()
+    };
     if mode == "benchmark" && !rest.iter().any(|a| a == "--bench" || a == "--bench-io") {
         rest.insert(0, "--bench".to_string());
     }
@@ -437,6 +441,7 @@ fn main() {
             commands::export_cancel,
             commands::stats,
             commands::nvcomp_available,
+            commands::pagefile_status,
             commands::initial_overrides,
             commands::hash_job,
             commands::archive_compress_job,

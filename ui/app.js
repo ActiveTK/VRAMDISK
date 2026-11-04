@@ -44,6 +44,16 @@ const I18N = {
     dedupOpt: "同一内容のチャンクを共有",
     compressHint:
       "nvCOMP が見つからないため、この GUI では圧縮を利用できません（CLI では CPU zstd にフォールバックします）",
+    pagefileLabel: "Windows ページファイル",
+    pagefileWarning: "WinSpd のページファイル互換性は未検証です。自動変更は無効です。",
+    pagefileCheck: "ページファイルの状態を確認",
+    pagefileEnableBlocked: "ページファイルを有効化（利用不可）",
+    pagefileCompatibility: "互換性: {0}",
+    pagefileAutomatic: "自動有効化: {0}",
+    pagefileSwapadd: "swapadd: {0}",
+    pagefileActive: "有効なページファイル: {0}",
+    pagefileCommit: "コミット状況: {0}",
+    pagefileDiagnostic: "診断: {0}",
     mount: "マウント",
     statFiles: "ファイル数",
     statLogical: "論理データ",
@@ -175,6 +185,16 @@ const I18N = {
     dedupOpt: "Share identical chunks",
     compressHint:
       "nvCOMP was not found, so compression is unavailable in this GUI (the CLI falls back to CPU zstd).",
+    pagefileLabel: "Windows pagefile",
+    pagefileWarning: "WinSpd paging compatibility is unverified. Automatic pagefile changes are disabled.",
+    pagefileCheck: "Check pagefile status",
+    pagefileEnableBlocked: "Enable pagefile (unavailable)",
+    pagefileCompatibility: "Compatibility: {0}",
+    pagefileAutomatic: "Automatic enable: {0}",
+    pagefileSwapadd: "swapadd: {0}",
+    pagefileActive: "Active pagefiles: {0}",
+    pagefileCommit: "Commit status: {0}",
+    pagefileDiagnostic: "Diagnostic: {0}",
     mount: "Mount",
     statFiles: "Files",
     statLogical: "Logical data",
@@ -338,6 +358,25 @@ async function switchLanguage(lang) {
     await invoke("set_ui_language", { language: lang });
   } catch (e) {
     console.error("set_ui_language", e);
+  }
+}
+
+async function checkPagefileStatus() {
+  const status = el("pagefile-status");
+  status.textContent = t("pagefileCheck") + "…";
+  try {
+    const report = await invoke("pagefile_status");
+    const lines = [
+      t("pagefileCompatibility", report.compatibility),
+      t("pagefileAutomatic", report.auto_enable),
+      t("pagefileSwapadd", report.swapadd_path || "not found"),
+      t("pagefileActive", report.active_pagefiles || "unavailable"),
+      t("pagefileCommit", report.commit_status || "unavailable"),
+      ...(report.diagnostics || []).map((line) => t("pagefileDiagnostic", line)),
+    ];
+    status.textContent = lines.join("\n");
+  } catch (error) {
+    status.textContent = String(error);
   }
 }
 
@@ -1270,6 +1309,7 @@ async function boot() {
   }
   applyLanguage();
   el("lang-select").addEventListener("change", () => switchLanguage(el("lang-select").value));
+  el("pagefile-check-btn").addEventListener("click", checkPagefileStatus);
 
   await step(loadDevices, "stepGpus");
   await step(loadFreeDrives, "stepDrives");

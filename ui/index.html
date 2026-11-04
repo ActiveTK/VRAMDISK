@@ -64,6 +64,14 @@
             </div>
           </div>
 
+          <div class="field pagefile-status-panel">
+            <label data-i18n="pagefileLabel">Windows pagefile</label>
+            <div class="hint" data-i18n="pagefileWarning">WinSpd paging compatibility is unverified. Automatic pagefile changes are disabled.</div>
+            <button id="pagefile-check-btn" type="button" class="btn" data-i18n="pagefileCheck">Check pagefile status</button>
+            <button type="button" class="btn" disabled aria-disabled="true" data-i18n="pagefileEnableBlocked">Enable pagefile (unavailable)</button>
+            <div id="pagefile-status" class="status-text" role="status"></div>
+          </div>
+
           <button id="mount-btn" type="submit" class="btn btn-primary btn-block" data-i18n="mount">マウント</button>
           <div id="setup-status" class="status-text" role="status"></div>
         </form>
