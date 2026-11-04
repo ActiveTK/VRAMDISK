@@ -630,6 +630,12 @@ input[type="checkbox"] {
   overflow-y: auto;
 }
 
+.pagefile-stop-info {
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent);
+  color: var(--text);
+}
+
 .workflow-tabs {
   display: flex;
   gap: 8px;

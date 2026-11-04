@@ -77,6 +77,7 @@
 
           <div id="pagefile-workflow-panel" class="workflow-panel" role="tabpanel" aria-labelledby="pagefile-workflow-tab" data-workflow-panel="pagefile" hidden>
             <div class="field pagefile-status-panel workflow-card">
+              <div class="hint pagefile-stop-info" data-i18n="pagefileStopInfo">GPU memory and the M: pagefile disk are released only when Windows shuts down or restarts.</div>
               <div class="hint" data-i18n="pagefileWarning">Experimental: adding a pagefile to this volatile VRAM disk may hang Windows if the disk or service stops. Keep the Windows-managed pagefile on C:.</div>
               <button id="pagefile-check-btn" type="button" class="btn" data-i18n="pagefileCheck">Check pagefile status</button>
               <label for="pagefile-size" data-i18n="pagefileSizeLabel">Fixed pagefile size (MB)</label>
