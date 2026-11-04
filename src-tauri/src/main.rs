@@ -89,6 +89,7 @@ pub(crate) fn tr(lang: &str, key: &'static str) -> &'static str {
         "encode" => if ja { "ファイルのエンコード（Base64 / hex）" } else { "Encode files (Base64 / hex)" },
         "quit" => if ja { "終了" } else { "Exit" },
         "close_hint" => if ja { "VRAMDISKはタスクトレイからアンマウントできます" } else { "VRAMDISK stays available in the system tray." },
+        "pagefile_running_hint" => if ja { "ページファイル用の GPU ディスクが稼働中です。アプリを終了すると Windows が停止するおそれがあるため、VRAMDISK をタスクトレイで動作させたままにしてください。終了するには Windows を再起動してください。C: のページファイルも残してください。" } else { "The GPU pagefile disk is active. Keep VRAMDISK running in the system tray; closing it may hang Windows. Restart Windows to end this session, and keep the pagefile on C:." },
         "unmount_warning" => if ja { "本当にアンマウントしますか？\nドライブ上のデータは全て失われます。" } else { "Unmount now?\nAll data on the drive will be lost." },
         "quit_warning" => if ja { "本当に終了しますか？\nドライブ上のデータは全て失われます。" } else { "Exit now?\nAll data on the drive will be lost." },
         "continue" => if ja { "続行" } else { "Continue" },
@@ -233,6 +234,16 @@ fn show_main_window(app: &AppHandle) {
 
 pub(crate) fn quit(app: &AppHandle) {
     if let Some(manager) = app.try_state::<Manager>() {
+        if manager.pagefile_disk_status().is_some() {
+            show_main_window(app);
+            let lang = app_language(app);
+            app.dialog()
+                .message(tr(&lang, "pagefile_running_hint"))
+                .kind(MessageDialogKind::Warning)
+                .title("VRAMDISK")
+                .show(|_| {});
+            return;
+        }
         manager.shutdown();
     }
     app.exit(0);
@@ -450,6 +461,8 @@ fn main() {
             commands::nvcomp_available,
             commands::pagefile_status,
             commands::pagefile_enable,
+            commands::start_pagefile_disk,
+            commands::pagefile_disk_status,
             commands::initial_overrides,
             commands::hash_job,
             commands::archive_compress_job,
@@ -525,11 +538,15 @@ fn main() {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         // Only hide-to-tray when a disk is actually mounted;
                         // otherwise closing the window really quits the app.
-                        let mounted = handle
+                        let pagefile_active = handle
+                            .try_state::<Manager>()
+                            .map(|m| m.pagefile_disk_status().is_some())
+                            .unwrap_or(false);
+                        let active = pagefile_active || handle
                             .try_state::<Manager>()
                             .map(|m| m.status().is_some())
                             .unwrap_or(false);
-                        if !mounted {
+                        if !active {
                             quit(&handle);
                             return;
                         }
@@ -539,8 +556,8 @@ fn main() {
                             let lang = app_language(&handle);
                             handle
                                 .dialog()
-                                .message(tr(&lang, "close_hint"))
-                                .kind(MessageDialogKind::Info)
+                                .message(tr(&lang, if pagefile_active { "pagefile_running_hint" } else { "close_hint" }))
+                                .kind(if pagefile_active { MessageDialogKind::Warning } else { MessageDialogKind::Info })
                                 .title("VRAMDISK")
                                 .show(|_| {});
                         }

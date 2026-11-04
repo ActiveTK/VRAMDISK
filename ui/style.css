@@ -630,6 +630,19 @@ input[type="checkbox"] {
   overflow-y: auto;
 }
 
+.workflow-card {
+  padding: 12px;
+  border: 1px solid var(--border, #3a4657);
+  border-radius: 8px;
+  background: var(--panel, rgba(255, 255, 255, 0.025));
+}
+
+.workflow-card > label:first-child {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+
 .pagefile-size-row {
   display: flex;
   gap: 10px;

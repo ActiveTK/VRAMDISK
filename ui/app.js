@@ -33,6 +33,12 @@ let gpuList = []; // cached from list_gpus()
 
 const I18N = {
   ja: {
+    fileDiskWorkflow: "ファイル型 RAM ディスクをマウント",
+    pagefileWorkflow: "GPU VRAM ディスクを作成してページファイルを追加",
+    pagefileSizeLabel: "固定ページファイルサイズ（MB）",
+    pagefileCreating: "WinSpd ディスクを作成し、M: を初期化して swapadd を実行中…",
+    pagefileCreated: "GPU VRAM ディスク M: を作成し、ページファイルを追加しました。アプリを終了せず、Windows 管理の C: ページファイルも残してください。",
+    pagefileSizeInvalid: "ページファイルのサイズを確認してください。",
     device: "GPU",
     target: "マウント先",
     driveLetter: "ドライブレター",
@@ -47,14 +53,7 @@ const I18N = {
     pagefileLabel: "Windows ページファイル",
     pagefileWarning: "実験機能です。VRAM ディスクやサービスが停止すると Windows が停止するおそれがあります。C: のページファイルを残し、必要なら管理者として起動してください。",
     pagefileCheck: "ページファイルの状態を確認",
-    pagefilePathLabel: "ページファイルのパス",
-    pagefileMinLabel: "初期サイズ（MB）",
-    pagefileMaxLabel: "最大サイズ（MB）",
-    pagefileEnable: "swapadd でページファイルを追加",
-    pagefilePathRequired: "マウント済みボリューム上の pagefile.sys のパスを入力してください。",
-    pagefileSizeInvalid: "ページファイルのサイズを確認してください。",
-    pagefileAdding: "swapadd を実行中…",
-    pagefileAdded: "swapadd が正常終了しました。Windows の状態を再確認しています。",
+    pagefileEnable: "M: に GPU ディスクを作成してページファイルを追加",
     pagefileCompatibility: "互換性: {0}",
     pagefileAutomatic: "自動有効化: {0}",
     pagefileSwapadd: "swapadd: {0}",
@@ -181,6 +180,12 @@ const I18N = {
     bootFail: "初期化に失敗しました: {0}",
   },
   en: {
+    fileDiskWorkflow: "Mount a file based RAM disk",
+    pagefileWorkflow: "Create a GPU VRAM disk and add a pagefile",
+    pagefileSizeLabel: "Fixed pagefile size (MB)",
+    pagefileCreating: "Creating the WinSpd disk, preparing M:, and running swapadd…",
+    pagefileCreated: "Created the GPU VRAM disk on M: and added its pagefile. Keep VRAMDISK running and retain the Windows managed pagefile on C:.",
+    pagefileSizeInvalid: "Check the pagefile size.",
     device: "GPU",
     target: "Mount point",
     driveLetter: "Drive letter",
@@ -195,14 +200,7 @@ const I18N = {
     pagefileLabel: "Windows pagefile",
     pagefileWarning: "Experimental. Windows may hang if the VRAM disk or service stops. Keep the pagefile on C: and run as administrator if required.",
     pagefileCheck: "Check pagefile status",
-    pagefilePathLabel: "Pagefile path",
-    pagefileMinLabel: "Initial size (MB)",
-    pagefileMaxLabel: "Maximum size (MB)",
-    pagefileEnable: "Add pagefile with swapadd",
-    pagefilePathRequired: "Enter the pagefile.sys path on a mounted volume.",
-    pagefileSizeInvalid: "Check the pagefile size values.",
-    pagefileAdding: "Running swapadd…",
-    pagefileAdded: "swapadd completed. Refreshing Windows status.",
+    pagefileEnable: "Create GPU disk on M: and add pagefile",
     pagefileCompatibility: "Compatibility: {0}",
     pagefileAutomatic: "Automatic enable: {0}",
     pagefileSwapadd: "swapadd: {0}",
@@ -395,35 +393,29 @@ async function checkPagefileStatus() {
 }
 
 async function enablePagefile() {
-  const path = el("pagefile-path").value.trim();
-  const minMb = Number(el("pagefile-min").value);
-  const maxMb = Number(el("pagefile-max").value);
+  const sizeMb = Number(el("pagefile-size").value);
   const status = el("pagefile-status");
-  if (!path) {
-    status.textContent = t("pagefilePathRequired");
-    return;
-  }
-  if (!Number.isSafeInteger(minMb) || !Number.isSafeInteger(maxMb) || minMb < 1 || maxMb < minMb) {
+  if (!Number.isSafeInteger(sizeMb) || sizeMb < 1) {
     status.textContent = t("pagefileSizeInvalid");
     return;
   }
 
   const button = el("pagefile-enable-btn");
   button.disabled = true;
-  status.textContent = t("pagefileAdding");
+  let active = false;
+  status.textContent = t("pagefileCreating");
   try {
-    await invoke("pagefile_enable", {
-      path,
-      minSize: minMb * UNIT_BYTES.MB,
-      maxSize: maxMb * UNIT_BYTES.MB,
+    const selectedDevice = Number(el("device").value);
+    const result = await invoke("start_pagefile_disk", {
+      pagefileSize: sizeMb * UNIT_BYTES.MB,
+      device: selectedDevice,
     });
-    status.textContent = t("pagefileAdded") + "\n";
-    await checkPagefileStatus();
-    status.textContent = t("pagefileAdded") + "\n" + status.textContent;
+    status.textContent = `${t("pagefileCreated")}\n${result.drive} · ${formatSize(result.disk_size)} disk · ${formatSize(result.pagefile_size)} pagefile`;
+    active = true;
   } catch (error) {
     status.textContent = String(error);
   } finally {
-    button.disabled = false;
+    button.disabled = active;
   }
 }
 

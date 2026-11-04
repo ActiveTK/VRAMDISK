@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter as _, Manager as _, State};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::manager::{GpuDto, Manager, MountConfig, MountStatus};
+use crate::manager::{GpuDto, Manager, MountConfig, MountStatus, PagefileDiskConfig, PagefileDiskStatus};
 use crate::{tr, trf, CliSeed, ExportControl, UiLang};
 
 /// The UI language a command's messages must be rendered in.
@@ -96,6 +96,22 @@ pub fn pagefile_status() -> serde_json::Value {
 pub fn pagefile_enable(path: String, min_size: u64, max_size: u64) -> Result<(), String> {
     vramdisk::pagefile::PagefileManager::enable(std::path::Path::new(&path), min_size, max_size)
         .map_err(|error| format!("{error:#}"))
+}
+
+/// Create a GPU VRAM-backed WinSpd disk, format it as M:, and add its pagefile.
+#[tauri::command]
+pub fn start_pagefile_disk(
+    pagefile_size: u64,
+    device: usize,
+    manager: State<Manager>,
+    lang: State<UiLang>,
+) -> Result<PagefileDiskStatus, String> {
+    manager.start_pagefile_disk(PagefileDiskConfig { pagefile_size, device }, &lang_of(&lang))
+}
+
+#[tauri::command]
+pub fn pagefile_disk_status(manager: State<Manager>) -> Option<PagefileDiskStatus> {
+    manager.pagefile_disk_status()
 }
 
 /// CLI-flag-derived defaults for the setup screen, e.g. a shortcut launching

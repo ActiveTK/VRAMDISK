@@ -24,6 +24,11 @@
             <select id="device" required></select>
           </div>
 
+          <div class="field workflow-card">
+            <label data-i18n="fileDiskWorkflow">File RAM disk</label>
+            <button id="mount-btn" type="submit" class="btn btn-primary btn-block" data-i18n="mount">マウント</button>
+          </div>
+
           <div class="field">
             <label data-i18n="target">マウント先</label>
             <div class="seg" role="tablist">
@@ -64,21 +69,16 @@
             </div>
           </div>
 
-          <div class="field pagefile-status-panel">
-            <label data-i18n="pagefileLabel">Windows pagefile</label>
+          <div class="field pagefile-status-panel workflow-card">
+            <label data-i18n="pagefileWorkflow">GPU VRAM disk + Windows pagefile</label>
             <div class="hint" data-i18n="pagefileWarning">Experimental: adding a pagefile to this volatile VRAM disk may hang Windows if the disk or service stops. Keep the Windows-managed pagefile on C:.</div>
             <button id="pagefile-check-btn" type="button" class="btn" data-i18n="pagefileCheck">Check pagefile status</button>
-            <label for="pagefile-path" data-i18n="pagefilePathLabel">Pagefile path</label>
-            <input id="pagefile-path" type="text" value="M:\pagefile.sys" autocomplete="off" />
-            <div class="pagefile-size-row">
-              <label><span data-i18n="pagefileMinLabel">Initial size (MB)</span><input id="pagefile-min" type="number" min="1" value="16384" /></label>
-              <label><span data-i18n="pagefileMaxLabel">Maximum size (MB)</span><input id="pagefile-max" type="number" min="1" value="16384" /></label>
-            </div>
-            <button id="pagefile-enable-btn" type="button" class="btn" data-i18n="pagefileEnable">Add pagefile with swapadd</button>
+            <label for="pagefile-size" data-i18n="pagefileSizeLabel">Fixed pagefile size (MB)</label>
+            <input id="pagefile-size" type="number" min="1" value="16384" />
+            <button id="pagefile-enable-btn" type="button" class="btn btn-primary btn-block" data-i18n="pagefileEnable">Create GPU disk on M: and add pagefile</button>
             <div id="pagefile-status" class="status-text" role="status"></div>
           </div>
 
-          <button id="mount-btn" type="submit" class="btn btn-primary btn-block" data-i18n="mount">マウント</button>
           <div id="setup-status" class="status-text" role="status"></div>
         </form>
       </section>
