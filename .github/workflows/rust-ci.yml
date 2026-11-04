@@ -14,7 +14,7 @@ jobs:
     name: Core build and tests (no GPU required)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -24,3 +24,47 @@ jobs:
 
       - name: Run GPU-free tests
         run: cargo test --no-default-features --locked
+
+  windows-exe:
+    name: Build Windows executable
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install LLVM
+        shell: pwsh
+        run: choco install llvm --yes --no-progress
+
+      - name: Install WinFsp SDK and runtime
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp-2.1.25156.msi'
+          Invoke-WebRequest 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' -OutFile $msi
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/qn', '/norestart') -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "WinFsp installer failed with exit code $($process.ExitCode)" }
+          $env:LIBCLANG_PATH = Join-Path $env:ProgramFiles 'LLVM\bin'
+          if (-not (Test-Path (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) { throw 'libclang.dll was not installed' }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$env:LIBCLANG_PATH"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build release executable
+        shell: pwsh
+        run: .\build-gui.ps1 build
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: vramdisk-windows-x64-${{ github.sha }}
+          path: src-tauri/target/release/vramdisk.exe
+          if-no-files-found: error
+          retention-days: 14
