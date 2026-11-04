@@ -41,7 +41,7 @@ VRAMDISK 可以通过自有文件系统将 GPU 的显存（VRAM）挂载为 Wind
 
 安装 nvCOMP 运行时 DLL 后，即可在 GPU 上压缩文件。挂载界面中的“Compress data”选项和挂载后的文件压缩工具都会启用。
 
-可从 NVIDIA [nvCOMP 下载页面](https://developer.nvidia.com/nvcomp-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local)获取 nvCOMP。
+可从 NVIDIA [nvCOMP 5.3.0 Windows x64 下载页面](https://developer.nvidia.com/nvcomp-5-3-0-download-archive?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local)获取兼容版本。
 
 ## 常见安装问题
 
