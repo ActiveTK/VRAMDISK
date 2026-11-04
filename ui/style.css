@@ -629,3 +629,21 @@ input[type="checkbox"] {
   max-height: 120px;
   overflow-y: auto;
 }
+
+.pagefile-size-row {
+  display: flex;
+  gap: 10px;
+  margin: 8px 0;
+}
+
+.pagefile-size-row label {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.pagefile-size-row input {
+  display: block;
+  margin-top: 4px;
+}

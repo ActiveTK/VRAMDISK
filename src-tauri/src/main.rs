@@ -449,6 +449,7 @@ fn main() {
             commands::stats,
             commands::nvcomp_available,
             commands::pagefile_status,
+            commands::pagefile_enable,
             commands::initial_overrides,
             commands::hash_job,
             commands::archive_compress_job,

@@ -1,16 +1,16 @@
-//! Read-only diagnostics and guarded CLI surface for Windows page files.
+//! Windows pagefile diagnostics and explicit swapadd integration.
 //!
 //! A successful `swapadd` operation cannot establish that paging over a
 //! WinSpd user-mode storage service is deadlock-safe. Until that I/O path has
-//! been validated in a recoverable Windows test environment, enable/disable
-//! remain blocked and this module never changes Windows paging configuration.
+//! been validated in a recoverable Windows test environment, the GUI never
+//! changes paging automatically. An explicit user command can invoke swapadd
+//! to try adding a pagefile while preserving existing Windows pagefiles.
 
 use std::env;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,10 +77,42 @@ impl PagefileManager {
         Self::check()
     }
 
-    /// Changes to paging are intentionally impossible while compatibility is
-    /// unverified. This is a policy guard, not a missing `swapadd` invocation.
-    pub fn enable(_size_bytes: u64) -> Result<()> {
-        bail!("pagefile enable is blocked: WinSpd paging I/O is EXPERIMENTAL_UNVERIFIED")
+    /// Explicitly ask swapadd to add a pagefile. This does not remove or change
+    /// existing pagefiles, and it does not establish that paging over WinSpd is
+    /// safe. The caller must have administrative privileges.
+    pub fn enable(path: &Path, min_size: u64, max_size: u64) -> Result<()> {
+        ensure!(min_size > 0, "minimum pagefile size must be greater than zero");
+        ensure!(max_size >= min_size, "maximum pagefile size must be at least the minimum size");
+        let path_text = path.to_string_lossy();
+        ensure!(
+            path_text.len() >= 14
+                && path_text.as_bytes()[1] == b':'
+                && path_text.as_bytes()[2] == b'\\'
+                && path_text.to_ascii_lowercase().ends_with("\\pagefile.sys"),
+            "pagefile path must be an absolute drive path ending in \\pagefile.sys"
+        );
+        ensure!(path.parent().is_some_and(Path::is_dir), "pagefile volume is not mounted or accessible");
+        ensure!(!path.exists(), "target already exists; choose a new pagefile.sys path so existing pagefiles are preserved");
+        #[cfg(windows)]
+        ensure!(available_space(path)? >= max_size, "the target volume does not have enough free space for the requested maximum pagefile size");
+
+        let swapadd = discover_swapadd().context("swapadd.exe was not found")?;
+        let output = Command::new(&swapadd)
+            .arg(path)
+            .arg(format_size(min_size))
+            .arg(format_size(max_size))
+            .output()
+            .with_context(|| format!("could not launch {}", swapadd.display()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        ensure!(
+            output.status.success(),
+            "swapadd failed ({}): {}{}",
+            output.status,
+            stdout,
+            if stderr.is_empty() { String::new() } else { format!("\n{stderr}") }
+        );
+        Ok(())
     }
 
     pub fn disable() -> Result<()> {
@@ -174,8 +206,12 @@ enum PagefileAction {
     Status,
     /// Check dependencies and paging compatibility (read-only).
     Check,
-    /// Refuse to enable until paging compatibility is validated.
-    Enable { #[arg(long, value_parser = crate::cli::parse_size)] size: u64 },
+    /// Explicitly add a pagefile with swapadd; existing pagefiles are preserved.
+    Enable {
+        #[arg(long)] path: PathBuf,
+        #[arg(long, value_parser = crate::cli::parse_size)] min_size: u64,
+        #[arg(long, value_parser = crate::cli::parse_size)] max_size: u64,
+    },
     /// Report whether paging validation has been completed.
     Verify,
     /// Refuse to remove an active Windows pagefile.
@@ -183,7 +219,7 @@ enum PagefileAction {
 }
 
 /// Run the dedicated `pagefile` command path before normal mount argument
-/// parsing. No action in this parser can modify system paging configuration.
+/// parsing. The enable action invokes swapadd only when explicitly requested.
 pub fn run_cli(args: &[String]) -> Result<()> {
     let cli = PagefileCli::try_parse_from(args).context("parse pagefile command")?;
     match cli.action {
@@ -199,7 +235,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        PagefileAction::Enable { size } => PagefileManager::enable(size),
+        PagefileAction::Enable { path, min_size, max_size } => PagefileManager::enable(&path, min_size, max_size),
         PagefileAction::Verify => PagefileManager::verify(),
         PagefileAction::Disable => PagefileManager::disable(),
     }
@@ -208,6 +244,44 @@ pub fn run_cli(args: &[String]) -> Result<()> {
 /// Check whether a candidate path names an actual file, without running it.
 pub fn is_swapadd_file(path: &Path) -> bool {
     path.is_file()
+}
+
+fn format_size(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes % MIB == 0 {
+        format!("{}M", bytes / MIB)
+    } else {
+        bytes.to_string()
+    }
+}
+
+#[cfg(windows)]
+fn available_space(path: &Path) -> Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_to_caller: *mut u64,
+            total_bytes: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+
+    let volume_root = path.parent().context("pagefile path has no volume root")?;
+    let wide_path: Vec<u16> = volume_root.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0u64;
+    let result = unsafe {
+        GetDiskFreeSpaceExW(
+            wide_path.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    ensure!(result != 0, "could not query free space on the pagefile volume");
+    Ok(free)
 }
 
 #[cfg(test)]
@@ -223,8 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn enabling_and_disabling_are_guarded() {
-        assert!(PagefileManager::enable(2 * 1024 * 1024 * 1024).is_err());
+    fn disabling_is_guarded() {
         assert!(PagefileManager::disable().is_err());
     }
 }

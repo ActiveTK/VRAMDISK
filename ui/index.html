@@ -66,9 +66,15 @@
 
           <div class="field pagefile-status-panel">
             <label data-i18n="pagefileLabel">Windows pagefile</label>
-            <div class="hint" data-i18n="pagefileWarning">WinSpd paging compatibility is unverified. Automatic pagefile changes are disabled.</div>
+            <div class="hint" data-i18n="pagefileWarning">Experimental: adding a pagefile to this volatile VRAM disk may hang Windows if the disk or service stops. Keep the Windows-managed pagefile on C:.</div>
             <button id="pagefile-check-btn" type="button" class="btn" data-i18n="pagefileCheck">Check pagefile status</button>
-            <button type="button" class="btn" disabled aria-disabled="true" data-i18n="pagefileEnableBlocked">Enable pagefile (unavailable)</button>
+            <label for="pagefile-path" data-i18n="pagefilePathLabel">Pagefile path</label>
+            <input id="pagefile-path" type="text" value="M:\pagefile.sys" autocomplete="off" />
+            <div class="pagefile-size-row">
+              <label><span data-i18n="pagefileMinLabel">Initial size (MB)</span><input id="pagefile-min" type="number" min="1" value="16384" /></label>
+              <label><span data-i18n="pagefileMaxLabel">Maximum size (MB)</span><input id="pagefile-max" type="number" min="1" value="16384" /></label>
+            </div>
+            <button id="pagefile-enable-btn" type="button" class="btn" data-i18n="pagefileEnable">Add pagefile with swapadd</button>
             <div id="pagefile-status" class="status-text" role="status"></div>
           </div>
 

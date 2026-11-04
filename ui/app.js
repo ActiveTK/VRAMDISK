@@ -45,9 +45,16 @@ const I18N = {
     compressHint:
       "nvCOMP が見つからないため、この GUI では圧縮を利用できません（CLI では CPU zstd にフォールバックします）",
     pagefileLabel: "Windows ページファイル",
-    pagefileWarning: "WinSpd のページファイル互換性は未検証です。自動変更は無効です。",
+    pagefileWarning: "実験機能です。VRAM ディスクやサービスが停止すると Windows が停止するおそれがあります。C: のページファイルを残し、必要なら管理者として起動してください。",
     pagefileCheck: "ページファイルの状態を確認",
-    pagefileEnableBlocked: "ページファイルを有効化（利用不可）",
+    pagefilePathLabel: "ページファイルのパス",
+    pagefileMinLabel: "初期サイズ（MB）",
+    pagefileMaxLabel: "最大サイズ（MB）",
+    pagefileEnable: "swapadd でページファイルを追加",
+    pagefilePathRequired: "マウント済みボリューム上の pagefile.sys のパスを入力してください。",
+    pagefileSizeInvalid: "ページファイルのサイズを確認してください。",
+    pagefileAdding: "swapadd を実行中…",
+    pagefileAdded: "swapadd が正常終了しました。Windows の状態を再確認しています。",
     pagefileCompatibility: "互換性: {0}",
     pagefileAutomatic: "自動有効化: {0}",
     pagefileSwapadd: "swapadd: {0}",
@@ -186,9 +193,16 @@ const I18N = {
     compressHint:
       "nvCOMP was not found, so compression is unavailable in this GUI (the CLI falls back to CPU zstd).",
     pagefileLabel: "Windows pagefile",
-    pagefileWarning: "WinSpd paging compatibility is unverified. Automatic pagefile changes are disabled.",
+    pagefileWarning: "Experimental. Windows may hang if the VRAM disk or service stops. Keep the pagefile on C: and run as administrator if required.",
     pagefileCheck: "Check pagefile status",
-    pagefileEnableBlocked: "Enable pagefile (unavailable)",
+    pagefilePathLabel: "Pagefile path",
+    pagefileMinLabel: "Initial size (MB)",
+    pagefileMaxLabel: "Maximum size (MB)",
+    pagefileEnable: "Add pagefile with swapadd",
+    pagefilePathRequired: "Enter the pagefile.sys path on a mounted volume.",
+    pagefileSizeInvalid: "Check the pagefile size values.",
+    pagefileAdding: "Running swapadd…",
+    pagefileAdded: "swapadd completed. Refreshing Windows status.",
     pagefileCompatibility: "Compatibility: {0}",
     pagefileAutomatic: "Automatic enable: {0}",
     pagefileSwapadd: "swapadd: {0}",
@@ -377,6 +391,39 @@ async function checkPagefileStatus() {
     status.textContent = lines.join("\n");
   } catch (error) {
     status.textContent = String(error);
+  }
+}
+
+async function enablePagefile() {
+  const path = el("pagefile-path").value.trim();
+  const minMb = Number(el("pagefile-min").value);
+  const maxMb = Number(el("pagefile-max").value);
+  const status = el("pagefile-status");
+  if (!path) {
+    status.textContent = t("pagefilePathRequired");
+    return;
+  }
+  if (!Number.isSafeInteger(minMb) || !Number.isSafeInteger(maxMb) || minMb < 1 || maxMb < minMb) {
+    status.textContent = t("pagefileSizeInvalid");
+    return;
+  }
+
+  const button = el("pagefile-enable-btn");
+  button.disabled = true;
+  status.textContent = t("pagefileAdding");
+  try {
+    await invoke("pagefile_enable", {
+      path,
+      minSize: minMb * UNIT_BYTES.MB,
+      maxSize: maxMb * UNIT_BYTES.MB,
+    });
+    status.textContent = t("pagefileAdded") + "\n";
+    await checkPagefileStatus();
+    status.textContent = t("pagefileAdded") + "\n" + status.textContent;
+  } catch (error) {
+    status.textContent = String(error);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1310,6 +1357,7 @@ async function boot() {
   applyLanguage();
   el("lang-select").addEventListener("change", () => switchLanguage(el("lang-select").value));
   el("pagefile-check-btn").addEventListener("click", checkPagefileStatus);
+  el("pagefile-enable-btn").addEventListener("click", enablePagefile);
 
   await step(loadDevices, "stepGpus");
   await step(loadFreeDrives, "stepDrives");

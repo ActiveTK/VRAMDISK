@@ -73,4 +73,4 @@ npm install            # 仅首次运行：安装 @tauri-apps/cli
 
 ## WinSpd / ページファイル開発メモ
 
-WinSpd 用の任意ビルド機能を追加し、raw block I/O を VRAM に接続しました。WinSpd Developer SDK と winspd Cargo feature を使ってビルドしてください。pipe モードは WinSpd stgtest で接続をテストでき、disk モードは WinSpd ドライバーを必要とし、新しい未フォーマットの VRAM ディスクを公開します。GUI 操作はまだありません。ページファイル I/O の安全性は未検証のため、ページファイルの有効化は引き続き無効です。手順は [WinSpd / VRAM ページファイル監査](docs/WINSPD_PAGING_AUDIT.md) を参照してください。
+WinSpd 用の任意ビルド機能を追加し、raw block I/O を VRAM に接続しました。WinSpd Developer SDK と winspd Cargo feature を使ってビルドしてください。pipe モードは WinSpd stgtest で接続をテストでき、disk モードは WinSpd ドライバーを必要とし、新しい未フォーマットの VRAM ディスクを公開します。GUI から swapadd を明示的に実行してページファイルを追加できます。WinSpd 経由のページファイル I/O 安全性は未検証なので、C: のページファイルを残してください。手順は [WinSpd / VRAM ページファイル監査](docs/WINSPD_PAGING_AUDIT.md) を参照してください。

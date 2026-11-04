@@ -76,9 +76,7 @@ pub fn nvcomp_available() -> bool {
     vramdisk::nvcomp::nvcomp_available()
 }
 
-/// Read-only Windows pagefile and compatibility diagnostics. Pagefile
-/// activation is deliberately unavailable until the WinSpd paging path is
-/// validated.
+/// Read-only Windows pagefile and compatibility diagnostics.
 #[tauri::command]
 pub fn pagefile_status() -> serde_json::Value {
     let report = vramdisk::pagefile::PagefileManager::status();
@@ -90,6 +88,14 @@ pub fn pagefile_status() -> serde_json::Value {
         "commit_status": report.commit_status,
         "diagnostics": report.diagnostics,
     })
+}
+
+/// Explicitly request a pagefile through swapadd. Existing Windows pagefiles
+/// are left in place; this does not imply that WinSpd paging is validated.
+#[tauri::command]
+pub fn pagefile_enable(path: String, min_size: u64, max_size: u64) -> Result<(), String> {
+    vramdisk::pagefile::PagefileManager::enable(std::path::Path::new(&path), min_size, max_size)
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// CLI-flag-derived defaults for the setup screen, e.g. a shortcut launching
