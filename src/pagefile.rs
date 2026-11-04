@@ -119,6 +119,56 @@ impl PagefileManager {
         bail!("pagefile disable is blocked: VRAMDISK does not manage or remove active Windows pagefiles")
     }
 
+    /// Remove only VRAMDISK's M: pagefile startup setting. Windows defers
+    /// Win32_PageFileSetting changes until startup, so the active WinSpd disk
+    /// must remain alive until the user restarts the computer.
+    pub fn disable_specific(path: &Path) -> Result<()> {
+        ensure!(
+            path.to_string_lossy().eq_ignore_ascii_case(r"M:\pagefile.sys"),
+            "this operation only removes VRAMDISK's M:\\pagefile.sys setting"
+        );
+
+        #[cfg(windows)]
+        {
+            let script = r#"$ErrorActionPreference='Stop'
+$target='M:\pagefile.sys'
+$settings=@(Get-CimInstance -ClassName Win32_PageFileSetting | Where-Object { $_.Name -ieq $target })
+if($settings.Count -eq 0) { throw 'No configured M:\pagefile.sys setting was found.' }
+if($settings.Count -gt 1) { throw 'More than one matching M: pagefile setting was found; refusing an ambiguous removal.' }
+$settings[0] | Remove-CimInstance
+$remaining=@(Get-CimInstance -ClassName Win32_PageFileSetting | Where-Object { $_.Name -ieq $target })
+if($remaining.Count -ne 0) { throw 'The M: pagefile setting is still present.' }
+[pscustomobject]@{ RemovedPath=$target; RestartRequired=$true } | ConvertTo-Json -Compress"#;
+            let output = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .output()
+                .context("could not run the Windows pagefile configuration command")?;
+            ensure!(
+                output.status.success(),
+                "could not disable M:\\pagefile.sys ({}): {}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                if output.stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", String::from_utf8_lossy(&output.stderr).trim())
+                }
+            );
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .context("pagefile removal returned invalid status JSON")?;
+            ensure!(
+                result.get("RestartRequired").and_then(serde_json::Value::as_bool) == Some(true),
+                "Windows did not confirm that a restart is required"
+            );
+            Ok(())
+        }
+
+        #[cfg(not(windows))]
+        {
+            bail!("pagefile removal is only available on Windows")
+        }
+    }
+
     pub fn verify() -> Result<()> {
         let report = Self::status();
         println!("Compatibility: {}", report.compatibility.as_str());

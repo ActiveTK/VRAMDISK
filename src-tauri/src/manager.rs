@@ -75,6 +75,7 @@ pub struct PagefileDiskStatus {
     pub device: usize,
     pub pagefile_size: u64,
     pub disk_size: u64,
+    pub disable_pending_restart: bool,
 }
 
 /// Reply channel for a request.
@@ -96,6 +97,7 @@ enum Cmd {
     Stats(String, Reply<Result<serde_json::Value, String>>),
     MountPoint(Reply<Option<String>>),
     StartPagefileDisk(PagefileDiskConfig, String, Reply<Result<PagefileDiskStatus, String>>),
+    DisablePagefileDisk(String, Reply<Result<PagefileDiskStatus, String>>),
     PagefileDiskStatus(Reply<Option<PagefileDiskStatus>>),
     Shutdown(Reply<()>),
 }
@@ -140,6 +142,12 @@ impl Manager {
                         Cmd::StartPagefileDisk(cfg, lang, reply) => {
                             let result = state
                                 .start_pagefile_disk(cfg, &lang)
+                                .map_err(|e| format!("{e:#}"));
+                            let _ = reply.send(result);
+                        }
+                        Cmd::DisablePagefileDisk(lang, reply) => {
+                            let result = state
+                                .disable_pagefile_disk(&lang)
                                 .map_err(|e| format!("{e:#}"));
                             let _ = reply.send(result);
                         }
@@ -222,6 +230,11 @@ impl Manager {
         self.request(Cmd::PagefileDiskStatus)
     }
 
+    pub fn disable_pagefile_disk(&self, lang: &str) -> Result<PagefileDiskStatus, String> {
+        let lang = lang.to_string();
+        self.request(|reply| Cmd::DisablePagefileDisk(lang, reply))
+    }
+
     /// Unmount (if mounted) and stop the thread. Called on real app exit.
     /// Idempotent: safe to call again after the thread has already stopped.
     pub fn shutdown(&self) {
@@ -301,6 +314,23 @@ impl ManagerState {
             let _ = cfg;
             anyhow::bail!("This build does not include the Windows WinSpd feature")
         }
+    }
+
+    fn disable_pagefile_disk(&mut self, _lang: &str) -> anyhow::Result<PagefileDiskStatus> {
+        let record = self
+            .pagefile_disk
+            .as_mut()
+            .filter(|record| record.pagefile_added)
+            .context("No VRAMDISK pagefile is active in this session")?;
+        if record.status.disable_pending_restart {
+            return Ok(record.status.clone());
+        }
+        vramdisk::pagefile::PagefileManager::disable_specific(
+            std::path::Path::new(&record.status.pagefile_path),
+        )
+        .context("could not remove the M: pagefile startup setting")?;
+        record.status.disable_pending_restart = true;
+        Ok(record.status.clone())
     }
 
     #[cfg(windows)]
@@ -477,6 +507,7 @@ fn start_winspd_pagefile_disk(
         device: cfg.device,
         pagefile_size: cfg.pagefile_size,
         disk_size,
+        disable_pending_restart: false,
     };
     // Retain the device even if partitioning or swapadd fails; dropping it
     // while Windows may have opened the new disk would make cleanup unsafe.

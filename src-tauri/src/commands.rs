@@ -114,6 +114,15 @@ pub fn pagefile_disk_status(manager: State<Manager>) -> Option<PagefileDiskStatu
     manager.pagefile_disk_status()
 }
 
+/// Queue removal of M:\pagefile.sys from Windows settings; it takes effect after restart.
+#[tauri::command]
+pub fn disable_pagefile_disk(
+    manager: State<Manager>,
+    lang: State<UiLang>,
+) -> Result<PagefileDiskStatus, String> {
+    manager.disable_pagefile_disk(&lang_of(&lang))
+}
+
 /// CLI-flag-derived defaults for the setup screen, e.g. a shortcut launching
 /// `vramdisk.exe --mount R: --compress` pre-fills those fields instead of
 /// mounting automatically. Every field is `null` unless that specific flag

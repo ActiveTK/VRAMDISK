@@ -463,6 +463,7 @@ fn main() {
             commands::pagefile_enable,
             commands::start_pagefile_disk,
             commands::pagefile_disk_status,
+            commands::disable_pagefile_disk,
             commands::initial_overrides,
             commands::hash_job,
             commands::archive_compress_job,
