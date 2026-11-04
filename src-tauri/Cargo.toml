@@ -35,7 +35,7 @@ serde_json = "1"
 anyhow = "1"
 vramdisk = { path = ".." }
 # UI language preference: persisted under HKCU\Software\VRAMDISK, defaulting to
-# the Windows display language reported by sys-locale.
+# English on first launch.
 winreg = "0.55"
 sys-locale = "0.3"
 # "Save the disk to a ZIP before unmounting" (see commands::export_zip). Only
