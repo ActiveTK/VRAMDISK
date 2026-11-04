@@ -39,9 +39,6 @@ const I18N = {
     pagefileDiskFootprint: "GPU ディスク容量はページファイルサイズ + 32 MiB です。",
     pagefileCreating: "WinSpd ディスクを作成し、M: を初期化して swapadd を実行中…",
     pagefileCreated: "GPU VRAM ディスク M: を作成し、ページファイルを追加しました。アプリを終了せず、Windows 管理の C: ページファイルも残してください。",
-    pagefileDisable: "M: のページファイルを無効化（再起動が必要）",
-    pagefileDisabling: "Windows のページファイル設定から M:\\pagefile.sys を削除中…",
-    pagefileDisabledPending: "M: のページファイル設定を削除しました。変更は再起動後に反映されます。再起動までは VRAMDISK を終了しないでください。C: のページファイルは残しています。",
     pagefileSizeInvalid: "ページファイルのサイズを確認してください。",
     device: "GPU",
     target: "マウント先",
@@ -55,7 +52,7 @@ const I18N = {
     compressHint:
       "nvCOMP が見つからないため、この GUI では圧縮を利用できません（CLI では CPU zstd にフォールバックします）",
     pagefileLabel: "Windows ページファイル",
-    pagefileWarning: "実験機能です。VRAM ディスクやサービスが停止すると Windows が停止するおそれがあります。C: のページファイルを残してください。無効化後も再起動するまでは VRAMDISK を終了しないでください。管理者として実行してください。",
+    pagefileWarning: "実験機能です。VRAM ディスクやサービスが停止すると Windows が停止するおそれがあります。C: のページファイルを残し、必要なら管理者として起動してください。",
     pagefileCheck: "ページファイルの状態を確認",
     pagefileEnable: "M: に GPU ディスクを作成してページファイルを追加",
     pagefileCompatibility: "互換性: {0}",
@@ -190,9 +187,6 @@ const I18N = {
     pagefileDiskFootprint: "GPU disk capacity is the pagefile size plus 32 MiB.",
     pagefileCreating: "Creating the WinSpd disk, preparing M:, and running swapadd…",
     pagefileCreated: "Created the GPU VRAM disk on M: and added its pagefile. Keep VRAMDISK running and retain the Windows managed pagefile on C:.",
-    pagefileDisable: "Disable M: pagefile (restart required)",
-    pagefileDisabling: "Removing M:\\pagefile.sys from Windows pagefile settings…",
-    pagefileDisabledPending: "The M: pagefile setting was removed. The change takes effect after restart. Keep VRAMDISK running until then; the C: pagefile is unchanged.",
     pagefileSizeInvalid: "Check the pagefile size.",
     device: "GPU",
     target: "Mount point",
@@ -206,7 +200,7 @@ const I18N = {
     compressHint:
       "nvCOMP was not found, so compression is unavailable in this GUI (the CLI falls back to CPU zstd).",
     pagefileLabel: "Windows pagefile",
-    pagefileWarning: "Experimental: Windows may hang if the VRAM disk or service stops. Keep the pagefile on C:. Run as administrator. After disabling M:, keep VRAMDISK running until you restart.",
+    pagefileWarning: "Experimental. Windows may hang if the VRAM disk or service stops. Keep the pagefile on C: and run as administrator if required.",
     pagefileCheck: "Check pagefile status",
     pagefileEnable: "Create GPU disk on M: and add pagefile",
     pagefileCompatibility: "Compatibility: {0}",
@@ -431,25 +425,10 @@ async function enablePagefile() {
     });
     status.textContent = `${t("pagefileCreated")}\n${result.drive} · ${formatSize(result.disk_size)} disk · ${formatSize(result.pagefile_size)} pagefile`;
     active = true;
-    el("pagefile-disable-btn").disabled = false;
   } catch (error) {
     status.textContent = String(error);
   } finally {
     button.disabled = active;
-  }
-}
-
-async function disablePagefile() {
-  const button = el("pagefile-disable-btn");
-  const status = el("pagefile-status");
-  button.disabled = true;
-  status.textContent = t("pagefileDisabling");
-  try {
-    await invoke("disable_pagefile_disk");
-    status.textContent = t("pagefileDisabledPending");
-  } catch (error) {
-    status.textContent = String(error);
-    button.disabled = false;
   }
 }
 
@@ -1387,7 +1366,6 @@ async function boot() {
   }
   el("pagefile-check-btn").addEventListener("click", checkPagefileStatus);
   el("pagefile-enable-btn").addEventListener("click", enablePagefile);
-  el("pagefile-disable-btn").addEventListener("click", disablePagefile);
 
   await step(loadDevices, "stepGpus");
   await step(loadFreeDrives, "stepDrives");

@@ -11,7 +11,7 @@
 | WinSpd SCSI adapter | `IMPLEMENTED` (optional build feature) | `src/winspd.rs` and `native/winspd_shim.c` map Read/Write/Flush/Unmap requests to `BlockStorage`. |
 | Pagefile diagnostics | `IMPLEMENTED` (read-only) | `vramdisk.exe pagefile status` / `check` query Windows CIM data and locate `swapadd.exe` / `swapadd64.exe` beside the app, in `C:\ProgramData`, or on `PATH`. |
 | Explicit pagefile add | `IMPLEMENTED / EXPERIMENTAL_UNVERIFIED` | The GUI creates a GPU-backed WinSpd disk, partitions and formats the new disk as M:, then asks `swapadd` to add a fixed-size pagefile. The disk reserves 32 MiB beyond the requested pagefile size. Existing pagefiles are preserved. This does not validate paging safety. |
-| Pagefile disable | `CONFIG_REMOVAL_IMPLEMENTED / RESTART_REQUIRED` | The GUI can remove only its M:\pagefile.sys startup setting. The active pagefile and WinSpd disk remain in use until Windows restarts; immediate removal is unsupported. |
+| Pagefile remove | `UNSUPPORTED` | VRAMDISK does not remove or reconfigure active Windows pagefiles. |
 | GPU block-storage runtime | `BASIC I/O VERIFIED BY USER` | User reported `stgtest` returned `OK`, the WinSpd disk came online, and ordinary file reads/writes succeeded. Low-memory and paging-path behavior remain untested. |
 | Windows paging over WinSpd | `NOT PAGING_VALIDATED` | No WinSpd paging-path support statement or system-level paging test was found. |
 
@@ -29,7 +29,7 @@ The [WinSpd project](https://github.com/winfsp/winspd) describes a kernel StorPo
 
 Microsoft's [storage-driver paging-path guidance](https://learn.microsoft.com/en-us/windows-hardware/drivers/storage/restrictions-on-pageable-code-in-storage-drivers) describes deadlock constraints for drivers that service paging I/O. That guidance does not establish that a user-mode WinSpd storage process, its dispatcher, CUDA context, CUDA driver calls, and their memory dependencies are safe in the paging path. A page fault could wait for a user-mode service whose working set or dependencies themselves require paging. This circular-wait scenario is a technical risk assessment, not a claim that every WinSpd device will deadlock.
 
-Therefore NTFS visibility, successful `swapadd`, or an increased commit limit do not prove paging I/O correctness. The GUI exposes only a manual, user-initiated creation and swapadd sequence; it does not include startup integration to recreate the GPU disk at boot. Its disable button removes only the M: pagefile startup setting and requires a restart; the active pagefile and disk remain live until then. Treat a pagefile on this disk as experimental until WinSpd explicitly supports paging and a recoverable test environment validates the complete paging path, including low-memory behavior and service/CUDA dependencies.
+Therefore NTFS visibility, successful `swapadd`, or an increased commit limit do not prove paging I/O correctness. The GUI exposes only a manual, user-initiated creation and swapadd sequence; it does not include startup integration to recreate the GPU disk at boot. Treat a pagefile on this disk as experimental until WinSpd explicitly supports paging and a recoverable test environment validates the complete paging path, including low-memory behavior and service/CUDA dependencies.
 
 ## License and redistribution
 
