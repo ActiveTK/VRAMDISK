@@ -403,6 +403,13 @@ fn dispatch_cli_mode(argv: &[String]) {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if argv.first().is_some_and(|mode| mode.eq_ignore_ascii_case("winspd"))
+        && !ensure_winspd_console()
+    {
+        eprintln!("Could not create a console for the interactive WinSpd CLI.");
+        std::process::exit(1);
+    }
     dispatch_cli_mode(&argv);
     let cli_seed = CliSeed(if argv.is_empty() {
         None
@@ -553,6 +560,39 @@ fn main() {
             }
         }
     });
+}
+
+/// Release builds use the Windows GUI subsystem, so a CLI launched from
+/// PowerShell has no console input handle. WinSpd stays interactive until the
+/// user presses Enter; give that mode its own console before reading stdin.
+#[cfg(windows)]
+fn ensure_winspd_console() -> bool {
+    use std::ffi::c_void;
+
+    const STD_INPUT_HANDLE: i32 = -10;
+    const STD_OUTPUT_HANDLE: i32 = -11;
+    const STD_ERROR_HANDLE: i32 = -12;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> *mut c_void;
+        fn AllocConsole() -> i32;
+        fn GetStdHandle(kind: i32) -> *mut c_void;
+        fn SetStdHandle(kind: i32, handle: *mut c_void) -> i32;
+    }
+
+    unsafe {
+        if GetConsoleWindow().is_null() && AllocConsole() == 0 {
+            return false;
+        }
+
+        [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .into_iter()
+            .all(|kind| {
+                let handle = GetStdHandle(kind);
+                !handle.is_null() && handle as isize != -1 && SetStdHandle(kind, handle) != 0
+            })
+    }
 }
 
 #[cfg(test)]

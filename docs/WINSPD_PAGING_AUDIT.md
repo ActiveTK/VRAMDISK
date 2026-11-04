@@ -54,7 +54,7 @@ vramdisk.exe winspd --mode pipe --size 1GiB
 vramdisk.exe winspd --mode disk --size 1GiB
 ```
 
-Set `WINSPD_SDK_DIR` to the WinSpd Developer SDK root when building. Pipe mode is for `stgtest-x64.exe` at `\\.\pipe\vramdisk\0`; it does not expose a Windows disk. Disk mode requires the installed WinSpd driver and an elevated terminal; it exposes a new VRAM disk but does not initialize or format it. GUI controls and lifecycle handling are still pending.
+Set `WINSPD_SDK_DIR` to the WinSpd Developer SDK root when building. Pipe mode is for `stgtest-x64.exe` at `\\.\pipe\vramdisk\0`; it does not expose a Windows disk. Disk mode requires the installed WinSpd driver and an elevated terminal; it exposes a new VRAM disk but does not initialize or format it. Release builds open a dedicated console window for the interactive WinSpd CLI so Enter can be read even though the main executable uses the Windows GUI subsystem. GUI controls and lifecycle handling are still pending.
 
 ## Deferred work and safe test order
 
