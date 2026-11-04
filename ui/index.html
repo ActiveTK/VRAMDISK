@@ -81,8 +81,10 @@
               <div class="hint" data-i18n="pagefileWarning">Experimental: adding a pagefile to this volatile VRAM disk may hang Windows if the disk or service stops. Keep the Windows-managed pagefile on C:.</div>
               <button id="pagefile-check-btn" type="button" class="btn" data-i18n="pagefileCheck">Check pagefile status</button>
               <label for="pagefile-size" data-i18n="pagefileSizeLabel">Fixed pagefile size (MB)</label>
-              <div class="hint" data-i18n="pagefileDiskFootprint">GPU disk capacity is the pagefile size plus 32 MiB.</div>
               <input id="pagefile-size" type="number" min="1" value="16384" />
+              <label for="pagefile-overhead" data-i18n="pagefileOverheadLabel">Extra disk reserve (MiB)</label>
+              <input id="pagefile-overhead" type="number" min="1" value="128" />
+              <div class="hint" data-i18n="pagefileDiskFootprint">GPU disk capacity = pagefile size + reserve.</div>
               <button id="pagefile-enable-btn" type="button" class="btn btn-primary btn-block" data-i18n="pagefileEnable">Create GPU disk on M: and add pagefile</button>
               <div id="pagefile-status" class="status-text" role="status"></div>
             </div>

@@ -36,11 +36,12 @@ const I18N = {
     fileDiskWorkflow: "ファイル RAM ディスク",
     pagefileWorkflow: "GPU ページファイル",
     pagefileSizeLabel: "固定ページファイルサイズ（MB）",
-    pagefileDiskFootprint: "GPU ディスク容量はページファイルサイズ + 32 MiB です。",
+    pagefileOverheadLabel: "追加の冗長容量（MiB）",
+    pagefileDiskFootprint: "GPU ディスク容量 = ページファイルサイズ + 冗長容量。",
     pagefileStopInfo: "GPU メモリと M: ページファイル用ディスクは、Windows のシャットダウンまたは再起動時に解放されます。",
     pagefileCreating: "WinSpd ディスクを作成し、M: を初期化して swapadd を実行中…",
     pagefileCreated: "GPU VRAM ディスク M: を作成し、ページファイルを追加しました。アプリを終了せず、Windows 管理の C: ページファイルも残してください。",
-    pagefileSizeInvalid: "ページファイルのサイズを確認してください。",
+    pagefileSizeInvalid: "ページファイルサイズと冗長容量を確認してください。",
     device: "GPU",
     target: "マウント先",
     driveLetter: "ドライブレター",
@@ -185,11 +186,12 @@ const I18N = {
     fileDiskWorkflow: "File RAM disk",
     pagefileWorkflow: "GPU pagefile",
     pagefileSizeLabel: "Fixed pagefile size (MB)",
-    pagefileDiskFootprint: "GPU disk capacity is the pagefile size plus 32 MiB.",
+    pagefileOverheadLabel: "Extra disk reserve (MiB)",
+    pagefileDiskFootprint: "GPU disk capacity = pagefile size + reserve.",
     pagefileStopInfo: "GPU memory and the M: pagefile disk are released only when Windows shuts down or restarts.",
     pagefileCreating: "Creating the WinSpd disk, preparing M:, and running swapadd…",
     pagefileCreated: "Created the GPU VRAM disk on M: and added its pagefile. Keep VRAMDISK running and retain the Windows managed pagefile on C:.",
-    pagefileSizeInvalid: "Check the pagefile size.",
+    pagefileSizeInvalid: "Check the pagefile size and disk reserve.",
     device: "GPU",
     target: "Mount point",
     driveLetter: "Drive letter",
@@ -409,8 +411,9 @@ async function checkPagefileStatus() {
 
 async function enablePagefile() {
   const sizeMb = Number(el("pagefile-size").value);
+  const overheadMb = Number(el("pagefile-overhead").value);
   const status = el("pagefile-status");
-  if (!Number.isSafeInteger(sizeMb) || sizeMb < 1) {
+  if (!Number.isSafeInteger(sizeMb) || sizeMb < 1 || !Number.isSafeInteger(overheadMb) || overheadMb < 1) {
     status.textContent = t("pagefileSizeInvalid");
     return;
   }
@@ -423,9 +426,10 @@ async function enablePagefile() {
     const selectedDevice = Number(el("device").value);
     const result = await invoke("start_pagefile_disk", {
       pagefileSize: sizeMb * UNIT_BYTES.MB,
+      filesystemOverhead: overheadMb * UNIT_BYTES.MB,
       device: selectedDevice,
     });
-    status.textContent = `${t("pagefileCreated")}\n${result.drive} · ${formatSize(result.disk_size)} disk · ${formatSize(result.pagefile_size)} pagefile`;
+    status.textContent = `${t("pagefileCreated")}\n${result.drive} · ${formatSize(result.disk_size)} disk = ${formatSize(result.pagefile_size)} pagefile + ${formatSize(result.filesystem_overhead)} reserve`;
     active = true;
   } catch (error) {
     status.textContent = String(error);

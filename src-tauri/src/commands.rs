@@ -102,11 +102,15 @@ pub fn pagefile_enable(path: String, min_size: u64, max_size: u64) -> Result<(),
 #[tauri::command]
 pub fn start_pagefile_disk(
     pagefile_size: u64,
+    filesystem_overhead: u64,
     device: usize,
     manager: State<Manager>,
     lang: State<UiLang>,
 ) -> Result<PagefileDiskStatus, String> {
-    manager.start_pagefile_disk(PagefileDiskConfig { pagefile_size, device }, &lang_of(&lang))
+    manager.start_pagefile_disk(
+        PagefileDiskConfig { pagefile_size, filesystem_overhead, device },
+        &lang_of(&lang),
+    )
 }
 
 #[tauri::command]

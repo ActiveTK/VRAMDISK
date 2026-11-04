@@ -64,6 +64,7 @@ pub struct MountStatus {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PagefileDiskConfig {
     pub pagefile_size: u64,
+    pub filesystem_overhead: u64,
     #[serde(default)]
     pub device: usize,
 }
@@ -74,6 +75,7 @@ pub struct PagefileDiskStatus {
     pub pagefile_path: String,
     pub device: usize,
     pub pagefile_size: u64,
+    pub filesystem_overhead: u64,
     pub disk_size: u64,
 }
 
@@ -287,6 +289,7 @@ impl ManagerState {
         anyhow::ensure!(self.mount.is_none(), "Unmount the file RAM disk before starting the WinSpd pagefile disk");
         anyhow::ensure!(self.pagefile_disk.is_none(), "A WinSpd pagefile disk is already running");
         anyhow::ensure!(cfg.pagefile_size > 0, "pagefile size must be greater than zero");
+        anyhow::ensure!(cfg.filesystem_overhead > 0, "pagefile disk reserve must be greater than zero");
         anyhow::ensure!(
             list_free_drives().iter().any(|drive| drive.eq_ignore_ascii_case("M:")),
             "Drive M: is already assigned; free it before creating the WinSpd pagefile disk"
@@ -455,10 +458,9 @@ fn start_winspd_pagefile_disk(
     cfg: PagefileDiskConfig,
 ) -> anyhow::Result<PagefileDiskStatus> {
     use std::path::Path;
-    const FILESYSTEM_OVERHEAD: u64 = 32 * 1024 * 1024;
     let disk_size = cfg
         .pagefile_size
-        .checked_add(FILESYSTEM_OVERHEAD)
+        .checked_add(cfg.filesystem_overhead)
         .context("pagefile disk size overflow")?;
     let total_vram = Vram::device_total_mem(cfg.device)?;
     anyhow::ensure!(
@@ -476,6 +478,7 @@ fn start_winspd_pagefile_disk(
         pagefile_path: r"M:\pagefile.sys".into(),
         device: cfg.device,
         pagefile_size: cfg.pagefile_size,
+        filesystem_overhead: cfg.filesystem_overhead,
         disk_size,
     };
     // Retain the device even if partitioning or swapadd fails; dropping it

@@ -10,7 +10,7 @@
 | Generic block-storage contract | `IMPLEMENTED` | `src/block.rs`; checked LBA ranges, 512/4096-byte sectors, CUDA backing, and a test-only in-memory backend. |
 | WinSpd SCSI adapter | `IMPLEMENTED` (optional build feature) | `src/winspd.rs` and `native/winspd_shim.c` map Read/Write/Flush/Unmap requests to `BlockStorage`. |
 | Pagefile diagnostics | `IMPLEMENTED` (read-only) | `vramdisk.exe pagefile status` / `check` query Windows CIM data and locate `swapadd.exe` / `swapadd64.exe` beside the app, in `C:\ProgramData`, or on `PATH`. |
-| Explicit pagefile add | `IMPLEMENTED / EXPERIMENTAL_UNVERIFIED` | The GUI creates a GPU-backed WinSpd disk, partitions and formats the new disk as M:, then asks `swapadd` to add a fixed-size pagefile. The disk reserves 32 MiB beyond the requested pagefile size. Existing pagefiles are preserved. This does not validate paging safety. |
+| Explicit pagefile add | `IMPLEMENTED / EXPERIMENTAL_UNVERIFIED` | The GUI creates a GPU-backed WinSpd disk, partitions and formats the new disk as M:, then asks `swapadd` to add a fixed-size pagefile. A configurable extra reserve (default 128 MiB) is added beyond the requested pagefile size. Existing pagefiles are preserved. This does not validate paging safety. |
 | Pagefile remove | `UNSUPPORTED` | VRAMDISK does not remove or reconfigure active Windows pagefiles. |
 | GPU block-storage runtime | `BASIC I/O VERIFIED BY USER` | User reported `stgtest` returned `OK`, the WinSpd disk came online, and ordinary file reads/writes succeeded. Low-memory and paging-path behavior remain untested. |
 | Windows paging over WinSpd | `NOT PAGING_VALIDATED` | No WinSpd paging-path support statement or system-level paging test was found. |
