@@ -45,7 +45,7 @@ impl PagefileManager {
     /// registry settings, create files, or change the running paging state.
     pub fn check() -> PagefileReport {
         let mut diagnostics = vec![
-            "WinSpd block backend is not connected to VRAMDISK yet.".to_string(),
+            "WinSpd is an optional feature; this status check does not query active WinSpd devices.".to_string(),
             "WinSpd paging I/O safety has no validation evidence; automatic pagefile enable is disabled.".to_string(),
             "Keep the Windows-managed pagefile on a persistent system volume.".to_string(),
         ];
@@ -219,7 +219,7 @@ mod tests {
         let report = PagefileManager::check();
         assert_eq!(report.compatibility, PagingCompatibility::ExperimentalUnverified);
         assert!(!report.auto_enable);
-        assert!(report.diagnostics.iter().any(|line| line.contains("not connected")));
+        assert!(report.diagnostics.iter().any(|line| line.contains("does not query active WinSpd devices")));
     }
 
     #[test]

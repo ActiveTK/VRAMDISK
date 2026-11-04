@@ -19,6 +19,9 @@ path = "src/main.rs"
 # unaffected. Build this from the `src-tauri/` directory (see build-gui.ps1).
 [workspace]
 
+[features]
+winspd = ["vramdisk/winspd"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 # Emit the same /DELAYLOAD:winfsp-x64.dll linker directive as the CLI so this

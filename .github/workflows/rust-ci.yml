@@ -54,12 +54,26 @@ jobs:
           if (-not (Test-Path (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) { throw 'libclang.dll was not installed' }
           Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$env:LIBCLANG_PATH"
 
+      - name: Extract WinSpd Developer SDK
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winspd-1.0.20357.msi'
+          $target = Join-Path $env:RUNNER_TEMP 'winspd-sdk'
+          Invoke-WebRequest 'https://github.com/winfsp/winspd/releases/download/v1.0B1/winspd-1.0.20357.msi' -OutFile $msi
+          New-Item -ItemType Directory -Path $target | Out-Null
+          $process = Start-Process msiexec.exe -ArgumentList @('/a', $msi, '/qn', "TARGETDIR=$target") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "WinSpd SDK extraction failed with exit code $($process.ExitCode)" }
+          $header = Get-ChildItem -LiteralPath $target -Filter 'winspd.h' -Recurse | Select-Object -First 1
+          if (-not $header) { throw 'WinSpd developer headers were not found in the extracted MSI' }
+          $sdk = $header.Directory.Parent.Parent.FullName
+          Add-Content -Path $env:GITHUB_ENV -Value "WINSPD_SDK_DIR=$sdk"
+
       - name: Install frontend dependencies
         run: npm ci
 
       - name: Build release executable
         shell: pwsh
-        run: .\build-gui.ps1 build
+        run: .\build-gui.ps1 build --features winspd
 
       - name: Upload executable
         uses: actions/upload-artifact@v7

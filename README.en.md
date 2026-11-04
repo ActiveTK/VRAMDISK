@@ -82,4 +82,4 @@ https://github.com/ActiveTK/VRAMDISK/blob/main/LICENSE
 
 ## WinSpd and pagefile development status
 
-The existing WinFsp filesystem remains the only implemented Windows backend. A reusable block-storage interface and read-only pagefile diagnostics have been added, but there is no connected WinSpd device yet. Windows paging I/O through WinSpd is unverified and cannot be enabled automatically. See the [WinSpd / VRAM pagefile audit](docs/WINSPD_PAGING_AUDIT.md) for the findings and safe test plan.
+An optional WinSpd adapter now connects raw block requests to VRAM. Build with the WinSpd Developer SDK and the winspd Cargo feature. The pipe mode can test the adapter with WinSpd stgtest; disk mode requires the WinSpd driver and exposes a new, initially unformatted VRAM disk. GUI controls are not added yet. Windows paging I/O through WinSpd remains unverified and pagefile activation stays disabled. See the [WinSpd / VRAM pagefile audit](docs/WINSPD_PAGING_AUDIT.md) for the commands and safe test order.

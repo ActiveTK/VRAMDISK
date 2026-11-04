@@ -387,10 +387,10 @@ fn dispatch_cli_mode(argv: &[String]) {
     if mode == "cdm-bench" {
         std::process::exit(vramdisk::cdm_bench::run(argv[1..].to_vec()));
     }
-    if mode != "cli" && mode != "benchmark" && mode != "pagefile" {
+    if mode != "cli" && mode != "benchmark" && mode != "pagefile" && mode != "winspd" {
         return;
     }
-    let mut rest = if mode == "pagefile" {
+    let mut rest = if mode == "pagefile" || mode == "winspd" {
         argv.to_vec()
     } else {
         argv[1..].to_vec()
