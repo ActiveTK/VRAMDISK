@@ -43,7 +43,7 @@ nvCOMPのランタイムDLLを導入すると、GPU上でファイルを圧縮�
 
 nvCOMPは以下から入手できます。
 
-https://developer.nvidia.com/nvcomp-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local
+[nvCOMP 5.3.0 Windows x64](https://developer.nvidia.com/nvcomp-5-3-0-download-archive?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local)
 
 ## 導入時のエラーについて
 

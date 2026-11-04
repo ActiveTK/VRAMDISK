@@ -20,7 +20,7 @@ use manager::Manager;
 pub(crate) struct CliSeed(pub Option<vramdisk::cli::SeedOverrides>);
 
 /// UI language ("ja" or "en"). Chosen from, in order: the value persisted
-/// under HKCU\Software\VRAMDISK, else the Windows display language. The
+/// under HKCU\Software\VRAMDISK, else English. The
 /// frontend reads/writes it via the `get_ui_language` / `set_ui_language`
 /// commands; the tray menu and native dialogs read it through this state.
 pub(crate) struct UiLang(pub Mutex<String>);
@@ -49,15 +49,7 @@ fn stored_language() -> Option<String> {
 }
 
 fn detect_language() -> String {
-    stored_language().unwrap_or_else(|| {
-        let sys = sys_locale::get_locale().unwrap_or_default();
-        if sys.to_ascii_lowercase().starts_with("ja") {
-            "ja"
-        } else {
-            "en"
-        }
-        .to_string()
-    })
+    stored_language().unwrap_or_else(|| "en".to_string())
 }
 
 pub(crate) fn persist_language(lang: &str) -> Result<(), String> {

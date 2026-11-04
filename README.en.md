@@ -41,9 +41,9 @@ That's it, the disk is mounted!
 
 Installing the nvCOMP runtime DLL lets you compress files on the GPU (the "Compress data" option on the mount screen becomes available, and so does the file compression tool after mounting).
 
-You can get nvCOMP here:
+Download the compatible nvCOMP 5.3.0 Windows x64 package here:
 
-https://developer.nvidia.com/nvcomp-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local
+https://developer.nvidia.com/nvcomp-5-3-0-download-archive?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local
 
 ## Installation errors
 
