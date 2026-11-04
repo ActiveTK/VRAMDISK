@@ -1,79 +1,72 @@
-# VRAMDISK: Create VRAM disk on Windows
+# VRAMDISK：在 Windows 上创建 VRAM 磁盘
 
-VRAMDISKは、GPUのVRAMを独自のファイルシステム経由でWindowsにマウントできるアプリです。
+[English](README.en.md) | 简体中文
 
-<img width="928" height="472" alt="image" src="https://github.com/user-attachments/assets/42a44f7e-3a8c-4ab4-a85b-dad7a1769782" />
+VRAMDISK 可以通过自有文件系统将 GPU 的显存（VRAM）挂载为 Windows 磁盘。
 
-VRAM上にはオブジェクトストレージのような構造でデータを保存しているため、GPUの高い並列計算性能を活用してGPU上でそのままファイルを圧縮したり、ハッシュ値を求めたり、エンコードしたりすることができます。
+<img width="928" height="472" alt="VRAMDISK 主界面" src="https://github.com/user-attachments/assets/42a44f7e-3a8c-4ab4-a85b-dad7a1769782" />
 
-マウント中は次のGPUツールが使えます（GUIのツールパネル、または `$VRAMDISK` 内部APIから）。
+数据以类似对象存储的结构保存在 VRAM 中，因此可以利用 GPU 的并行计算能力直接压缩文件、计算哈希值和进行编码。
 
-| ツール | 内容 |
+挂载磁盘后，可通过 GUI 工具面板或 `$VRAMDISK` 内部 API 使用以下 GPU 工具：
+
+| 工具 | 说明 |
 |---|---|
-| ハッシュ計算 | MD5 / SHA-1 / SHA-256 / FNV-1a 64 をGPU/CPU自動振り分けで計算 |
-| 圧縮・展開 | tar.zst / tar.lz4 / tar.gz / zip をGPU上で作成・展開（要 nvCOMP） |
-| エンコード | Base64 / hex（16進テキスト）のエンコード・デコードをGPU上で実行 |
-| 全文検索 | ドライブ上の全ファイルをGPUで横断検索（VRAM帯域で走査するのでPCIeを通りません） |
+| 哈希计算 | 自动选择 GPU 或 CPU，计算 MD5、SHA-1、SHA-256 和 FNV-1a 64 |
+| 压缩与解压 | 在 GPU 上创建或解压 tar.zst、tar.lz4、tar.gz 和 zip（需要 nvCOMP） |
+| 编码 | 在 GPU 上进行 Base64 和十六进制编码、解码 |
+| 全文搜索 | 使用 GPU 扫描磁盘中的所有文件；数据通过 VRAM 带宽读取，无需经过 PCIe |
 
-※VRAM上のデータはアンマウント/プロセス終了で消えます。GUIからアンマウントまたは終了するときは、ドライブの内容をZIPとしてPCに保存するか選べます。
+注意：卸载磁盘或退出进程后，VRAM 中的数据会丢失。通过 GUI 卸载磁盘或退出程序时，可以先将磁盘内容保存为 ZIP 文件。
 
-## 導入方法
+## 开始使用
 
-前提条件: Windows (10 || 11) && NVIDIA GPU: > Maxwell (sm_50, CUDA 12.8)
+**系统要求：** Windows 10 或 11；NVIDIA Maxwell（sm_50）及更新架构的 GPU；CUDA 12.8。
 
-### Step1. WinFspをインストール
+### 1. 安装 WinFsp
 
-まず初めに、[こちら](https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi)からWinFspのインストーラーを入手して導入してください。
+从[此处](https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi)下载并安装 WinFsp。
 
-### Step2. 本体をダウンロード
+### 2. 下载程序
 
-[Releases](../../releases) から `vramdisk.zip` を入手して展開してください。
+从 [Releases](../../releases) 下载 `vramdisk.zip` 并解压。
 
-### Step3. VRAMディスクをマウント
+### 3. 挂载 VRAM 磁盘
 
-`vramdisk.exe` を起動し、GPUデバイス / マウント先（ドライブレター || フォルダ）/ サイズを選んで「マウント」を押します。
+运行 `vramdisk.exe`，选择 GPU、挂载位置（盘符或文件夹）和容量，然后点击“Mount”。
 
-<img width="405" height="446" alt="image" src="https://github.com/user-attachments/assets/67bdbd04-631a-4fae-8ac1-0a5cadbcf293" />
+<img width="405" height="446" alt="挂载设置界面" src="https://github.com/user-attachments/assets/67bdbd04-631a-4fae-8ac1-0a5cadbcf293" />
 
-無事にマウントできました！
+### 4. 启用压缩（可选）
 
-### （オマケ）Step4. 圧縮機能を有効化（任意）
+安装 nvCOMP 运行时 DLL 后，即可在 GPU 上压缩文件。挂载界面中的“Compress data”选项和挂载后的文件压缩工具都会启用。
 
-nvCOMPのランタイムDLLを導入すると、GPU上でファイルを圧縮できるようになります（マウント画面の「データを圧縮」が押せるようになるのと、マウント後にファイル圧縮ツールが使えるようになります）。
+可从 NVIDIA [nvCOMP 下载页面](https://developer.nvidia.com/nvcomp-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local)获取 nvCOMP。
 
-nvCOMPは以下から入手できます。
+## 常见安装问题
 
-https://developer.nvidia.com/nvcomp-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local
+### 提示找不到 `VCRUNTIME140.dll`
 
-## 導入時のエラーについて
+请安装 [Microsoft Visual C++ Redistributable（VC++ 运行库）](https://aka.ms/vc14/vc_redist.x64.exe)。
 
-### 「VCRUNTIME140.dll が見つからないため、コードの実行を続行できません」と表示された場合
+### 提示找不到 WebView2 Runtime
 
-以下から、Microsoft Visual C++ 再頒布可能パッケージ（VC++ ランタイム）を導入してください。
+请安装 [WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2?form=MA13LH#download)。选择 Evergreen Standalone Installer 即可。
 
-https://aka.ms/vc14/vc_redist.x64.exe
+## 构建
 
-### 「Could not find the WebView2 Runtime」と表示された場合
-
-以下から、WebView2ランタイムを導入してください。Evergreen Standalone Installerで大丈夫です。
-
-https://developer.microsoft.com/en-us/microsoft-edge/webview2?form=MA13LH#download
-
-## ビルド方法
-
-Visual Studio Dev Shell環境が必要です。以下のコマンドでビルドできます。
+需要 Visual Studio Dev Shell 环境。运行以下命令：
 
 ```powershell
-npm install            # 初回のみ（@tauri-apps/cliを取得）
-.\build-gui.ps1        # リリースビルド → src-tauri\target\release\vramdisk.exe
-.\build-gui.ps1 dev    # 開発起動（devtools付き）
+npm install            # 仅首次运行：安装 @tauri-apps/cli
+.\build-gui.ps1        # 发布构建：生成 src-tauri\target\release\vramdisk.exe
+.\build-gui.ps1 dev    # 启动开发版本（含开发者工具）
 ```
 
-細かい開発仕様は [DEV.md](DEV.md)をLLMに投げてください。
+详细开发说明见 [DEV.md](DEV.md)。
 
-## ライセンス
+## 许可证
 
-このプログラムは The MIT License の下で公開されています。
+本程序采用 MIT 许可证发布。
 
-© 2026 ActiveTK.
-https://github.com/ActiveTK/VRAMDISK/blob/main/LICENSE
+© 2026 ActiveTK。详见 [LICENSE](LICENSE)。

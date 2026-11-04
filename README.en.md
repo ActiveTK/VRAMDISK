@@ -1,5 +1,7 @@
 # VRAMDISK: Create VRAM disk on Windows
 
+English | [简体中文](README.md)
+
 VRAMDISK is an app that mounts your GPU's VRAM as a Windows drive through its own file system.
 
 <img width="928" height="472" alt="image" src="https://github.com/user-attachments/assets/42a44f7e-3a8c-4ab4-a85b-dad7a1769782" />

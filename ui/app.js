@@ -296,7 +296,7 @@ const I18N = {
   },
 };
 
-let LANG = "ja";
+let LANG = "en";
 
 // Missing keys degrade to the key name, never to undefined/"": an untranslated
 // or typo'd key must still show *something* rather than silently blanking a
@@ -1266,7 +1266,7 @@ async function boot() {
   try {
     LANG = await invoke("get_ui_language");
   } catch (e) {
-    LANG = String(navigator.language || "").toLowerCase().startsWith("ja") ? "ja" : "en";
+    LANG = "en";
   }
   applyLanguage();
   el("lang-select").addEventListener("change", () => switchLanguage(el("lang-select").value));
