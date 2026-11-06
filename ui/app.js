@@ -484,12 +484,14 @@ function kvRow(key, val) {
   return `<div class="kv-row"><span class="kv-key">${escapeHtml(key)}</span><span class="kv-val">${escapeHtml(val)}</span></div>`;
 }
 
-// --- config persistence (frontend-only, via localStorage) ------------------
+// --- config persistence (stored beside the executable by the Rust backend) --
 
-const CFG_KEY = "vramdisk.lastConfig";
+let savedConfig = null;
+let configSaveTimer = null;
 
 function saveConfig() {
   const cfg = {
+    workflowTab: document.querySelector("[data-workflow-tab].active")?.dataset.workflowTab || "file",
     device: el("device").value,
     mountMode: mountMode(),
     drive: el("drive").value,
@@ -498,20 +500,18 @@ function saveConfig() {
     sizeUnit: el("size-unit").value,
     compress: el("compress").checked,
     dedup: el("dedup").checked,
+    pagefileSize: el("pagefile-size").value,
+    pagefileOverhead: el("pagefile-overhead").value,
   };
-  try {
-    localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
-  } catch (e) {
-    /* ignore */
-  }
+  savedConfig = cfg;
+  clearTimeout(configSaveTimer);
+  configSaveTimer = setTimeout(() => {
+    invoke("save_gui_config", { config: cfg }).catch((e) => console.error("save_gui_config", e));
+  }, 300);
 }
 
 function loadSavedConfig() {
-  try {
-    return JSON.parse(localStorage.getItem(CFG_KEY) || "null");
-  } catch (e) {
-    return null;
-  }
+  return savedConfig;
 }
 
 // --- setup screen: devices / drives / size hint -----------------------------
@@ -609,6 +609,9 @@ function restoreSizeAndFlags() {
   el("compress").checked = !!saved.compress;
   el("dedup").checked = !!saved.dedup;
   if (saved.mountMode) setMountMode(saved.mountMode);
+  if (saved.pagefileSize) el("pagefile-size").value = saved.pagefileSize;
+  if (saved.pagefileOverhead) el("pagefile-overhead").value = saved.pagefileOverhead;
+  if (saved.workflowTab === "file" || saved.workflowTab === "pagefile") setWorkflowTab(saved.workflowTab);
 }
 
 // --- mount mode (drive letter vs. folder) -----------------------------------
@@ -1368,11 +1371,20 @@ async function boot() {
   applyLanguage();
   el("lang-select").addEventListener("change", () => switchLanguage(el("lang-select").value));
   for (const tab of document.querySelectorAll("[data-workflow-tab]")) {
-    tab.addEventListener("click", () => setWorkflowTab(tab.dataset.workflowTab));
+    tab.addEventListener("click", () => {
+      setWorkflowTab(tab.dataset.workflowTab);
+      saveConfig();
+    });
   }
   el("pagefile-check-btn").addEventListener("click", checkPagefileStatus);
   el("pagefile-enable-btn").addEventListener("click", enablePagefile);
 
+  try {
+    savedConfig = await invoke("load_gui_config");
+  } catch (e) {
+    console.error("load_gui_config", e);
+    savedConfig = null;
+  }
   await step(loadDevices, "stepGpus");
   await step(loadFreeDrives, "stepDrives");
   restoreSizeAndFlags();
@@ -1393,6 +1405,8 @@ async function boot() {
   });
   el("size-value").addEventListener("input", validateSizeField);
   el("size-unit").addEventListener("change", validateSizeField);
+  el("pagefile-size").addEventListener("input", saveConfig);
+  el("pagefile-overhead").addEventListener("input", saveConfig);
   el("browse-folder-btn").addEventListener("click", doBrowseFolder);
 
   for (const tab of document.querySelectorAll("#screen-setup .seg-btn")) {
@@ -1413,6 +1427,7 @@ async function boot() {
   ]) {
     el(idn).addEventListener("change", saveConfig);
   }
+  el("size-value").addEventListener("input", saveConfig);
 
   el("open-hash").addEventListener("click", () => showScreen("hash"));
   el("open-archive").addEventListener("click", () => {

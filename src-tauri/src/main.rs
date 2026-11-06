@@ -445,6 +445,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_ui_language,
             commands::set_ui_language,
+            commands::load_gui_config,
+            commands::save_gui_config,
             commands::list_gpus,
             commands::list_free_drives,
             commands::browse_folder,
