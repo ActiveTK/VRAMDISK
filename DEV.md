@@ -1116,3 +1116,12 @@ Windows / WinFsp 構成では NVIDIA GPUDirect Storage / cuFile は利用しな�
 - directory mount point は WinFsp が mount lifetime を所有し、unmount 時に削除される。
 - block clone は OS / WinFsp から source handle path を復元できる環境でのみ有効に働く。
 - GUI には合成ベンチマーク起動ビューを提供しない。
+# WinSpd / raw-block development status
+
+`src/block.rs` defines the raw-LBA storage boundary and a CUDA-backed implementation. It is independent of `StorageEngine`: Windows/NTFS owns partition and filesystem metadata. The CPU memory backend is test-only and is never used as a production fallback.
+
+`src/pagefile.rs` provides read-only `pagefile status` and `pagefile check` diagnostics plus an explicit `pagefile enable --path ... --min-size ... --max-size ...` command that invokes `swapadd`. The GUI requires a caller-supplied mounted-volume path and sizes. It preserves existing pagefiles; disable remains unsupported. WinSpd paging I/O is still unverified, so adding a pagefile does not imply it is safe to rely on.
+
+WinSpd is integrated as an optional user-mode raw disk backend. The official WinSpd user-mode storage tutorial does not claim paging-path support, and Microsoft documents special deadlock constraints for storage drivers in the paging path. Do not treat NTFS format success, ordinary file I/O, or `swapadd` success as paging validation. See [`docs/WINSPD_PAGING_AUDIT.md`](docs/WINSPD_PAGING_AUDIT.md) for the architecture audit, state labels, license notes, and test gates.
+
+The current host has a Tesla M40 24 GB in WDDM mode, but Rust/Cargo are unavailable in this shell, so the new Rust code has not been built or run here. No WinSpd driver was installed, no disk was initialized/formatted, and no Windows pagefile setting was changed.

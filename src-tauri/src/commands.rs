@@ -10,8 +10,58 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter as _, Manager as _, State};
 use tauri_plugin_dialog::DialogExt;
 
-use crate::manager::{GpuDto, Manager, MountConfig, MountStatus};
+use crate::manager::{GpuDto, Manager, MountConfig, MountStatus, PagefileDiskConfig, PagefileDiskStatus};
 use crate::{tr, trf, CliSeed, ExportControl, UiLang};
+
+const GUI_CONFIG_FILE: &str = "vramdisk-config.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(rename_all = "camelCase")]
+pub struct GuiConfig {
+    pub workflow_tab: String,
+    pub device: String,
+    pub mount_mode: String,
+    pub drive: String,
+    pub folder: String,
+    pub size_value: String,
+    pub size_unit: String,
+    pub compress: bool,
+    pub dedup: bool,
+    pub pagefile_size: String,
+    pub pagefile_overhead: String,
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        Self {
+            workflow_tab: "file".into(), device: String::new(), mount_mode: "drive".into(),
+            drive: String::new(), folder: String::new(), size_value: String::new(),
+            size_unit: "GiB".into(), compress: false, dedup: false,
+            pagefile_size: "16384".into(), pagefile_overhead: "128".into(),
+        }
+    }
+}
+
+fn gui_config_path() -> Result<PathBuf, String> {
+    std::env::current_exe().map_err(|e| format!("Could not locate executable: {e}"))?
+        .parent().map(|dir| dir.join(GUI_CONFIG_FILE))
+        .ok_or_else(|| "Could not locate executable directory".to_string())
+}
+
+#[tauri::command]
+pub fn load_gui_config() -> GuiConfig {
+    gui_config_path().ok().and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<GuiConfig>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn save_gui_config(config: GuiConfig) -> Result<(), String> {
+    let path = gui_config_path()?;
+    let contents = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
+    std::fs::write(path, contents).map_err(|e| format!("Could not save GUI config: {e}"))
+}
 
 /// The UI language a command's messages must be rendered in.
 ///
@@ -74,6 +124,48 @@ pub fn mount_status(manager: State<Manager>) -> Option<MountStatus> {
 #[tauri::command]
 pub fn nvcomp_available() -> bool {
     vramdisk::nvcomp::nvcomp_available()
+}
+
+/// Read-only Windows pagefile and compatibility diagnostics.
+#[tauri::command]
+pub fn pagefile_status() -> serde_json::Value {
+    let report = vramdisk::pagefile::PagefileManager::status();
+    serde_json::json!({
+        "compatibility": report.compatibility.as_str(),
+        "auto_enable": report.auto_enable,
+        "swapadd_path": report.swapadd_path.map(|path| path.display().to_string()),
+        "active_pagefiles": report.active_pagefiles,
+        "commit_status": report.commit_status,
+        "diagnostics": report.diagnostics,
+    })
+}
+
+/// Explicitly request a pagefile through swapadd. Existing Windows pagefiles
+/// are left in place; this does not imply that WinSpd paging is validated.
+#[tauri::command]
+pub fn pagefile_enable(path: String, min_size: u64, max_size: u64) -> Result<(), String> {
+    vramdisk::pagefile::PagefileManager::enable(std::path::Path::new(&path), min_size, max_size)
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// Create a GPU VRAM-backed WinSpd disk, format it as M:, and add its pagefile.
+#[tauri::command]
+pub fn start_pagefile_disk(
+    pagefile_size: u64,
+    filesystem_overhead: u64,
+    device: usize,
+    manager: State<Manager>,
+    lang: State<UiLang>,
+) -> Result<PagefileDiskStatus, String> {
+    manager.start_pagefile_disk(
+        PagefileDiskConfig { pagefile_size, filesystem_overhead, device },
+        &lang_of(&lang),
+    )
+}
+
+#[tauri::command]
+pub fn pagefile_disk_status(manager: State<Manager>) -> Option<PagefileDiskStatus> {
+    manager.pagefile_disk_status()
 }
 
 /// CLI-flag-derived defaults for the setup screen, e.g. a shortcut launching

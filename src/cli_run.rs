@@ -27,6 +27,34 @@ pub fn run(args: Vec<String>) -> i32 {
         }
     }
 
+    if args.first().is_some_and(|arg| arg == "pagefile") {
+        return match crate::pagefile::run_cli(&args[1..]) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("Error: {err:#}");
+                1
+            }
+        };
+    }
+
+    if args.first().is_some_and(|arg| arg == "winspd") {
+        #[cfg(all(windows, feature = "winspd"))]
+        {
+            return match crate::winspd::run_cli(&args[1..]) {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("Error: {err:#}");
+                    1
+                }
+            };
+        }
+        #[cfg(not(all(windows, feature = "winspd")))]
+        {
+            eprintln!("Error: this executable was built without the Windows WinSpd feature");
+            return 1;
+        }
+    }
+
     let cli_args = std::iter::once("vramdisk".to_string()).chain(args);
     let args = Cli::parse_from(cli_args);
 

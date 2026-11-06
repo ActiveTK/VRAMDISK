@@ -33,6 +33,15 @@ let gpuList = []; // cached from list_gpus()
 
 const I18N = {
   ja: {
+    fileDiskWorkflow: "ファイル RAM ディスク",
+    pagefileWorkflow: "GPU ページファイル",
+    pagefileSizeLabel: "固定ページファイルサイズ（MB）",
+    pagefileOverheadLabel: "追加の冗長容量（MiB）",
+    pagefileDiskFootprint: "GPU ディスク容量 = ページファイルサイズ + 冗長容量。",
+    pagefileStopInfo: "GPU メモリと M: ページファイル用ディスクは、Windows のシャットダウンまたは再起動時に解放されます。",
+    pagefileCreating: "WinSpd ディスクを作成し、M: を初期化して swapadd を実行中…",
+    pagefileCreated: "GPU VRAM ディスク M: を作成し、ページファイルを追加しました。アプリを終了せず、Windows 管理の C: ページファイルも残してください。",
+    pagefileSizeInvalid: "ページファイルサイズと冗長容量を確認してください。",
     device: "GPU",
     target: "マウント先",
     driveLetter: "ドライブレター",
@@ -44,6 +53,16 @@ const I18N = {
     dedupOpt: "同一内容のチャンクを共有",
     compressHint:
       "nvCOMP が見つからないため、この GUI では圧縮を利用できません（CLI では CPU zstd にフォールバックします）",
+    pagefileLabel: "Windows ページファイル",
+    pagefileWarning: "実験機能です。VRAM ディスクやサービスが停止すると Windows が停止するおそれがあります。C: のページファイルを残し、必要なら管理者として起動してください。",
+    pagefileCheck: "ページファイルの状態を確認",
+    pagefileEnable: "M: に GPU ディスクを作成してページファイルを追加",
+    pagefileCompatibility: "互換性: {0}",
+    pagefileAutomatic: "自動有効化: {0}",
+    pagefileSwapadd: "swapadd: {0}",
+    pagefileActive: "有効なページファイル: {0}",
+    pagefileCommit: "コミット状況: {0}",
+    pagefileDiagnostic: "診断: {0}",
     mount: "マウント",
     statFiles: "ファイル数",
     statLogical: "論理データ",
@@ -164,6 +183,15 @@ const I18N = {
     bootFail: "初期化に失敗しました: {0}",
   },
   en: {
+    fileDiskWorkflow: "File RAM disk",
+    pagefileWorkflow: "GPU pagefile",
+    pagefileSizeLabel: "Fixed pagefile size (MB)",
+    pagefileOverheadLabel: "Extra disk reserve (MiB)",
+    pagefileDiskFootprint: "GPU disk capacity = pagefile size + reserve.",
+    pagefileStopInfo: "GPU memory and the M: pagefile disk are released only when Windows shuts down or restarts.",
+    pagefileCreating: "Creating the WinSpd disk, preparing M:, and running swapadd…",
+    pagefileCreated: "Created the GPU VRAM disk on M: and added its pagefile. Keep VRAMDISK running and retain the Windows managed pagefile on C:.",
+    pagefileSizeInvalid: "Check the pagefile size and disk reserve.",
     device: "GPU",
     target: "Mount point",
     driveLetter: "Drive letter",
@@ -175,6 +203,16 @@ const I18N = {
     dedupOpt: "Share identical chunks",
     compressHint:
       "nvCOMP was not found, so compression is unavailable in this GUI (the CLI falls back to CPU zstd).",
+    pagefileLabel: "Windows pagefile",
+    pagefileWarning: "Experimental. Windows may hang if the VRAM disk or service stops. Keep the pagefile on C: and run as administrator if required.",
+    pagefileCheck: "Check pagefile status",
+    pagefileEnable: "Create GPU disk on M: and add pagefile",
+    pagefileCompatibility: "Compatibility: {0}",
+    pagefileAutomatic: "Automatic enable: {0}",
+    pagefileSwapadd: "swapadd: {0}",
+    pagefileActive: "Active pagefiles: {0}",
+    pagefileCommit: "Commit status: {0}",
+    pagefileDiagnostic: "Diagnostic: {0}",
     mount: "Mount",
     statFiles: "Files",
     statLogical: "Logical data",
@@ -296,7 +334,7 @@ const I18N = {
   },
 };
 
-let LANG = "ja";
+let LANG = "en";
 
 // Missing keys degrade to the key name, never to undefined/"": an untranslated
 // or typo'd key must still show *something* rather than silently blanking a
@@ -338,6 +376,65 @@ async function switchLanguage(lang) {
     await invoke("set_ui_language", { language: lang });
   } catch (e) {
     console.error("set_ui_language", e);
+  }
+}
+
+function setWorkflowTab(name) {
+  for (const tab of document.querySelectorAll("[data-workflow-tab]")) {
+    const selected = tab.dataset.workflowTab === name;
+    tab.classList.toggle("active", selected);
+    tab.setAttribute("aria-selected", String(selected));
+  }
+  for (const panel of document.querySelectorAll("[data-workflow-panel]")) {
+    panel.hidden = panel.dataset.workflowPanel !== name;
+  }
+}
+
+async function checkPagefileStatus() {
+  const status = el("pagefile-status");
+  status.textContent = t("pagefileCheck") + "…";
+  try {
+    const report = await invoke("pagefile_status");
+    const lines = [
+      t("pagefileCompatibility", report.compatibility),
+      t("pagefileAutomatic", report.auto_enable),
+      t("pagefileSwapadd", report.swapadd_path || "not found"),
+      t("pagefileActive", report.active_pagefiles || "unavailable"),
+      t("pagefileCommit", report.commit_status || "unavailable"),
+      ...(report.diagnostics || []).map((line) => t("pagefileDiagnostic", line)),
+    ];
+    status.textContent = lines.join("\n");
+  } catch (error) {
+    status.textContent = String(error);
+  }
+}
+
+async function enablePagefile() {
+  const sizeMb = Number(el("pagefile-size").value);
+  const overheadMb = Number(el("pagefile-overhead").value);
+  const status = el("pagefile-status");
+  if (!Number.isSafeInteger(sizeMb) || sizeMb < 1 || !Number.isSafeInteger(overheadMb) || overheadMb < 1) {
+    status.textContent = t("pagefileSizeInvalid");
+    return;
+  }
+
+  const button = el("pagefile-enable-btn");
+  button.disabled = true;
+  let active = false;
+  status.textContent = t("pagefileCreating");
+  try {
+    const selectedDevice = Number(el("device").value);
+    const result = await invoke("start_pagefile_disk", {
+      pagefileSize: sizeMb * UNIT_BYTES.MB,
+      filesystemOverhead: overheadMb * UNIT_BYTES.MB,
+      device: selectedDevice,
+    });
+    status.textContent = `${t("pagefileCreated")}\n${result.drive} · ${formatSize(result.disk_size)} disk = ${formatSize(result.pagefile_size)} pagefile + ${formatSize(result.filesystem_overhead)} reserve`;
+    active = true;
+  } catch (error) {
+    status.textContent = String(error);
+  } finally {
+    button.disabled = active;
   }
 }
 
@@ -387,12 +484,14 @@ function kvRow(key, val) {
   return `<div class="kv-row"><span class="kv-key">${escapeHtml(key)}</span><span class="kv-val">${escapeHtml(val)}</span></div>`;
 }
 
-// --- config persistence (frontend-only, via localStorage) ------------------
+// --- config persistence (stored beside the executable by the Rust backend) --
 
-const CFG_KEY = "vramdisk.lastConfig";
+let savedConfig = null;
+let configSaveTimer = null;
 
 function saveConfig() {
   const cfg = {
+    workflowTab: document.querySelector("[data-workflow-tab].active")?.dataset.workflowTab || "file",
     device: el("device").value,
     mountMode: mountMode(),
     drive: el("drive").value,
@@ -401,20 +500,18 @@ function saveConfig() {
     sizeUnit: el("size-unit").value,
     compress: el("compress").checked,
     dedup: el("dedup").checked,
+    pagefileSize: el("pagefile-size").value,
+    pagefileOverhead: el("pagefile-overhead").value,
   };
-  try {
-    localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
-  } catch (e) {
-    /* ignore */
-  }
+  savedConfig = cfg;
+  clearTimeout(configSaveTimer);
+  configSaveTimer = setTimeout(() => {
+    invoke("save_gui_config", { config: cfg }).catch((e) => console.error("save_gui_config", e));
+  }, 300);
 }
 
 function loadSavedConfig() {
-  try {
-    return JSON.parse(localStorage.getItem(CFG_KEY) || "null");
-  } catch (e) {
-    return null;
-  }
+  return savedConfig;
 }
 
 // --- setup screen: devices / drives / size hint -----------------------------
@@ -512,6 +609,9 @@ function restoreSizeAndFlags() {
   el("compress").checked = !!saved.compress;
   el("dedup").checked = !!saved.dedup;
   if (saved.mountMode) setMountMode(saved.mountMode);
+  if (saved.pagefileSize) el("pagefile-size").value = saved.pagefileSize;
+  if (saved.pagefileOverhead) el("pagefile-overhead").value = saved.pagefileOverhead;
+  if (saved.workflowTab === "file" || saved.workflowTab === "pagefile") setWorkflowTab(saved.workflowTab);
 }
 
 // --- mount mode (drive letter vs. folder) -----------------------------------
@@ -1266,11 +1366,25 @@ async function boot() {
   try {
     LANG = await invoke("get_ui_language");
   } catch (e) {
-    LANG = String(navigator.language || "").toLowerCase().startsWith("ja") ? "ja" : "en";
+    LANG = "en";
   }
   applyLanguage();
   el("lang-select").addEventListener("change", () => switchLanguage(el("lang-select").value));
+  for (const tab of document.querySelectorAll("[data-workflow-tab]")) {
+    tab.addEventListener("click", () => {
+      setWorkflowTab(tab.dataset.workflowTab);
+      saveConfig();
+    });
+  }
+  el("pagefile-check-btn").addEventListener("click", checkPagefileStatus);
+  el("pagefile-enable-btn").addEventListener("click", enablePagefile);
 
+  try {
+    savedConfig = await invoke("load_gui_config");
+  } catch (e) {
+    console.error("load_gui_config", e);
+    savedConfig = null;
+  }
   await step(loadDevices, "stepGpus");
   await step(loadFreeDrives, "stepDrives");
   restoreSizeAndFlags();
@@ -1291,6 +1405,8 @@ async function boot() {
   });
   el("size-value").addEventListener("input", validateSizeField);
   el("size-unit").addEventListener("change", validateSizeField);
+  el("pagefile-size").addEventListener("input", saveConfig);
+  el("pagefile-overhead").addEventListener("input", saveConfig);
   el("browse-folder-btn").addEventListener("click", doBrowseFolder);
 
   for (const tab of document.querySelectorAll("#screen-setup .seg-btn")) {
@@ -1311,6 +1427,7 @@ async function boot() {
   ]) {
     el(idn).addEventListener("change", saveConfig);
   }
+  el("size-value").addEventListener("input", saveConfig);
 
   el("open-hash").addEventListener("click", () => showScreen("hash"));
   el("open-archive").addEventListener("click", () => {

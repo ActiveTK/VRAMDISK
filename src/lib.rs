@@ -13,6 +13,7 @@
 pub mod api_kernel;
 pub mod arena;
 pub mod bench;
+pub mod block;
 pub mod cdm_bench;
 pub mod chunk;
 pub mod cli;
@@ -26,6 +27,9 @@ pub mod internal_api;
 pub mod jobs;
 pub mod lookup;
 pub mod nvcomp;
+pub mod pagefile;
+#[cfg(all(windows, feature = "winspd"))]
+pub mod winspd;
 
 /// Logical chunk size: 64 KiB. The VRAM buffer is always a multiple of this.
 pub const CHUNK_SIZE: u64 = 64 * 1024;

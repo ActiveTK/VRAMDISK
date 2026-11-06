@@ -20,7 +20,7 @@ use manager::Manager;
 pub(crate) struct CliSeed(pub Option<vramdisk::cli::SeedOverrides>);
 
 /// UI language ("ja" or "en"). Chosen from, in order: the value persisted
-/// under HKCU\Software\VRAMDISK, else the Windows display language. The
+/// under HKCU\Software\VRAMDISK, else English. The
 /// frontend reads/writes it via the `get_ui_language` / `set_ui_language`
 /// commands; the tray menu and native dialogs read it through this state.
 pub(crate) struct UiLang(pub Mutex<String>);
@@ -49,15 +49,7 @@ fn stored_language() -> Option<String> {
 }
 
 fn detect_language() -> String {
-    stored_language().unwrap_or_else(|| {
-        let sys = sys_locale::get_locale().unwrap_or_default();
-        if sys.to_ascii_lowercase().starts_with("ja") {
-            "ja"
-        } else {
-            "en"
-        }
-        .to_string()
-    })
+    stored_language().unwrap_or_else(|| "en".to_string())
 }
 
 pub(crate) fn persist_language(lang: &str) -> Result<(), String> {
@@ -97,6 +89,7 @@ pub(crate) fn tr(lang: &str, key: &'static str) -> &'static str {
         "encode" => if ja { "ファイルのエンコード（Base64 / hex）" } else { "Encode files (Base64 / hex)" },
         "quit" => if ja { "終了" } else { "Exit" },
         "close_hint" => if ja { "VRAMDISKはタスクトレイからアンマウントできます" } else { "VRAMDISK stays available in the system tray." },
+        "pagefile_running_hint" => if ja { "ページファイル用の GPU ディスクが稼働中です。アプリを終了すると Windows が停止するおそれがあるため、VRAMDISK をタスクトレイで動作させたままにしてください。終了するには Windows を再起動してください。C: のページファイルも残してください。" } else { "The GPU pagefile disk is active. Keep VRAMDISK running in the system tray; closing it may hang Windows. Restart Windows to end this session, and keep the pagefile on C:." },
         "unmount_warning" => if ja { "本当にアンマウントしますか？\nドライブ上のデータは全て失われます。" } else { "Unmount now?\nAll data on the drive will be lost." },
         "quit_warning" => if ja { "本当に終了しますか？\nドライブ上のデータは全て失われます。" } else { "Exit now?\nAll data on the drive will be lost." },
         "continue" => if ja { "続行" } else { "Continue" },
@@ -241,6 +234,16 @@ fn show_main_window(app: &AppHandle) {
 
 pub(crate) fn quit(app: &AppHandle) {
     if let Some(manager) = app.try_state::<Manager>() {
+        if manager.pagefile_disk_status().is_some() {
+            show_main_window(app);
+            let lang = app_language(app);
+            app.dialog()
+                .message(tr(&lang, "pagefile_running_hint"))
+                .kind(MessageDialogKind::Warning)
+                .title("VRAMDISK")
+                .show(|_| {});
+            return;
+        }
         manager.shutdown();
     }
     app.exit(0);
@@ -378,10 +381,10 @@ pub(crate) fn after_mount_success(app: &AppHandle, mount_point: &str) {
         });
 }
 
-/// vramdisk.exe is both the GUI and (via these two dispatch tokens) the CLI
-/// that used to be a separate `vramdisk-cli.exe`. `cli`/`benchmark` run the
-/// old CLI synchronously in the console and exit — no window is ever
-/// created. Any other argv (e.g. a shortcut with `--mount R: --compress`) is
+/// vramdisk.exe is both the GUI and CLI. `cli`/`benchmark` run the old CLI;
+/// `pagefile` exposes read-only diagnostics and guarded operations. CLI modes
+/// run synchronously in the console and exit before a window is created. Any
+/// other argv (e.g. a shortcut with `--mount R: --compress`) is
 /// left for the normal GUI startup below, which uses it only to seed the
 /// setup screen's initial field values (see `commands::initial_overrides`),
 /// never to mount automatically.
@@ -395,10 +398,14 @@ fn dispatch_cli_mode(argv: &[String]) {
     if mode == "cdm-bench" {
         std::process::exit(vramdisk::cdm_bench::run(argv[1..].to_vec()));
     }
-    if mode != "cli" && mode != "benchmark" {
+    if mode != "cli" && mode != "benchmark" && mode != "pagefile" && mode != "winspd" {
         return;
     }
-    let mut rest = argv[1..].to_vec();
+    let mut rest = if mode == "pagefile" || mode == "winspd" {
+        argv.to_vec()
+    } else {
+        argv[1..].to_vec()
+    };
     if mode == "benchmark" && !rest.iter().any(|a| a == "--bench" || a == "--bench-io") {
         rest.insert(0, "--bench".to_string());
     }
@@ -407,6 +414,13 @@ fn dispatch_cli_mode(argv: &[String]) {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    if argv.first().is_some_and(|mode| mode.eq_ignore_ascii_case("winspd"))
+        && !ensure_winspd_console()
+    {
+        eprintln!("Could not create a console for the interactive WinSpd CLI.");
+        std::process::exit(1);
+    }
     dispatch_cli_mode(&argv);
     let cli_seed = CliSeed(if argv.is_empty() {
         None
@@ -431,6 +445,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_ui_language,
             commands::set_ui_language,
+            commands::load_gui_config,
+            commands::save_gui_config,
             commands::list_gpus,
             commands::list_free_drives,
             commands::browse_folder,
@@ -445,6 +461,10 @@ fn main() {
             commands::export_cancel,
             commands::stats,
             commands::nvcomp_available,
+            commands::pagefile_status,
+            commands::pagefile_enable,
+            commands::start_pagefile_disk,
+            commands::pagefile_disk_status,
             commands::initial_overrides,
             commands::hash_job,
             commands::archive_compress_job,
@@ -520,11 +540,15 @@ fn main() {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         // Only hide-to-tray when a disk is actually mounted;
                         // otherwise closing the window really quits the app.
-                        let mounted = handle
+                        let pagefile_active = handle
+                            .try_state::<Manager>()
+                            .map(|m| m.pagefile_disk_status().is_some())
+                            .unwrap_or(false);
+                        let active = pagefile_active || handle
                             .try_state::<Manager>()
                             .map(|m| m.status().is_some())
                             .unwrap_or(false);
-                        if !mounted {
+                        if !active {
                             quit(&handle);
                             return;
                         }
@@ -534,8 +558,8 @@ fn main() {
                             let lang = app_language(&handle);
                             handle
                                 .dialog()
-                                .message(tr(&lang, "close_hint"))
-                                .kind(MessageDialogKind::Info)
+                                .message(tr(&lang, if pagefile_active { "pagefile_running_hint" } else { "close_hint" }))
+                                .kind(if pagefile_active { MessageDialogKind::Warning } else { MessageDialogKind::Info })
                                 .title("VRAMDISK")
                                 .show(|_| {});
                         }
@@ -556,6 +580,39 @@ fn main() {
             }
         }
     });
+}
+
+/// Release builds use the Windows GUI subsystem, so a CLI launched from
+/// PowerShell has no console input handle. WinSpd stays interactive until the
+/// user presses Enter; give that mode its own console before reading stdin.
+#[cfg(windows)]
+fn ensure_winspd_console() -> bool {
+    use std::ffi::c_void;
+
+    const STD_INPUT_HANDLE: i32 = -10;
+    const STD_OUTPUT_HANDLE: i32 = -11;
+    const STD_ERROR_HANDLE: i32 = -12;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> *mut c_void;
+        fn AllocConsole() -> i32;
+        fn GetStdHandle(kind: i32) -> *mut c_void;
+        fn SetStdHandle(kind: i32, handle: *mut c_void) -> i32;
+    }
+
+    unsafe {
+        if GetConsoleWindow().is_null() && AllocConsole() == 0 {
+            return false;
+        }
+
+        [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .into_iter()
+            .all(|kind| {
+                let handle = GetStdHandle(kind);
+                !handle.is_null() && handle as isize != -1 && SetStdHandle(kind, handle) != 0
+            })
+    }
 }
 
 #[cfg(test)]

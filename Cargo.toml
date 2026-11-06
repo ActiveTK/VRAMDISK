@@ -18,6 +18,7 @@ path = "src/lib.rs"
 [features]
 default = ["gpu-tests"]
 gpu-tests = []
+winspd = []
 
 [dependencies]
 anyhow = "1"

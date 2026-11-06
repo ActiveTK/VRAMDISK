@@ -15,10 +15,16 @@ use std::sync::mpsc::{channel, Sender};
 use std::thread;
 
 use serde::{Deserialize, Serialize};
+#[cfg(all(windows, feature = "winspd"))]
+use anyhow::Context;
 
 use vramdisk::cuda::Vram;
 use vramdisk::engine::StorageEngine;
 use vramdisk::{default_size, round_up_to_chunk};
+#[cfg(all(windows, feature = "winspd"))]
+use vramdisk::block::{BlockDeviceConfig, GpuBlockStorage};
+#[cfg(all(windows, feature = "winspd"))]
+use vramdisk::winspd::WinSpdDevice;
 
 /// A CUDA device, as sent to the UI.
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +61,24 @@ pub struct MountStatus {
     pub dedup: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct PagefileDiskConfig {
+    pub pagefile_size: u64,
+    pub filesystem_overhead: u64,
+    #[serde(default)]
+    pub device: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PagefileDiskStatus {
+    pub drive: String,
+    pub pagefile_path: String,
+    pub device: usize,
+    pub pagefile_size: u64,
+    pub filesystem_overhead: u64,
+    pub disk_size: u64,
+}
+
 /// Reply channel for a request.
 type Reply<T> = Sender<T>;
 
@@ -73,6 +97,8 @@ enum Cmd {
     Status(Reply<Option<MountStatus>>),
     Stats(String, Reply<Result<serde_json::Value, String>>),
     MountPoint(Reply<Option<String>>),
+    StartPagefileDisk(PagefileDiskConfig, String, Reply<Result<PagefileDiskStatus, String>>),
+    PagefileDiskStatus(Reply<Option<PagefileDiskStatus>>),
     Shutdown(Reply<()>),
 }
 
@@ -112,6 +138,15 @@ impl Manager {
                         }
                         Cmd::MountPoint(reply) => {
                             let _ = reply.send(state.mount_point());
+                        }
+                        Cmd::StartPagefileDisk(cfg, lang, reply) => {
+                            let result = state
+                                .start_pagefile_disk(cfg, &lang)
+                                .map_err(|e| format!("{e:#}"));
+                            let _ = reply.send(result);
+                        }
+                        Cmd::PagefileDiskStatus(reply) => {
+                            let _ = reply.send(state.pagefile_disk_status());
                         }
                         Cmd::Shutdown(reply) => {
                             state.shutdown();
@@ -176,6 +211,19 @@ impl Manager {
         self.request(Cmd::MountPoint)
     }
 
+    pub fn start_pagefile_disk(
+        &self,
+        cfg: PagefileDiskConfig,
+        lang: &str,
+    ) -> Result<PagefileDiskStatus, String> {
+        let lang = lang.to_string();
+        self.request(|reply| Cmd::StartPagefileDisk(cfg, lang, reply))
+    }
+
+    pub fn pagefile_disk_status(&self) -> Option<PagefileDiskStatus> {
+        self.request(Cmd::PagefileDiskStatus)
+    }
+
     /// Unmount (if mounted) and stop the thread. Called on real app exit.
     /// Idempotent: safe to call again after the thread has already stopped.
     pub fn shutdown(&self) {
@@ -195,6 +243,14 @@ struct MountRecord {
 #[derive(Default)]
 struct ManagerState {
     mount: Option<MountRecord>,
+    pagefile_disk: Option<PagefileDiskRecord>,
+}
+
+struct PagefileDiskRecord {
+    status: PagefileDiskStatus,
+    pagefile_added: bool,
+    #[cfg(all(windows, feature = "winspd"))]
+    _device: WinSpdDevice,
 }
 
 impl ManagerState {
@@ -218,10 +274,45 @@ impl ManagerState {
         self.mount.as_ref().map(|r| r.status.mount_point.clone())
     }
 
+    fn pagefile_disk_status(&self) -> Option<PagefileDiskStatus> {
+        self.pagefile_disk
+            .as_ref()
+            .filter(|record| record.pagefile_added)
+            .map(|record| record.status.clone())
+    }
+
+    fn start_pagefile_disk(
+        &mut self,
+        cfg: PagefileDiskConfig,
+        _lang: &str,
+    ) -> anyhow::Result<PagefileDiskStatus> {
+        anyhow::ensure!(self.mount.is_none(), "Unmount the file RAM disk before starting the WinSpd pagefile disk");
+        anyhow::ensure!(self.pagefile_disk.is_none(), "A WinSpd pagefile disk is already running");
+        anyhow::ensure!(cfg.pagefile_size > 0, "pagefile size must be greater than zero");
+        anyhow::ensure!(cfg.filesystem_overhead > 0, "pagefile disk reserve must be greater than zero");
+        anyhow::ensure!(
+            list_free_drives().iter().any(|drive| drive.eq_ignore_ascii_case("M:")),
+            "Drive M: is already assigned; free it before creating the WinSpd pagefile disk"
+        );
+
+        #[cfg(all(windows, feature = "winspd"))]
+        {
+            start_winspd_pagefile_disk(self, cfg)
+        }
+        #[cfg(not(all(windows, feature = "winspd")))]
+        {
+            let _ = cfg;
+            anyhow::bail!("This build does not include the Windows WinSpd feature")
+        }
+    }
+
     #[cfg(windows)]
     fn mount(&mut self, cfg: MountConfig, lang: &str) -> anyhow::Result<()> {
         if self.mount.is_some() {
             anyhow::bail!("{}", crate::tr(lang, "err_already_mounted"));
+        }
+        if self.pagefile_disk.is_some() {
+            anyhow::bail!("Stop the WinSpd pagefile workflow before mounting the file RAM disk");
         }
         let mount_point = normalize_mount_point(&cfg.mount_point);
         if mount_point.is_empty() {
@@ -359,6 +450,137 @@ impl ManagerState {
             _record.mounted.unmount();
         }
     }
+}
+
+#[cfg(all(windows, feature = "winspd"))]
+fn start_winspd_pagefile_disk(
+    state: &mut ManagerState,
+    cfg: PagefileDiskConfig,
+) -> anyhow::Result<PagefileDiskStatus> {
+    use std::path::Path;
+    let disk_size = cfg
+        .pagefile_size
+        .checked_add(cfg.filesystem_overhead)
+        .context("pagefile disk size overflow")?;
+    let total_vram = Vram::device_total_mem(cfg.device)?;
+    anyhow::ensure!(
+        disk_size <= total_vram,
+        "pagefile plus filesystem overhead ({disk_size} bytes) exceeds GPU VRAM ({total_vram} bytes)"
+    );
+    let disks_before = list_windows_disk_numbers()?;
+
+    let storage_cfg = BlockDeviceConfig::new(disk_size, vramdisk::block::DEFAULT_LOGICAL_SECTOR_SIZE)?;
+    let storage = GpuBlockStorage::new(cfg.device, storage_cfg)?;
+    let device = WinSpdDevice::start(Box::new(storage), None)
+        .context("could not publish the GPU-backed WinSpd disk")?;
+    let status = PagefileDiskStatus {
+        drive: "M:".into(),
+        pagefile_path: r"M:\pagefile.sys".into(),
+        device: cfg.device,
+        pagefile_size: cfg.pagefile_size,
+        filesystem_overhead: cfg.filesystem_overhead,
+        disk_size,
+    };
+    // Retain the device even if partitioning or swapadd fails; dropping it
+    // while Windows may have opened the new disk would make cleanup unsafe.
+    state.pagefile_disk = Some(PagefileDiskRecord {
+        status: status.clone(),
+        pagefile_added: false,
+        _device: device,
+    });
+
+    prepare_new_pagefile_volume(&disks_before, disk_size)
+        .context("WinSpd disk is running, but automatic M: partitioning/formatting failed")?;
+    vramdisk::pagefile::PagefileManager::enable(
+        Path::new(&status.pagefile_path),
+        cfg.pagefile_size,
+        cfg.pagefile_size,
+    )
+    .context("M: was created and formatted, but swapadd could not add the pagefile")?;
+    if let Some(record) = state.pagefile_disk.as_mut() {
+        record.pagefile_added = true;
+    }
+    Ok(status)
+}
+
+#[cfg(all(windows, feature = "winspd"))]
+fn list_windows_disk_numbers() -> anyhow::Result<Vec<u32>> {
+    use std::process::Command;
+
+    let script = "$ErrorActionPreference='Stop'; $d=@(Get-Disk | Select-Object -ExpandProperty Number); ConvertTo-Json -Compress -InputObject $d";
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .context("could not enumerate Windows disks")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Get-Disk failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("Get-Disk returned invalid JSON")?;
+    let values = value.as_array().cloned().unwrap_or_else(|| vec![value]);
+    values
+        .into_iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|number| u32::try_from(number).ok())
+                .context("Get-Disk returned an invalid disk number")
+        })
+        .collect()
+}
+
+#[cfg(all(windows, feature = "winspd"))]
+fn prepare_new_pagefile_volume(disks_before: &[u32], disk_size: u64) -> anyhow::Result<()> {
+    use std::process::Command;
+
+    let before = disks_before
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'
+$before=@({before})
+$expected=[uint64]{disk_size}
+$disk=$null
+for($i=0; $i -lt 120 -and $null -eq $disk; $i++) {{
+  $matches=@(Get-Disk | Where-Object {{ $_.Number -notin $before -and $_.FriendlyName -match 'VRAMDISK' -and [Math]::Abs([double]$_.Size-[double]$expected) -lt 16777216 }})
+  if($matches.Count -gt 1) {{ throw 'More than one new VRAMDISK disk appeared; refusing to format an ambiguous target.' }}
+  if($matches.Count -eq 1) {{ $disk=$matches[0] }} else {{ Start-Sleep -Milliseconds 500 }}
+}}
+if($null -eq $disk) {{ throw 'The new WinSpd VRAMDISK did not appear in Get-Disk.' }}
+if($disk.PartitionStyle -ne 'RAW') {{ throw 'The new VRAMDISK is not RAW; refusing to overwrite a partitioned disk.' }}
+if($disk.IsReadOnly) {{ Set-Disk -Number $disk.Number -IsReadOnly $false }}
+if($disk.IsOffline) {{ Set-Disk -Number $disk.Number -IsOffline $false }}
+Initialize-Disk -Number $disk.Number -PartitionStyle GPT | Out-Null
+$partition=New-Partition -DiskNumber $disk.Number -UseMaximumSize -DriveLetter 'M'
+Format-Volume -Partition $partition -FileSystem NTFS -NewFileSystemLabel 'VRAMDISK' -Confirm:$false -Force | Out-Null
+$volume=Get-Volume -DriveLetter M
+[pscustomobject]@{{DiskNumber=$disk.Number; DriveLetter='M:'; FreeBytes=[uint64]$volume.SizeRemaining}} | ConvertTo-Json -Compress"#
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .context("could not run automatic partition and format commands")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "automatic M: setup failed: {}{}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        if output.stderr.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", String::from_utf8_lossy(&output.stderr).trim())
+        }
+    );
+    let volume: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("automatic M: setup returned invalid status JSON")?;
+    anyhow::ensure!(
+        volume.get("DriveLetter").and_then(|value| value.as_str()) == Some("M:"),
+        "automatic setup did not assign the requested M: drive"
+    );
+    Ok(())
 }
 
 /// Drive letters (`C:`..`Z:`) not currently assigned to any volume. Uses the

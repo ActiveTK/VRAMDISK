@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Locate libclang
+        shell: pwsh
+        run: |
+          $clangPath = "$env:ProgramFiles\LLVM\bin"
+          if (-not (Test-Path "$clangPath\libclang.dll")) {
+            throw "libclang.dll not found at $clangPath"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$clangPath"
+
+      - name: Build release executable
+        working-directory: src-tauri
+        run: cargo build --locked --release
+
+      - name: Package executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path src-tauri\target\release\vramdisk.exe -DestinationPath dist\vramdisk.zip -Force
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/vramdisk.zip

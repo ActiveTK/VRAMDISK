@@ -1,5 +1,7 @@
 # VRAMDISK: Create VRAM disk on Windows
 
+English | [简体中文](README.md)
+
 VRAMDISK is an app that mounts your GPU's VRAM as a Windows drive through its own file system.
 
 <img width="928" height="472" alt="image" src="https://github.com/user-attachments/assets/42a44f7e-3a8c-4ab4-a85b-dad7a1769782" />
@@ -41,9 +43,9 @@ That's it, the disk is mounted!
 
 Installing the nvCOMP runtime DLL lets you compress files on the GPU (the "Compress data" option on the mount screen becomes available, and so does the file compression tool after mounting).
 
-You can get nvCOMP here:
+Download the compatible nvCOMP 5.3.0 Windows x64 package here:
 
-https://developer.nvidia.com/nvcomp-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local
+https://developer.nvidia.com/nvcomp-5-3-0-download-archive?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local
 
 ## Installation errors
 
@@ -77,3 +79,7 @@ This program is released under The MIT License.
 
 (c) 2026 ActiveTK.
 https://github.com/ActiveTK/VRAMDISK/blob/main/LICENSE
+
+## WinSpd and pagefile development status
+
+An optional WinSpd adapter now connects raw block requests to VRAM. Build with the WinSpd Developer SDK and the winspd Cargo feature. The pipe mode can test the adapter with WinSpd stgtest; disk mode requires the WinSpd driver and exposes a new, initially unformatted VRAM disk. The GUI can explicitly ask `swapadd.exe` to add a pagefile on a mounted volume; keep the Windows-managed pagefile on C:. Windows paging I/O through WinSpd remains experimental and unverified, so a successful add or ordinary read/write test does not establish paging safety. See the [WinSpd / VRAM pagefile audit](docs/WINSPD_PAGING_AUDIT.md) for details.
